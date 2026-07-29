@@ -1,0 +1,543 @@
+"""
+Braintrust harness for LiveNewsBench x {Exa, Parallel, You.com}.
+
+One frozen agent (temp 0, fixed prompt, two tools), provider + arm are the
+only variables. Braintrust-native throughout:
+
+  * reads the dataset that import_livenewsbench.py pushes ("LiveNewsBench" in
+    the project named by BRAINTRUST_PROJECT_ID); --dataset-version pins a
+    version so cross-provider diffs are item-paired in the UI
+  * agent LLM calls auto-traced via wrap_openai
+  * every search/fetch is a `tool` span with native metrics (tokens, latency,
+    $cost) and the RAW provider payload in span metadata — the decision-surface
+    analysis depends on pre-normalization responses surviving in traces
+  * trial_count for retrieval nondeterminism (temp 0 doesn't freeze the web)
+
+Dataset contract (set by import_livenewsbench.py, consumed by scorers.py):
+    input    = {"question": str}
+    expected = answer string          <- NOT a dict
+    metadata = upstream row fields (link, articles, event_date, ...) plus
+               livenewsbench_release / livenewsbench_split / source_commit
+Leakage excludes and temporal grounding both read from metadata, not expected.
+
+Usage:
+    # .env supplies BRAINTRUST_API_KEY + BRAINTRUST_PROJECT_ID and always wins
+    export OPENAI_API_KEY=...
+    export EXA_API_KEY=... PARALLEL_API_KEY=... YDC_API_KEY=...
+
+    # dataset push lives in import_livenewsbench.py, not here:
+    python import_livenewsbench.py <datasets_root> --source-commit <sha>
+
+    # per (provider, arm): interleave these in time, don't run days apart
+    python run_eval.py run --provider exa --arm native_fresh --trials 3
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from urllib.parse import urlparse
+
+import httpx
+from braintrust import Eval, current_span, init_dataset, traced, wrap_openai
+from openai import OpenAI
+
+from import_livenewsbench import DATASET_NAME, load_env
+from scorers import DETERMINISTIC_SCORERS, make_simpleqa_grader
+
+# ---------------------------------------------------------------------------
+# Credentials. AGENTS.md: the .env key always overrides any ambient credential.
+# ---------------------------------------------------------------------------
+
+
+def load_braintrust_env(env_path: Path) -> tuple[str, str]:
+    """Return (api_key, project_id) from the env file, overriding the ambient
+    BRAINTRUST_API_KEY so a stale shell export can never redirect a run."""
+    env = load_env(env_path)
+    api_key = env.get("BRAINTRUST_API_KEY")
+    project_id = env.get("BRAINTRUST_PROJECT_ID")
+    if not api_key or not project_id:
+        raise SystemExit(
+            f"{env_path}: BRAINTRUST_API_KEY and BRAINTRUST_PROJECT_ID are required"
+        )
+    os.environ["BRAINTRUST_API_KEY"] = api_key
+    return api_key, project_id
+
+
+# ---------------------------------------------------------------------------
+# Frozen-agent constants. Changing ANY of these is a new experiment condition.
+# ---------------------------------------------------------------------------
+
+AGENT_MODEL = "gpt-4o-2024-11-20"      # pin an exact snapshot; judge = gpt-4.1 (different lineage at minimum — ideally use a non-OpenAI judge)
+MAX_SEARCHES, MAX_CLICKS = 5, 5        # LiveNewsBench defaults
+SNIPPET_CHARS = 400                    # normalized-arm snippet truncation
+FETCH_CHARS = 6000                     # shared fetcher page budget
+N_RESULTS = 8
+
+# Exa search tier. Their default is "auto", which routes per query — pinning it
+# keeps the retrieval tier a declared experiment condition.
+EXA_SEARCH_TYPE = "auto"
+# Parallel's Search API is beta and requires this version header.
+PARALLEL_BETA = "search-extract-2025-10-10"
+# Combined include_domains + exclude_domains ceiling in a Parallel source_policy.
+PARALLEL_MAX_DOMAINS = 200
+
+FROZEN_SYSTEM_PROMPT = """\
+You are a web research agent answering a news question. You have two tools:
+search_web(query) and fetch_page(url). You may use at most 5 searches and
+5 page fetches total. Search results show rank, title, url, snippet, and
+published date when available. When you know the answer, stop calling tools
+and reply with ONLY the final answer, as concisely as possible. If you cannot
+determine the answer within budget, reply exactly: I could not find this."""
+
+TOOLS = [
+    {"type": "function", "function": {
+        "name": "search_web",
+        "description": "Search the web for news. Returns ranked results.",
+        "parameters": {"type": "object",
+                       "properties": {"query": {"type": "string"}},
+                       "required": ["query"]}}},
+    {"type": "function", "function": {
+        "name": "fetch_page",
+        "description": "Fetch the text content of a result URL.",
+        "parameters": {"type": "object",
+                       "properties": {"url": {"type": "string"}},
+                       "required": ["url"]}}},
+]
+
+# Approximate per-call search pricing (USD) for native cost metrics.
+# Verify against each vendor's current pricing page before publishing numbers.
+SEARCH_COST = {
+    ("exa", "normalized"): 0.005, ("exa", "native_fresh"): 0.005,       # + $1/1k pages if text requested
+    ("parallel", "normalized"): 0.004, ("parallel", "native_fresh"): 0.009,  # base vs pro tier
+    ("youdotcom", "normalized"): 0.004, ("youdotcom", "native_fresh"): 0.004,
+}
+
+ARCHIVE_EXCLUDES = ["web.archive.org", "archive.org", "archive.is",
+                    "archive.ph", "archive.today"]
+
+# Env var each provider adapter reads, for preflight validation.
+PROVIDER_KEYS = {"exa": "EXA_API_KEY", "parallel": "PARALLEL_API_KEY",
+                 "youdotcom": "YDC_API_KEY"}
+
+
+def _tok(text: str) -> int:
+    """Cheap token estimate (chars/4). Swap in tiktoken for publication runs."""
+    return max(1, len(text) // 4)
+
+
+def _domain_of(url: str) -> str:
+    h = (urlparse(url).hostname or "").lower()
+    return h[4:] if h.startswith("www.") else h
+
+
+def source_domains_of(metadata: dict, expected) -> list[str]:
+    """Domains that must never appear in the decision surface, read from the
+    SAME fields scorers.leakage_guard checks: metadata['link'] plus every
+    metadata['articles'][*].link/url. Falls back to a dict-shaped `expected`
+    for datasets that predate the importer's schema.
+
+    Ordered source-domains-first: Parallel caps exclude_domains at 10, so any
+    truncation must drop archive mirrors, never a gold source.
+    """
+    urls = []
+    if isinstance(metadata, dict):
+        if metadata.get("link"):
+            urls.append(metadata["link"])
+        for article in metadata.get("articles") or []:
+            if isinstance(article, dict):
+                url = article.get("link") or article.get("url")
+                if url:
+                    urls.append(url)
+    if not urls and isinstance(expected, dict) and expected.get("link"):
+        urls.append(expected["link"])
+
+    seen, domains = set(), []
+    for url in urls:
+        host = _domain_of(url)
+        if host and host not in seen:
+            seen.add(host)
+            domains.append(host)
+    return domains
+
+
+# ---------------------------------------------------------------------------
+# Provider adapters. Each returns (normalized_results, raw_payload).
+# Normalized schema: {rank, url, title, snippet, published_date} — the agent
+# must not be able to tell providers apart from formatting.
+#
+# NB: no adapter may derive date parameters from the item's event_date (label
+# leakage into retrieval), and queries must avoid temporal keywords — You.com
+# takes the broader of query-implied vs parameter freshness, which would
+# silently un-blind the arms.
+# ---------------------------------------------------------------------------
+
+_http = httpx.Client(
+    timeout=httpx.Timeout(30.0, connect=10.0),
+    follow_redirects=True,
+    headers={"user-agent": "Mozilla/5.0 (compatible; livenewsbench-eval/1.0)"},
+)
+
+
+def exa_search(query: str, arm: str, exclude_domains: list[str]):
+    body = {
+        # `type` defaults to "auto", which routes per query and is therefore NOT
+        # frozen across runs. Pinned here so the search tier is a declared
+        # condition; "fast"/"deep" are the other reproducible choices.
+        "type": EXA_SEARCH_TYPE,
+        "query": query,
+        "numResults": N_RESULTS,
+        "category": "news",
+        "excludeDomains": exclude_domains,
+        # numSentences/highlightsPerUrl are deprecated; maxCharacters is current
+        # and matches the SNIPPET_CHARS budget enforced below.
+        "contents": {"highlights": {"maxCharacters": SNIPPET_CHARS}},
+    }
+    if arm == "native_fresh":
+        # Exa's two documented freshness knobs. livecrawl="preferred" is
+        # deprecated, so this uses "always"; maxAgeHours accepts -1..720.
+        body["contents"]["livecrawl"] = "always"
+        body["contents"]["maxAgeHours"] = 24
+    r = _http.post("https://api.exa.ai/search", json=body,
+                   headers={"x-api-key": os.environ["EXA_API_KEY"]})
+    r.raise_for_status()
+    raw = r.json()
+    results = []
+    for i, res in enumerate(raw.get("results", []), start=1):
+        highlights = res.get("highlights") or []
+        results.append({
+            "rank": i,
+            "url": res.get("url", ""),
+            "title": res.get("title") or "",
+            "snippet": (highlights[0] if highlights else res.get("text", "") or "")[:SNIPPET_CHARS],
+            "published_date": res.get("publishedDate"),
+        })
+    return results, raw
+
+
+def parallel_search(query: str, arm: str, exclude_domains: list[str]):
+    body = {
+        "objective": query,
+        "search_queries": [query[:200]],
+        "processor": "pro" if arm == "native_fresh" else "base",
+        "max_results": N_RESULTS,
+        # Nested under `excerpts`; as a top-level field this was simply ignored.
+        "excerpts": {"max_chars_per_result": 1500},
+        # Ceiling is 200 combined include+exclude domains. exclude_domains is
+        # source-first, so any truncation drops archive mirrors, not gold sources.
+        "source_policy": {
+            "exclude_domains": exclude_domains[:PARALLEL_MAX_DOMAINS]},
+    }
+    r = _http.post("https://api.parallel.ai/v1beta/search", json=body,
+                   headers={"x-api-key": os.environ["PARALLEL_API_KEY"],
+                            "parallel-beta": PARALLEL_BETA,
+                            "content-type": "application/json"})
+    r.raise_for_status()
+    raw = r.json()
+    results = []
+    for i, res in enumerate(raw.get("results", []), start=1):
+        excerpts = res.get("excerpts") or []
+        snippet = " ".join(excerpts)
+        if arm == "normalized":
+            # Truncating Parallel's long excerpts removes its core product
+            # feature — a deliberate, documented limitation of this arm.
+            snippet = snippet[:SNIPPET_CHARS]
+        results.append({
+            "rank": i,
+            "url": res.get("url", ""),
+            "title": res.get("title") or "",
+            "snippet": snippet,
+            "published_date": res.get("publish_date"),
+        })
+    return results, raw
+
+
+def youdotcom_search(query: str, arm: str, exclude_domains: list[str]):
+    # GET with query params against ydc-index.io — NOT a JSON POST to api.you.com.
+    # exclude_domains is a single comma-separated string (repeated params are
+    # unsupported) and is mutually exclusive with include_domains.
+    params = {"query": query, "count": N_RESULTS,
+              "exclude_domains": ",".join(exclude_domains)}
+    if arm == "native_fresh":
+        # day|week|month|year or YYYY-MM-DDtoYYYY-MM-DD. Broadest window that
+        # still filters news; never derive this from event_date.
+        params["freshness"] = "week"
+        # NB: You.com also exposes a `livecrawl` param, but it only populates
+        # result.contents — it would not change the snippet decision surface we
+        # measure, so enabling it would add latency and cost for no signal.
+    r = _http.get("https://ydc-index.io/v1/search", params=params,
+                  headers={"X-API-Key": os.environ["YDC_API_KEY"]})
+    r.raise_for_status()
+    raw = r.json()
+    # results.web[] carries `snippets`; results.news[] does not, so web is the
+    # only shape comparable to the other providers' snippets.
+    hits = (raw.get("results") or {}).get("web") or []
+    results = []
+    for i, res in enumerate(hits, start=1):
+        snippets = res.get("snippets") or []
+        results.append({
+            "rank": i,
+            "url": res.get("url", ""),
+            "title": res.get("title") or "",
+            "snippet": (snippets[0] if snippets else res.get("description", "") or "")[:SNIPPET_CHARS],
+            "published_date": res.get("page_age") or res.get("published_date"),
+        })
+    return results, raw
+
+
+PROVIDERS = {"exa": exa_search, "parallel": parallel_search,
+             "youdotcom": youdotcom_search}
+
+
+# ---------------------------------------------------------------------------
+# Traced tools. type="tool" spans; native metrics + raw payloads in metadata.
+# notrace_io=True on both: @traced otherwise auto-logs the return value over
+# the explicit output= below, and these return tuples, not the payload we want.
+# ---------------------------------------------------------------------------
+
+@traced(type="tool", name="search_web", notrace_io=True)
+def run_search(provider: str, arm: str, query: str, exclude_domains: list[str]):
+    t0 = time.perf_counter()
+    results, raw = PROVIDERS[provider](query, arm, exclude_domains)
+    latency = time.perf_counter() - t0
+    rendered = "\n".join(
+        f"[{r['rank']}] {r['title']}\n    {r['url']}\n    "
+        f"published: {r['published_date'] or 'unknown'}\n    {r['snippet']}"
+        for r in results) or "No results."
+    current_span().log(
+        input={"query": query, "provider": provider, "arm": arm,
+               "exclude_domains": exclude_domains},
+        output=results,
+        metrics={"tokens": _tok(rendered),
+                 "latency_s": latency,
+                 "search_cost_usd": SEARCH_COST.get((provider, arm), 0.0),
+                 "n_results": len(results)},
+        metadata={"raw_response": raw},   # pre-normalization payload, verbatim
+    )
+    return results, rendered, _tok(rendered)
+
+
+@traced(type="tool", name="fetch_page", notrace_io=True)
+def run_fetch(url: str, blocked_domains: list[str]):
+    """Provider-NEUTRAL fetcher, so 'fetch' quality is held constant and only
+    the search layer varies. (Using Exa /contents or You.com livecrawl here
+    would smuggle the provider back into the fetch arm.)"""
+    t0 = time.perf_counter()
+    host = _domain_of(url)
+    status = None
+    blocked = False
+    if not host:
+        text = "FETCH ERROR: not a fetchable URL."
+    elif any(host == d or host.endswith("." + d) for d in blocked_domains):
+        text, blocked = "BLOCKED: this domain is excluded for this task.", True
+    else:
+        try:
+            resp = _http.get(url)
+            status = resp.status_code
+            # Without this, a 403/404 interstitial becomes "page text" and the
+            # agent treats a paywall notice as evidence.
+            resp.raise_for_status()
+            body = re.sub(r"(?is)<(script|style|nav|footer|header)[^>]*>.*?</\1>", " ", resp.text)
+            body = re.sub(r"(?s)<[^>]+>", " ", body)
+            text = re.sub(r"\s+", " ", body).strip()[:FETCH_CHARS]
+        except Exception as e:
+            text = f"FETCH ERROR: {type(e).__name__}: {e}"
+    current_span().log(
+        input={"url": url},
+        output=text[:500],
+        metrics={"tokens": _tok(text), "latency_s": time.perf_counter() - t0},
+        metadata={"blocked": blocked, "host": host, "http_status": status,
+                  "ok": not blocked and not text.startswith("FETCH ERROR")},
+    )
+    return text, _tok(text), blocked
+
+
+# ---------------------------------------------------------------------------
+# Frozen agent loop
+# ---------------------------------------------------------------------------
+
+# Built lazily: constructing OpenAI() at import time raises on a missing
+# OPENAI_API_KEY, which would crash `--help` and preempt _preflight's clear
+# error message. wrap_openai makes every completion an LLM span.
+agent_client = None
+
+
+def get_agent_client():
+    global agent_client
+    if agent_client is None:
+        agent_client = wrap_openai(OpenAI())
+    return agent_client
+
+
+def make_task(provider: str, arm: str):
+
+    def task(input: dict, hooks) -> dict:
+        # Leakage excludes come from row METADATA (link + articles[*]), which is
+        # where the importer puts them and where leakage_guard reads them.
+        # `expected` is the answer string, so it has no .get().
+        source_domains = source_domains_of(hooks.metadata or {}, hooks.expected)
+        excludes = source_domains + ARCHIVE_EXCLUDES
+
+        messages = [{"role": "system", "content": FROZEN_SYSTEM_PROMPT},
+                    {"role": "user", "content": input["question"]}]
+        trajectory, searches, clicks = [], 0, 0
+        bad_tool_calls = 0
+        final = None
+
+        for _ in range(2 * (MAX_SEARCHES + MAX_CLICKS) + 2):
+            # Once both budgets are spent there is nothing left to call, so drop
+            # the tools and force a final answer instead of burning turns on
+            # "budget exhausted" replies until the loop cap trips.
+            out_of_budget = searches >= MAX_SEARCHES and clicks >= MAX_CLICKS
+            kwargs = {} if out_of_budget else {"tools": TOOLS}
+            resp = get_agent_client().chat.completions.create(
+                model=AGENT_MODEL, temperature=0, seed=42,
+                messages=messages, **kwargs)
+            msg = resp.choices[0].message
+            if not msg.tool_calls:
+                final = (msg.content or "").strip()
+                break
+            messages.append(msg)
+            for tc in msg.tool_calls:
+                name = tc.function.name
+                try:
+                    args = json.loads(tc.function.arguments or "{}")
+                except json.JSONDecodeError:
+                    args = {}
+                if not isinstance(args, dict):
+                    args = {}
+
+                if name == "search_web":
+                    if searches >= MAX_SEARCHES:
+                        content = "Search budget exhausted."
+                    else:
+                        searches += 1
+                        query = args.get("query", "")
+                        results, content, tok = run_search(
+                            provider, arm, query, excludes)
+                        trajectory.append({"type": "search", "query": query,
+                                           "tokens": tok, "results": results})
+                elif name == "fetch_page":
+                    if clicks >= MAX_CLICKS:
+                        content = "Fetch budget exhausted."
+                    else:
+                        clicks += 1
+                        url = args.get("url", "")
+                        content, tok, _ = run_fetch(url, excludes)
+                        trajectory.append({"type": "fetch", "url": url,
+                                           "tokens": tok})
+                else:
+                    # Never silently route an unknown name into fetch_page.
+                    bad_tool_calls += 1
+                    content = f"Unknown tool: {name}. Use search_web or fetch_page."
+                messages.append({"role": "tool", "tool_call_id": tc.id,
+                                 "content": content})
+        if final is None:
+            final = "I could not find this."
+
+        hooks.metadata.update({
+            "provider": provider, "arm": arm, "agent_model": AGENT_MODEL,
+            "trial_index": hooks.trial_index,
+            "excluded_source_domains": source_domains,
+            "bad_tool_calls": bad_tool_calls,
+            "as_of": datetime.now(timezone.utc).isoformat(),
+        })
+        # Task-span metrics; Braintrust rolls these into the experiment summary.
+        current_span().log(metrics={
+            "search_cost_usd": searches * SEARCH_COST.get((provider, arm), 0.0),
+            "used_searches": searches, "used_clicks": clicks,
+        })
+        return {"final_answer": final, "trajectory": trajectory,
+                "used_searches": searches, "used_clicks": clicks}
+
+    return task
+
+
+# ---------------------------------------------------------------------------
+# Eval run. Dataset push lives in import_livenewsbench.py — a second pusher
+# here produced an incompatible schema (link/event_date under `expected`, no
+# livenewsbench_release) that silently disabled leakage_guard and
+# temporal_grounding. Do not reintroduce it.
+# ---------------------------------------------------------------------------
+
+def _git_commit() -> str:
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"], text=True).strip()
+    except Exception:
+        return "unknown"
+
+
+def _preflight(provider: str, arm: str) -> None:
+    """Fail before spending money, not on row 1 of N."""
+    missing = [k for k in ("OPENAI_API_KEY", PROVIDER_KEYS[provider])
+               if not os.environ.get(k)]
+    if missing:
+        raise SystemExit(f"Missing env var(s): {', '.join(missing)}")
+    if (provider, arm) not in SEARCH_COST:
+        raise SystemExit(f"No SEARCH_COST entry for ({provider}, {arm}); "
+                         "cost metrics would silently be $0.")
+
+
+def run(provider: str, arm: str, dataset_name: str, dataset_version: str | None,
+        trials: int, judge_model: str, env_path: Path):
+    api_key, project_id = load_braintrust_env(env_path)
+    _preflight(provider, arm)
+
+    dataset = init_dataset(project_id=project_id, name=dataset_name,
+                           version=dataset_version, api_key=api_key)
+    project_name = dataset.project.name
+    resolved_version = dataset_version or dataset.version()
+    print(f"Dataset: {project_name}/{dataset.name} @ version {resolved_version}"
+          f"{'' if dataset_version else '  (latest; pass --dataset-version to pin)'}")
+
+    judge = make_simpleqa_grader(OpenAI(), judge_model=judge_model)
+    Eval(
+        project_name,
+        experiment_name=f"{provider}-{arm}",
+        data=dataset,
+        task=make_task(provider, arm),
+        scores=[judge, *DETERMINISTIC_SCORERS],
+        trial_count=trials,          # web nondeterminism > model nondeterminism
+        max_concurrency=8,
+        metadata={
+            "provider": provider, "arm": arm, "agent_model": AGENT_MODEL,
+            "judge_model": judge_model, "dataset_name": dataset.name,
+            "dataset_version": resolved_version,
+            "dataset_version_pinned": bool(dataset_version),
+            "budget": {"searches": MAX_SEARCHES, "clicks": MAX_CLICKS},
+            "snippet_chars": SNIPPET_CHARS, "n_results": N_RESULTS,
+            "git_commit": _git_commit(),
+            "prompt_version": "frozen-v1",
+        },
+    )
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    r = sub.add_parser("run")
+    r.add_argument("--provider", choices=list(PROVIDERS), required=True)
+    r.add_argument("--arm", choices=["normalized", "native_fresh"], required=True)
+    r.add_argument("--dataset-name", default=DATASET_NAME)
+    r.add_argument("--dataset-version", default=None,
+                   help="Pin a dataset version so every provider/arm sees the "
+                        "same rows. Strongly recommended for published runs.")
+    r.add_argument("--trials", type=int, default=3)
+    r.add_argument("--judge-model", default="gpt-4.1")  # parity with the repo's grading
+    r.add_argument("--env-file", type=Path, default=Path(".env"))
+
+    args = ap.parse_args()
+    run(args.provider, args.arm, args.dataset_name, args.dataset_version,
+        args.trials, args.judge_model, args.env_file)
+
+
+if __name__ == "__main__":
+    main()

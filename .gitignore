@@ -1,0 +1,35 @@
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+
+# Python environments and bytecode
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Test, type-checking, and coverage caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Packaging artifacts
+build/
+dist/
+*.egg-info/
+
+# Braintrust CLI-generated local state
+.bt/
+
+# Editor and operating-system files
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
