@@ -1,0 +1,17 @@
+{
+  "reviewed_at": "2026-07-30",
+  "providers": {
+    "exa": {
+      "status": "blocked_pending_written_permission",
+      "reason": "Current terms do not establish the required benchmark-result and third-party storage rights."
+    },
+    "parallel": {
+      "status": "blocked_pending_written_permission",
+      "reason": "Current customer terms require prior written consent before providing benchmark or evaluation results to third parties."
+    },
+    "youdotcom": {
+      "status": "blocked_pending_written_permission",
+      "reason": "Current acceptable-use terms restrict storing significant API content for reuse without contractual authorization."
+    }
+  }
+}

@@ -26,9 +26,18 @@ Use the framework to define and test your own experiment:
    diversity, latency, and cost—not accuracy alone.
 
 The current example compares LiveNewsBench and RetrievalQA across Exa,
-Parallel, and You.com. The **Remaining gaps** and **Open decisions** sections
-below identify choices that must be resolved before treating results as
-publication-quality.
+Parallel, and You.com. A first implementation of the event-sourced Corvus-QA
+pipeline is also included. The **Remaining gaps** and **Open decisions**
+sections below identify choices that must be resolved before treating results
+as publication-quality.
+
+## Repository layout
+
+- `corvus/` — Corvus-QA schemas, source adapters, review helpers, and CLI modules
+- `config/corvus/` — machine-readable source policies and approval templates
+- `docs/` — compliance and operational documentation
+- `tests/` — offline unit and smoke-test fixtures
+- root scripts — the original cross-provider evaluation and import workflow
 
 ## Included example configuration
 
@@ -38,7 +47,8 @@ publication-quality.
 - Arms: `normalized` (uniform snippet budget), `native_fresh` (each vendor's own
   freshness knobs), `no_search` (control — no tools, parametric memory only)
 - Datasets: `LiveNewsBench`, `RetrievalQA` — Braintrust, versioned with named
-  snapshots
+  snapshots; `Corvus-QA-dev` and `Corvus-QA-test` can be built and imported
+  separately
 - Scorers: 10 deterministic plus one judge score per run, single or jury. See
   [scorers.py](scorers.py)
 
@@ -46,11 +56,11 @@ publication-quality.
 
 ```bash
 python -m venv .venv && .venv/bin/pip install -r requirements.txt
-export OPENAI_API_KEY=... EXA_API_KEY=... PARALLEL_API_KEY=... YDC_API_KEY=...
+cp .env.example .env
 ```
 
-`.env` supplies `BRAINTRUST_API_KEY` and `BRAINTRUST_PROJECT_ID` and always
-overrides any ambient credential, per [AGENTS.md](AGENTS.md).
+Fill `.env`; every supported credential is loaded from that file and overrides
+or clears the corresponding ambient credential, per [AGENTS.md](AGENTS.md).
 
 ## Running
 
@@ -61,9 +71,128 @@ python import_livenewsbench.py <datasets_root> --source-commit <sha>
 python import_retrievalqa.py <source_file> --source-revision <rev> --source-sha256 <sha>
 ```
 
+### Building Corvus-QA
+
+Corvus-QA sources fact transitions rather than authored questions. Each source
+adapter should emit one JSONL `FactEvent` observation with this shape:
+
+```json
+{
+  "entity_id": "CIK0000123456",
+  "entity_name": "Example Corp",
+  "entity_type": "company",
+  "attribute": "ceo_of",
+  "old_value": "Former CEO",
+  "new_value": "Current CEO",
+  "effective_ts": "2026-07-28T09:00:00Z",
+  "observed_ts": "2026-07-28T12:00:00Z",
+  "source_url": "https://authority.example/event",
+  "source_type": "filing",
+  "resolver_id": "edgar-8k",
+  "authority_family": "sec",
+  "compliance_source_id": "sec_edgar",
+  "distribution_rights_confirmed": true,
+  "aliases": ["C. CEO"],
+  "provenance": {}
+}
+```
+
+`authority_family` names the underlying authority, not merely the detector. A
+Wikidata observation citing an SEC filing therefore remains in the `sec`
+family. By default, a row is eligible only when two resolvers backed by two
+authority families agree on the entity, attribute, new value, effective time,
+and previous answer.
+
+Build the dry-run dev set and publication test set as separate freezes:
+
+```bash
+python -m corvus.cli.build_dataset events-dev.jsonl corvus-dev.jsonl \
+    --split dev --freeze-id 2026-07-dry-run \
+    --as-of 2026-07-30T17:00:00Z
+python -m corvus.cli.build_dataset events-test.jsonl corvus-test.jsonl \
+    --split test --freeze-id 2026-08-preregistered \
+    --as-of 2026-08-30T17:00:00Z
+```
+
+Each command writes the eligible rows, a rejection ledger, and a SHA-256
+manifest. Inspect those artifacts before importing. The importer verifies the
+hash and refuses empty input; it then replaces the selected dataset head and
+creates a named snapshot:
+
+```bash
+python -m corvus.cli.import_dataset corvus-dev.jsonl \
+    --manifest corvus-dev.jsonl.manifest.json --split dev \
+    --compliance-approval compliance-approval.json
+python -m corvus.cli.import_dataset corvus-test.jsonl \
+    --manifest corvus-test.jsonl.manifest.json --split test \
+    --compliance-approval compliance-approval.json
+```
+
+The split is encoded in physically separate Braintrust datasets
+(`Corvus-QA-dev` and `Corvus-QA-test`) so harness tuning cannot silently consume
+test rows. Run either with `--dataset-name` and its pinned snapshot version.
+Corvus metadata maps `effective_ts` to `event_date` and source URLs to
+`articles[*].url`, so the existing temporal-grounding and leakage scorers work
+without a dataset-specific branch. `previous_answer` is retained for
+stale-answer analysis.
+
+The source adapters live in [corvus/sources.py](corvus/sources.py). They
+require a monitored organizational `CORVUS_CONTACT_EMAIL` and the
+single-deployment confirmation in `.env`. They run serially at one
+request/second with shared local locking, bounded backoff, and approved-host
+checks. They also preserve effective time separately from observation time.
+EDGAR Item 5.02 candidates require a reviewed `OfficerTransition`; only
+the reviewed excerpt's hash enters provenance. Wikidata changes use the cited
+reference's domain as the authority family, preventing an SEC-cited Wikidata
+claim from falsely counting as independent of EDGAR.
+
+Use the compliance-gated collector rather than constructing generic HTTP
+clients:
+
+```bash
+python -m corvus.cli.smoke_test
+python -m corvus.cli.check_compliance
+python -m corvus.cli.collect_sources edgar-candidates \
+    --cik 0000123456 --since 2026-07-01 --until 2026-07-31 \
+    --output edgar-candidates.jsonl
+python -m corvus.cli.collect_sources wikidata-latest \
+    --qid Q123 --property P169 --attribute ceo_of \
+    --canonical-entity-id CIK0000123456 --entity-type company \
+    --effective-ts 2026-07-28T09:00:00Z \
+    --output wikidata-events.jsonl
+```
+
+EDGAR collection deliberately emits candidates rather than guessing officer
+names or effective dates from prose. A reviewed `OfficerTransition` must be
+created from the filing before `EdgarAdapter.emit_fact` produces a `FactEvent`.
+
+Optional trap JSONL can be supplied with `--traps-file` and `--run-end`. A trap
+is accepted only when two resolvers and two authorities agree on its scheduled
+resolution and it resolves more than seven days after the run:
+
+```bash
+python -m corvus.cli.build_dataset events-test.jsonl corvus-test.jsonl \
+    --split test --freeze-id 2026-08-preregistered \
+    --as-of 2026-08-30T17:00:00Z \
+    --traps-file traps-test.jsonl --run-end 2026-09-02T17:00:00Z
+```
+
+Recency rungs are computed against `--as-of`. Coverage tiers may be loaded with
+`--coverage-file`, but every assessment must affirm storage rights; unlicensed
+search-result storage fails validation and its `compliance_source_id` must be
+approved by the source policy. Review
+[Corvus compliance review](docs/corvus-compliance.md) and the machine-readable
+[source policy](config/corvus/source_compliance.json) before collecting or
+publishing any source.
+
 Use one `study-id`, pinned dataset version, and agent model across every
 condition in a comparison. Interleave conditions in time—running them days
 apart makes the web itself a variable:
+
+Search-provider arms fail closed until
+[provider permissions](config/corvus/provider_permissions.json) record actual written
+permission for benchmarking, result retention, and Braintrust storage. Generic
+webpage fetching is disabled.
 
 ```bash
 python run_eval.py run --provider exa --arm native_fresh \

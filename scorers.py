@@ -206,6 +206,24 @@ def qa_answer_match(input, output, expected, **kwargs):
                              "reason": "no gold answer on this row"}}
 
     attempted = bool(pred_norm) and REFUSAL_SENTINEL not in pred_norm
+    normalized_golds = [_normalize_answer(gold) for gold in golds]
+    expected_refusal = REFUSAL_SENTINEL in normalized_golds
+    if expected_refusal and REFUSAL_SENTINEL in pred_norm:
+        return {
+            "name": "qa_answer_match",
+            "score": 1.0,
+            "metadata": {
+                "applicable": True,
+                "attempted": False,
+                "match_type": "expected_refusal",
+                "matched_gold": next(
+                    gold
+                    for gold in golds
+                    if _normalize_answer(gold) == REFUSAL_SENTINEL
+                ),
+                "n_acceptable": len(golds),
+            },
+        }
     if not attempted:
         return {"name": "qa_answer_match", "score": 0.0,
                 "metadata": {"applicable": True, "attempted": False,

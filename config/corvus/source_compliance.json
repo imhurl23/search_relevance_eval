@@ -1,0 +1,132 @@
+{
+  "reviewed_at": "2026-07-30",
+  "review_valid_until": "2026-08-29",
+  "review_kind": "engineering_only_pending_authorized_release_approval",
+  "dataset_distribution_policy": {
+    "release": "derived_facts_and_source_urls_only",
+    "exclude": [
+      "source_document_bodies",
+      "search_result_snippets",
+      "personal_information_not_required_by_the_question",
+      "api_keys_and_raw_authenticated_responses"
+    ],
+    "legal_review_required_before_publication": true
+  },
+  "sources": {
+    "sec_edgar": {
+      "status": "approved_with_controls",
+      "allowed_output": ["derived_facts", "filing_metadata", "source_urls"],
+      "controls": [
+        "identify the client with a contact email",
+        "run serially at one request per second with a shared local process lock",
+        "confirm no other machine or service shares the aggregate SEC request budget",
+        "honor Retry-After and exponentially back off on 429 and transient 5xx responses",
+        "download only required filings",
+        "do not redistribute filing bodies in the dataset"
+      ],
+      "terms_url": "https://www.sec.gov/about/webmaster-frequently-asked-questions",
+      "aggregate_limit_url": "https://www.sec.gov/filergroup/announcements-old/new-rate-control-limits",
+      "data_url": "https://www.sec.gov/search-filings/edgar-application-programming-interfaces"
+    },
+    "wikidata": {
+      "status": "approved_with_controls",
+      "license": "CC0-1.0",
+      "allowed_output": ["structured_facts", "entity_ids", "reference_urls"],
+      "controls": [
+        "send a descriptive User-Agent with contact information",
+        "run requests serially at one request per second",
+        "send maxlag=1 and gzip support",
+        "respect Retry-After and exponentially back off on maxlag, rate-limit, and transient HTTP errors",
+        "credit Wikidata in the dataset card"
+      ],
+      "terms_url": "https://foundation.wikimedia.org/wiki/Policy:Wikimedia_Foundation_User-Agent_Policy/en",
+      "api_etiquette_url": "https://www.mediawiki.org/wiki/API:Etiquette/en",
+      "license_url": "https://www.wikidata.org/wiki/Wikidata:Licensing"
+    },
+    "nvd": {
+      "status": "approved_with_controls",
+      "license": "US-public-domain",
+      "allowed_output": ["derived_facts", "cve_ids", "cvss_values", "source_urls"],
+      "required_notice": "This product uses data from the NVD API but is not endorsed or certified by the NVD.",
+      "controls": [
+        "load NVD_API_KEY from .env when used",
+        "do not share the API key",
+        "respect 5 requests per 30 seconds without a key or 50 with a key",
+        "do not attribute modified NVD content to NVD"
+      ],
+      "terms_url": "https://nvd.nist.gov/developers/terms-of-use"
+    },
+    "cve_list": {
+      "status": "approved_with_controls",
+      "license": "CVE-Program-Terms-of-Use",
+      "allowed_output": ["derived_facts", "cve_ids", "source_urls"],
+      "controls": [
+        "preserve the CVE copyright designation and license notice when copying CVE content",
+        "prefer derived facts rather than copied descriptions",
+        "do not represent modified content as an unmodified CVE Record"
+      ],
+      "terms_url": "https://www.cve.org/Legal/TermsOfUse",
+      "data_url": "https://www.cve.org/Downloads"
+    },
+    "cisa_kev": {
+      "status": "approved_with_controls",
+      "allowed_output": ["derived_facts", "cve_ids", "catalog_dates", "source_urls"],
+      "controls": [
+        "use the official CSV or JSON download",
+        "do not use CISA marks or branding to imply endorsement",
+        "retain a source URL and retrieval timestamp"
+      ],
+      "data_url": "https://www.cisa.gov/known-exploited-vulnerabilities-catalog"
+    },
+    "github_releases": {
+      "status": "conditional",
+      "allowed_output": ["release_tags", "release_dates", "source_urls"],
+      "controls": [
+        "check and record the underlying repository license",
+        "publish resulting research open access",
+        "collect only public non-personal information",
+        "respect primary and secondary API rate limits",
+        "do not redistribute release notes unless their license permits it"
+      ],
+      "terms_url": "https://docs.github.com/en/site-policy/github-terms/github-terms-of-service",
+      "acceptable_use_url": "https://docs.github.com/en/site-policy/acceptable-use-policies/github-acceptable-use-policies"
+    },
+    "gleif_lei": {
+      "status": "approved_identity_crosswalk_only",
+      "license": "CC0-1.0",
+      "allowed_output": ["lei", "legal_entity_name", "mapped_identifiers"],
+      "reason": "Useful for entity identity and crosswalks, not an independent resolver for leadership changes.",
+      "terms_url": "https://www.gleif.org/en/meta/lei-data-terms-of-use"
+    },
+    "uk_companies_house": {
+      "status": "candidate_privacy_review_required",
+      "reason": "The official API includes officer and other personal data; downstream users become responsible for applicable data-protection compliance.",
+      "api_url": "https://www.api.gov.uk/ch/companies-house/",
+      "rate_limit_url": "https://developer-specs.company-information.service.gov.uk/guides/rateLimiting",
+      "privacy_url": "https://www.gov.uk/government/organisations/companies-house/about/personal-information-charter"
+    },
+    "brave_search": {
+      "status": "blocked_without_contract",
+      "reason": "Storing API results requires a plan that explicitly grants storage rights.",
+      "terms_url": "https://brave.com/search/api/"
+    },
+    "gdelt_cloud": {
+      "status": "blocked_without_contract",
+      "reason": "Dataset redistribution or materially transformed redistribution requires a separate written license.",
+      "terms_url": "https://gdeltcloud.com/terms"
+    },
+    "common_crawl_content": {
+      "status": "blocked_for_distribution",
+      "reason": "Crawled content remains subject to origin-site terms and rights.",
+      "terms_url": "https://commoncrawl.org/terms-of-use"
+    },
+    "official_election_feeds": {
+      "status": "review_per_jurisdiction",
+      "reason": "Licenses and certification status vary by election authority."
+    },
+    "official_sports_feeds": {
+      "status": "review_per_league",
+      "reason": "League data and fixture redistribution terms vary and are often commercial."
+    }
+  }
+}

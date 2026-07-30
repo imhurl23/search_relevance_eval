@@ -7,9 +7,8 @@ Braintrust-native throughout:
   * reads a versioned LiveNewsBench or RetrievalQA dataset from the project
     named by BRAINTRUST_PROJECT_ID; real comparisons require a pinned version
   * agent LLM calls auto-traced via wrap_openai
-  * every search/fetch is a `tool` span with native metrics (tokens, latency,
-    $cost) and the RAW provider payload in span metadata — the decision-surface
-    analysis depends on pre-normalization responses surviving in traces
+  * every approved search is a `tool` span with native metrics; raw provider
+    payloads are never retained
   * trial_count for retrieval nondeterminism (temp 0 doesn't freeze the web)
 
 Dataset contract (set by the importers, consumed by scorers.py):
@@ -21,8 +20,7 @@ Leakage excludes and temporal grounding both read from metadata, not expected.
 
 Usage:
     # .env supplies BRAINTRUST_API_KEY + BRAINTRUST_PROJECT_ID and always wins
-    export OPENAI_API_KEY=...
-    export EXA_API_KEY=... PARALLEL_API_KEY=... YDC_API_KEY=...
+    # All credentials must be in .env; ambient credentials are ignored.
 
     # dataset push lives in import_livenewsbench.py, not here:
     python import_livenewsbench.py <datasets_root> --source-commit <sha>
@@ -50,6 +48,8 @@ from braintrust import Eval, current_span, init_dataset, traced, wrap_openai
 from openai import OpenAI
 
 from import_livenewsbench import DATASET_NAME, load_env
+from corvus.compliance import require_provider_permission
+from corvus.sources import SharedHostLimiter, retry_after_seconds
 from scorers import (DETERMINISTIC_SCORERS, make_jury_grader,
                      make_simpleqa_grader)
 
@@ -58,17 +58,31 @@ from scorers import (DETERMINISTIC_SCORERS, make_jury_grader,
 # ---------------------------------------------------------------------------
 
 
-def load_braintrust_env(env_path: Path) -> tuple[str, str]:
-    """Return (api_key, project_id) from the env file, overriding the ambient
-    BRAINTRUST_API_KEY so a stale shell export can never redirect a run."""
+RUNTIME_ENV_NAMES = (
+    "BRAINTRUST_API_KEY",
+    "BRAINTRUST_PROJECT_ID",
+    "OPENAI_API_KEY",
+    "EXA_API_KEY",
+    "PARALLEL_API_KEY",
+    "YDC_API_KEY",
+    "JUDGE_API_KEY",
+)
+
+
+def load_runtime_env(env_path: Path) -> tuple[str, str]:
+    """Load all supported credentials only from .env, overriding the ambient."""
     env = load_env(env_path)
+    for name in RUNTIME_ENV_NAMES:
+        if env.get(name):
+            os.environ[name] = env[name]
+        else:
+            os.environ.pop(name, None)
     api_key = env.get("BRAINTRUST_API_KEY")
     project_id = env.get("BRAINTRUST_PROJECT_ID")
     if not api_key or not project_id:
         raise SystemExit(
             f"{env_path}: BRAINTRUST_API_KEY and BRAINTRUST_PROJECT_ID are required"
         )
-    os.environ["BRAINTRUST_API_KEY"] = api_key
     return api_key, project_id
 
 
@@ -77,9 +91,8 @@ def load_braintrust_env(env_path: Path) -> tuple[str, str]:
 # ---------------------------------------------------------------------------
 
 AGENT_MODEL = "gpt-4o-2024-11-20"      # pin an exact snapshot; judge = gpt-4.1 (different lineage at minimum — ideally use a non-OpenAI judge)
-MAX_SEARCHES, MAX_CLICKS = 5, 5        # LiveNewsBench defaults
+MAX_SEARCHES, MAX_CLICKS = 5, 0
 SNIPPET_CHARS = 400                    # normalized-arm snippet truncation
-FETCH_CHARS = 6000                     # shared fetcher page budget
 N_RESULTS = 8
 
 # Exa search tier. Their default is "auto", which routes per query — pinning it
@@ -91,9 +104,9 @@ PARALLEL_BETA = "search-extract-2025-10-10"
 PARALLEL_MAX_DOMAINS = 200
 
 FROZEN_SYSTEM_PROMPT = """\
-You are a web research agent answering a time-sensitive factual question. You have two tools:
-search_web(query) and fetch_page(url). You may use at most 5 searches and
-5 page fetches total. Search results show rank, title, url, snippet, and
+You are a web research agent answering a time-sensitive factual question. You have one tool:
+search_web(query). You may use at most 5 searches and may not fetch result pages.
+Search results show rank, title, url, snippet, and
 published date when available. When you know the answer, stop calling tools
 and reply with ONLY the final answer, as concisely as possible. If you cannot
 determine the answer within budget, reply exactly: I could not find this."""
@@ -116,12 +129,6 @@ TOOLS = [
         "parameters": {"type": "object",
                        "properties": {"query": {"type": "string"}},
                        "required": ["query"]}}},
-    {"type": "function", "function": {
-        "name": "fetch_page",
-        "description": "Fetch the text content of a result URL.",
-        "parameters": {"type": "object",
-                       "properties": {"url": {"type": "string"}},
-                       "required": ["url"]}}},
 ]
 
 # Approximate per-call search pricing (USD) for native cost metrics.
@@ -193,9 +200,40 @@ def source_domains_of(metadata: dict, expected) -> list[str]:
 
 _http = httpx.Client(
     timeout=httpx.Timeout(30.0, connect=10.0),
-    follow_redirects=True,
-    headers={"user-agent": "Mozilla/5.0 (compatible; livenewsbench-eval/1.0)"},
+    follow_redirects=False,
+    headers={"user-agent": "CorvusEval/0.1"},
 )
+_provider_limiters: dict[str, SharedHostLimiter] = {}
+
+
+def _provider_json(method: str, url: str, **kwargs):
+    """Conservative serial provider request with bounded retry/backoff."""
+    host = (urlparse(url).hostname or "").lower()
+    approved_hosts = {"api.exa.ai", "api.parallel.ai", "ydc-index.io"}
+    if host not in approved_hosts:
+        raise ValueError(f"unapproved provider API host: {host!r}")
+    limiter = _provider_limiters.setdefault(
+        host, SharedHostLimiter(f"provider-{host}", 1.0)
+    )
+    for attempt in range(5):
+        limiter.wait()
+        response = _http.request(method, url, **kwargs)
+        if 300 <= response.status_code < 400:
+            raise ValueError("provider API redirect refused")
+        if (response.url.host or "").lower() not in approved_hosts:
+            raise ValueError("provider API redirected to an unapproved host")
+        if response.status_code not in (429, 500, 502, 503, 504):
+            response.raise_for_status()
+            value = response.json()
+            if not isinstance(value, dict):
+                raise ValueError(f"{url}: expected a JSON object")
+            return value
+        if attempt == 4:
+            response.raise_for_status()
+        delay = max(retry_after_seconds(response.headers.get("Retry-After")),
+                    min(60.0, 5.0 * (2 ** attempt)))
+        time.sleep(delay)
+    raise AssertionError("unreachable")
 
 
 def exa_search(query: str, arm: str, exclude_domains: list[str]):
@@ -217,10 +255,12 @@ def exa_search(query: str, arm: str, exclude_domains: list[str]):
         # deprecated, so this uses "always"; maxAgeHours accepts -1..720.
         body["contents"]["livecrawl"] = "always"
         body["contents"]["maxAgeHours"] = 24
-    r = _http.post("https://api.exa.ai/search", json=body,
-                   headers={"x-api-key": os.environ["EXA_API_KEY"]})
-    r.raise_for_status()
-    raw = r.json()
+    raw = _provider_json(
+        "POST",
+        "https://api.exa.ai/search",
+        json=body,
+        headers={"x-api-key": os.environ["EXA_API_KEY"]},
+    )
     results = []
     for i, res in enumerate(raw.get("results", []), start=1):
         highlights = res.get("highlights") or []
@@ -247,12 +287,16 @@ def parallel_search(query: str, arm: str, exclude_domains: list[str]):
         "source_policy": {
             "exclude_domains": exclude_domains[:PARALLEL_MAX_DOMAINS]},
     }
-    r = _http.post("https://api.parallel.ai/v1beta/search", json=body,
-                   headers={"x-api-key": os.environ["PARALLEL_API_KEY"],
-                            "parallel-beta": PARALLEL_BETA,
-                            "content-type": "application/json"})
-    r.raise_for_status()
-    raw = r.json()
+    raw = _provider_json(
+        "POST",
+        "https://api.parallel.ai/v1beta/search",
+        json=body,
+        headers={
+            "x-api-key": os.environ["PARALLEL_API_KEY"],
+            "parallel-beta": PARALLEL_BETA,
+            "content-type": "application/json",
+        },
+    )
     results = []
     for i, res in enumerate(raw.get("results", []), start=1):
         excerpts = res.get("excerpts") or []
@@ -284,10 +328,12 @@ def youdotcom_search(query: str, arm: str, exclude_domains: list[str]):
         # NB: You.com also exposes a `livecrawl` param, but it only populates
         # result.contents — it would not change the snippet decision surface we
         # measure, so enabling it would add latency and cost for no signal.
-    r = _http.get("https://ydc-index.io/v1/search", params=params,
-                  headers={"X-API-Key": os.environ["YDC_API_KEY"]})
-    r.raise_for_status()
-    raw = r.json()
+    raw = _provider_json(
+        "GET",
+        "https://ydc-index.io/v1/search",
+        params=params,
+        headers={"X-API-Key": os.environ["YDC_API_KEY"]},
+    )
     # results.web[] carries `snippets`; results.news[] does not, so web is the
     # only shape comparable to the other providers' snippets.
     hits = (raw.get("results") or {}).get("web") or []
@@ -309,7 +355,7 @@ PROVIDERS = {"exa": exa_search, "parallel": parallel_search,
 
 
 # ---------------------------------------------------------------------------
-# Traced tools. type="tool" spans; native metrics + raw payloads in metadata.
+# Traced tools. type="tool" spans; native metrics without raw payload retention.
 # notrace_io=True on both: @traced otherwise auto-logs the return value over
 # the explicit output= below, and these return tuples, not the payload we want.
 # ---------------------------------------------------------------------------
@@ -317,7 +363,7 @@ PROVIDERS = {"exa": exa_search, "parallel": parallel_search,
 @traced(type="tool", name="search_web", notrace_io=True)
 def run_search(provider: str, arm: str, query: str, exclude_domains: list[str]):
     t0 = time.perf_counter()
-    results, raw = PROVIDERS[provider](query, arm, exclude_domains)
+    results, _raw = PROVIDERS[provider](query, arm, exclude_domains)
     latency = time.perf_counter() - t0
     rendered = "\n".join(
         f"[{r['rank']}] {r['title']}\n    {r['url']}\n    "
@@ -331,44 +377,8 @@ def run_search(provider: str, arm: str, query: str, exclude_domains: list[str]):
                  "latency_s": latency,
                  "search_cost_usd": SEARCH_COST.get((provider, arm), 0.0),
                  "n_results": len(results)},
-        metadata={"raw_response": raw},   # pre-normalization payload, verbatim
     )
     return results, rendered, _tok(rendered)
-
-
-@traced(type="tool", name="fetch_page", notrace_io=True)
-def run_fetch(url: str, blocked_domains: list[str]):
-    """Provider-NEUTRAL fetcher, so 'fetch' quality is held constant and only
-    the search layer varies. (Using Exa /contents or You.com livecrawl here
-    would smuggle the provider back into the fetch arm.)"""
-    t0 = time.perf_counter()
-    host = _domain_of(url)
-    status = None
-    blocked = False
-    if not host:
-        text = "FETCH ERROR: not a fetchable URL."
-    elif any(host == d or host.endswith("." + d) for d in blocked_domains):
-        text, blocked = "BLOCKED: this domain is excluded for this task.", True
-    else:
-        try:
-            resp = _http.get(url)
-            status = resp.status_code
-            # Without this, a 403/404 interstitial becomes "page text" and the
-            # agent treats a paywall notice as evidence.
-            resp.raise_for_status()
-            body = re.sub(r"(?is)<(script|style|nav|footer|header)[^>]*>.*?</\1>", " ", resp.text)
-            body = re.sub(r"(?s)<[^>]+>", " ", body)
-            text = re.sub(r"\s+", " ", body).strip()[:FETCH_CHARS]
-        except Exception as e:
-            text = f"FETCH ERROR: {type(e).__name__}: {e}"
-    current_span().log(
-        input={"url": url},
-        output=text[:500],
-        metrics={"tokens": _tok(text), "latency_s": time.perf_counter() - t0},
-        metadata={"blocked": blocked, "host": host, "http_status": status,
-                  "ok": not blocked and not text.startswith("FETCH ERROR")},
-    )
-    return text, _tok(text), blocked
 
 
 # ---------------------------------------------------------------------------
@@ -377,7 +387,6 @@ def run_fetch(url: str, blocked_domains: list[str]):
 
 # Built lazily: constructing OpenAI() at import time raises on a missing
 # OPENAI_API_KEY, which would crash `--help` and preempt _preflight's clear
-# error message. wrap_openai makes every completion an LLM span.
 agent_client = None
 
 
@@ -421,8 +430,8 @@ def make_task(
                     {"role": "user", "content": question}]
         trajectory, searches, clicks = [], 0, 0
         prompt_tokens, completion_tokens = 0, 0
-        # Attempts REFUSED because the budget was already spent. The 5/5 cap is
-        # the benchmark protocol, but it also hides tool-call runaway, which is a
+        # Attempts REFUSED because the search budget was already spent. The cap
+        # is the benchmark protocol, but it also hides tool-call runaway, which is a
         # provider-attributable cost failure mode elsewhere in the literature.
         # Counting refusals recovers that signal without relaxing the cap.
         refused_searches, refused_clicks = 0, 0
@@ -466,20 +475,9 @@ def make_task(
                             provider, arm, query, excludes)
                         trajectory.append({"type": "search", "query": query,
                                            "tokens": tok, "results": results})
-                elif name == "fetch_page":
-                    if clicks >= MAX_CLICKS:
-                        refused_clicks += 1
-                        content = "Fetch budget exhausted."
-                    else:
-                        clicks += 1
-                        url = args.get("url", "")
-                        content, tok, _ = run_fetch(url, excludes)
-                        trajectory.append({"type": "fetch", "url": url,
-                                           "tokens": tok})
                 else:
-                    # Never silently route an unknown name into fetch_page.
                     bad_tool_calls += 1
-                    content = f"Unknown tool: {name}. Use search_web or fetch_page."
+                    content = f"Unknown tool: {name}. Use search_web."
                 messages.append({"role": "tool", "tool_call_id": tc.id,
                                  "content": content})
         if final is None:
@@ -551,6 +549,7 @@ def _preflight(provider: str, arm: str) -> None:
     """Fail before spending money, not on row 1 of N."""
     needed = ["OPENAI_API_KEY"]
     if arm != NO_SEARCH_ARM:
+        require_provider_permission(provider)
         needed.append(PROVIDER_KEYS[provider])
     missing = [k for k in needed if not os.environ.get(k)]
     if missing:
@@ -585,7 +584,7 @@ def build_judges(specs: list[str]):
 def run(provider: str, arm: str, dataset_name: str, dataset_version: str | None,
         trials: int, judge_specs: list[str], agent_model: str, study_id: str,
         env_path: Path):
-    api_key, project_id = load_braintrust_env(env_path)
+    api_key, project_id = load_runtime_env(env_path)
     _preflight(provider, arm)
 
     dataset = init_dataset(project_id=project_id, name=dataset_name,

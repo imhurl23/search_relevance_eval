@@ -2,6 +2,7 @@
 .env
 .env.*
 !.env.example
+AGENTS.md
 
 # Python environments and bytecode
 .venv/
@@ -26,6 +27,11 @@ dist/
 
 # Braintrust CLI-generated local state
 .bt/
+.corvus/
+# Legacy locations used before Corvus runtime state was consolidated.
+.corvus-rate-limits/
+.corvus-collector.lock
+data/corvus_live/
 
 # Editor and operating-system files
 .DS_Store
