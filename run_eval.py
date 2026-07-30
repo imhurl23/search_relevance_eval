@@ -1,21 +1,20 @@
-"""
-Braintrust harness for LiveNewsBench x {Exa, Parallel, You.com}.
+"""Starter Braintrust harness for web-search API x LLM freshness experiments.
 
-One frozen agent (temp 0, fixed prompt, two tools), provider + arm are the
-only variables. Braintrust-native throughout:
+Within one condition block, the agent is frozen (model snapshot, temperature,
+prompt, tools, and budget); provider + arm are the treatment variables.
+Braintrust-native throughout:
 
-  * reads the dataset that import_livenewsbench.py pushes ("LiveNewsBench" in
-    the project named by BRAINTRUST_PROJECT_ID); --dataset-version pins a
-    version so cross-provider diffs are item-paired in the UI
+  * reads a versioned LiveNewsBench or RetrievalQA dataset from the project
+    named by BRAINTRUST_PROJECT_ID; real comparisons require a pinned version
   * agent LLM calls auto-traced via wrap_openai
   * every search/fetch is a `tool` span with native metrics (tokens, latency,
     $cost) and the RAW provider payload in span metadata — the decision-surface
     analysis depends on pre-normalization responses surviving in traces
   * trial_count for retrieval nondeterminism (temp 0 doesn't freeze the web)
 
-Dataset contract (set by import_livenewsbench.py, consumed by scorers.py):
+Dataset contract (set by the importers, consumed by scorers.py):
     input    = {"question": str}
-    expected = answer string          <- NOT a dict
+    expected = answer string or list of acceptable answer strings
     metadata = upstream row fields (link, articles, event_date, ...) plus
                livenewsbench_release / livenewsbench_split / source_commit
 Leakage excludes and temporal grounding both read from metadata, not expected.
@@ -29,12 +28,14 @@ Usage:
     python import_livenewsbench.py <datasets_root> --source-commit <sha>
 
     # per (provider, arm): interleave these in time, don't run days apart
-    python run_eval.py run --provider exa --arm native_fresh --trials 3
+    python run_eval.py run --provider exa --arm native_fresh \
+      --dataset-version <xact-id> --study-id freshness-v1 --trials 3
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -49,7 +50,8 @@ from braintrust import Eval, current_span, init_dataset, traced, wrap_openai
 from openai import OpenAI
 
 from import_livenewsbench import DATASET_NAME, load_env
-from scorers import DETERMINISTIC_SCORERS, make_simpleqa_grader
+from scorers import (DETERMINISTIC_SCORERS, make_jury_grader,
+                     make_simpleqa_grader)
 
 # ---------------------------------------------------------------------------
 # Credentials. AGENTS.md: the .env key always overrides any ambient credential.
@@ -89,12 +91,23 @@ PARALLEL_BETA = "search-extract-2025-10-10"
 PARALLEL_MAX_DOMAINS = 200
 
 FROZEN_SYSTEM_PROMPT = """\
-You are a web research agent answering a news question. You have two tools:
+You are a web research agent answering a time-sensitive factual question. You have two tools:
 search_web(query) and fetch_page(url). You may use at most 5 searches and
 5 page fetches total. Search results show rank, title, url, snippet, and
 published date when available. When you know the answer, stop calling tools
 and reply with ONLY the final answer, as concisely as possible. If you cannot
 determine the answer within budget, reply exactly: I could not find this."""
+
+# Control arm: no tools at all, so the agent answers from parametric memory.
+# Without this baseline a provider's score is uninterpretable — you cannot tell
+# retrieval quality from what the model already knew, and LiveNewsBench rows
+# older than the agent's training cutoff are answerable with no search at all.
+# Subtract this arm from every provider arm to get retrieval's marginal value.
+NO_SEARCH_ARM = "no_search"
+NO_SEARCH_SYSTEM_PROMPT = """\
+You are answering a time-sensitive factual question from memory. You have no tools and no web
+access. When you know the answer, reply with ONLY the final answer, as concisely
+as possible. If you do not know, reply exactly: I could not find this."""
 
 TOOLS = [
     {"type": "function", "function": {
@@ -375,18 +388,44 @@ def get_agent_client():
     return agent_client
 
 
-def make_task(provider: str, arm: str):
+def make_task(
+    provider: str,
+    arm: str,
+    agent_model: str = AGENT_MODEL,
+    study_id: str = "freshness-v1",
+    dataset_name: str = DATASET_NAME,
+    dataset_version: str | None = None,
+):
 
     def task(input: dict, hooks) -> dict:
         # Leakage excludes come from row METADATA (link + articles[*]), which is
         # where the importer puts them and where leakage_guard reads them.
         # `expected` is the answer string, so it has no .get().
-        source_domains = source_domains_of(hooks.metadata or {}, hooks.expected)
+        row_metadata = hooks.metadata or {}
+        source_domains = source_domains_of(row_metadata, hooks.expected)
         excludes = source_domains + ARCHIVE_EXCLUDES
+        no_search = arm == NO_SEARCH_ARM
+        condition = "no_search" if no_search else f"{provider}-{arm}"
+        condition_id = f"{agent_model}::{condition}"
+        question = input["question"]
+        task_key = hashlib.sha256(question.encode("utf-8")).hexdigest()[:16]
+        benchmark_category = (
+            row_metadata.get("category")
+            or row_metadata.get("event_category")
+            or row_metadata.get("data_source")
+            or "uncategorized"
+        )
 
-        messages = [{"role": "system", "content": FROZEN_SYSTEM_PROMPT},
-                    {"role": "user", "content": input["question"]}]
+        messages = [{"role": "system", "content":
+                     NO_SEARCH_SYSTEM_PROMPT if no_search else FROZEN_SYSTEM_PROMPT},
+                    {"role": "user", "content": question}]
         trajectory, searches, clicks = [], 0, 0
+        prompt_tokens, completion_tokens = 0, 0
+        # Attempts REFUSED because the budget was already spent. The 5/5 cap is
+        # the benchmark protocol, but it also hides tool-call runaway, which is a
+        # provider-attributable cost failure mode elsewhere in the literature.
+        # Counting refusals recovers that signal without relaxing the cap.
+        refused_searches, refused_clicks = 0, 0
         bad_tool_calls = 0
         final = None
 
@@ -395,10 +434,13 @@ def make_task(provider: str, arm: str):
             # the tools and force a final answer instead of burning turns on
             # "budget exhausted" replies until the loop cap trips.
             out_of_budget = searches >= MAX_SEARCHES and clicks >= MAX_CLICKS
-            kwargs = {} if out_of_budget else {"tools": TOOLS}
+            kwargs = {} if (no_search or out_of_budget) else {"tools": TOOLS}
             resp = get_agent_client().chat.completions.create(
-                model=AGENT_MODEL, temperature=0, seed=42,
+                model=agent_model, temperature=0, seed=42,
                 messages=messages, **kwargs)
+            usage = getattr(resp, "usage", None)
+            prompt_tokens += int(getattr(usage, "prompt_tokens", 0) or 0)
+            completion_tokens += int(getattr(usage, "completion_tokens", 0) or 0)
             msg = resp.choices[0].message
             if not msg.tool_calls:
                 final = (msg.content or "").strip()
@@ -415,6 +457,7 @@ def make_task(provider: str, arm: str):
 
                 if name == "search_web":
                     if searches >= MAX_SEARCHES:
+                        refused_searches += 1
                         content = "Search budget exhausted."
                     else:
                         searches += 1
@@ -425,6 +468,7 @@ def make_task(provider: str, arm: str):
                                            "tokens": tok, "results": results})
                 elif name == "fetch_page":
                     if clicks >= MAX_CLICKS:
+                        refused_clicks += 1
                         content = "Fetch budget exhausted."
                     else:
                         clicks += 1
@@ -441,20 +485,49 @@ def make_task(provider: str, arm: str):
         if final is None:
             final = "I could not find this."
 
+        surfaced_domains = {
+            _domain_of(result.get("url", ""))
+            for step in trajectory if step.get("type") == "search"
+            for result in step.get("results", [])
+            if _domain_of(result.get("url", ""))
+        }
         hooks.metadata.update({
-            "provider": provider, "arm": arm, "agent_model": AGENT_MODEL,
+            "provider": "none" if no_search else provider,
+            "arm": arm, "agent_model": agent_model,
+            "study_id": study_id,
+            "condition_id": condition_id,
+            "dataset_name": dataset_name,
+            "dataset_version": dataset_version,
             "trial_index": hooks.trial_index,
+            "task_key": task_key,
+            "benchmark_category": benchmark_category,
             "excluded_source_domains": source_domains,
             "bad_tool_calls": bad_tool_calls,
+            "refused_searches": refused_searches,
+            "refused_clicks": refused_clicks,
             "as_of": datetime.now(timezone.utc).isoformat(),
         })
         # Task-span metrics; Braintrust rolls these into the experiment summary.
+        # search_cost_usd is search spend ONLY — model inference cost comes from
+        # the wrapped LLM spans, so keep the two decomposable rather than summing
+        # them here. Total cost per row is an analysis-side join of the two.
         current_span().log(metrics={
             "search_cost_usd": searches * SEARCH_COST.get((provider, arm), 0.0),
             "used_searches": searches, "used_clicks": clicks,
+            "refused_tool_calls": refused_searches + refused_clicks,
+            "agent_prompt_tokens": prompt_tokens,
+            "agent_completion_tokens": completion_tokens,
+            "agent_total_tokens": prompt_tokens + completion_tokens,
+            "answer_words": len(final.split()),
+            "answer_chars": len(final),
+            "distinct_surfaced_domains": len(surfaced_domains),
         })
         return {"final_answer": final, "trajectory": trajectory,
-                "used_searches": searches, "used_clicks": clicks}
+                "used_searches": searches, "used_clicks": clicks,
+                "refused_searches": refused_searches,
+                "refused_clicks": refused_clicks,
+                "agent_prompt_tokens": prompt_tokens,
+                "agent_completion_tokens": completion_tokens}
 
     return task
 
@@ -476,17 +549,42 @@ def _git_commit() -> str:
 
 def _preflight(provider: str, arm: str) -> None:
     """Fail before spending money, not on row 1 of N."""
-    missing = [k for k in ("OPENAI_API_KEY", PROVIDER_KEYS[provider])
-               if not os.environ.get(k)]
+    needed = ["OPENAI_API_KEY"]
+    if arm != NO_SEARCH_ARM:
+        needed.append(PROVIDER_KEYS[provider])
+    missing = [k for k in needed if not os.environ.get(k)]
     if missing:
         raise SystemExit(f"Missing env var(s): {', '.join(missing)}")
-    if (provider, arm) not in SEARCH_COST:
+    if arm != NO_SEARCH_ARM and (provider, arm) not in SEARCH_COST:
         raise SystemExit(f"No SEARCH_COST entry for ({provider}, {arm}); "
                          "cost metrics would silently be $0.")
 
 
+def build_judges(specs: list[str]):
+    """Parse --judge specs into (client, model) pairs.
+
+    A spec is `model` (OpenAI, OPENAI_API_KEY) or `model@base_url` for any
+    OpenAI-compatible route, keyed by JUDGE_API_KEY. The second form is what
+    lets the panel span vendors, which is the point — a single-vendor judge
+    grading a single-vendor agent cannot rule out self-preference.
+    """
+    judges = []
+    for spec in specs:
+        model, _, base_url = spec.partition("@")
+        if base_url:
+            key = os.environ.get("JUDGE_API_KEY")
+            if not key:
+                raise SystemExit(
+                    f"--judge {spec} needs JUDGE_API_KEY for {base_url}")
+            judges.append((OpenAI(base_url=base_url, api_key=key), model))
+        else:
+            judges.append((OpenAI(), model))
+    return judges
+
+
 def run(provider: str, arm: str, dataset_name: str, dataset_version: str | None,
-        trials: int, judge_model: str, env_path: Path):
+        trials: int, judge_specs: list[str], agent_model: str, study_id: str,
+        env_path: Path):
     api_key, project_id = load_braintrust_env(env_path)
     _preflight(provider, arm)
 
@@ -497,24 +595,49 @@ def run(provider: str, arm: str, dataset_name: str, dataset_version: str | None,
     print(f"Dataset: {project_name}/{dataset.name} @ version {resolved_version}"
           f"{'' if dataset_version else '  (latest; pass --dataset-version to pin)'}")
 
-    judge = make_simpleqa_grader(OpenAI(), judge_model=judge_model)
+    judges = build_judges(judge_specs)
+    # One judge keeps SimpleQA parity with LiveNewsBench's published numbers;
+    # several convene a jury. Both emit exactly one score per row.
+    judge = (make_simpleqa_grader(judges[0][0], judge_model=judges[0][1])
+             if len(judges) == 1 else make_jury_grader(judges))
+    if arm == NO_SEARCH_ARM:
+        print("Control arm: no tools. Subtract this from provider arms to get "
+              "retrieval's marginal value.")
+    condition = "no_search" if arm == NO_SEARCH_ARM else f"{provider}-{arm}"
+    condition_id = f"{agent_model}::{condition}"
+    model_slug = re.sub(r"[^a-zA-Z0-9_.-]+", "-", agent_model)
+    experiment_name = f"{study_id}-{dataset.name}-{model_slug}-{condition}"
+
     Eval(
         project_name,
-        experiment_name=f"{provider}-{arm}",
+        experiment_name=experiment_name,
         data=dataset,
-        task=make_task(provider, arm),
+        task=make_task(
+            provider,
+            arm,
+            agent_model,
+            study_id,
+            dataset.name,
+            str(resolved_version),
+        ),
         scores=[judge, *DETERMINISTIC_SCORERS],
         trial_count=trials,          # web nondeterminism > model nondeterminism
         max_concurrency=8,
         metadata={
-            "provider": provider, "arm": arm, "agent_model": AGENT_MODEL,
-            "judge_model": judge_model, "dataset_name": dataset.name,
+            "provider": "none" if arm == NO_SEARCH_ARM else provider,
+            "arm": arm, "agent_model": agent_model,
+            "study_id": study_id,
+            "condition_id": condition_id,
+            "judge_models": [m for _, m in judges],
+            "judge_mode": "single" if len(judges) == 1 else "jury",
+            "dataset_name": dataset.name,
             "dataset_version": resolved_version,
             "dataset_version_pinned": bool(dataset_version),
             "budget": {"searches": MAX_SEARCHES, "clicks": MAX_CLICKS},
             "snippet_chars": SNIPPET_CHARS, "n_results": N_RESULTS,
+            "exa_search_type": EXA_SEARCH_TYPE,
             "git_commit": _git_commit(),
-            "prompt_version": "frozen-v1",
+            "prompt_version": "frozen-v2-generic-factual",
         },
     )
 
@@ -524,19 +647,40 @@ def main():
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     r = sub.add_parser("run")
-    r.add_argument("--provider", choices=list(PROVIDERS), required=True)
-    r.add_argument("--arm", choices=["normalized", "native_fresh"], required=True)
+    r.add_argument("--provider", choices=list(PROVIDERS), default="exa",
+                   help="Ignored when --arm no_search.")
+    r.add_argument("--arm", required=True,
+                   choices=["normalized", "native_fresh", NO_SEARCH_ARM])
     r.add_argument("--dataset-name", default=DATASET_NAME)
     r.add_argument("--dataset-version", default=None,
                    help="Pin a dataset version so every provider/arm sees the "
-                        "same rows. Strongly recommended for published runs.")
+                        "same rows. Required unless --allow-latest is passed.")
+    r.add_argument("--allow-latest", action="store_true",
+                   help="Exploratory runs only: allow an unpinned dataset head.")
     r.add_argument("--trials", type=int, default=3)
-    r.add_argument("--judge-model", default="gpt-4.1")  # parity with the repo's grading
+    r.add_argument("--study-id", default="freshness-v1",
+                   help="Shared identifier for every condition in one experiment "
+                        "matrix. Reuse it across providers, arms, and models.")
+    r.add_argument("--agent-model", default=AGENT_MODEL,
+                   help="Provider rankings can be model-dependent; re-run the "
+                        "matrix under a second agent model to check that yours "
+                        "generalizes.")
+    r.add_argument("--judge", action="append", dest="judges", metavar="MODEL[@BASE_URL]",
+                   help="Repeatable. One judge keeps SimpleQA parity; three or "
+                        "more convene a majority-vote jury. Use model@base_url "
+                        "with JUDGE_API_KEY for non-OpenAI routes.")
     r.add_argument("--env-file", type=Path, default=Path(".env"))
 
     args = ap.parse_args()
+    if not args.dataset_version and not args.allow_latest:
+        ap.error("--dataset-version is required for paired comparisons; pass "
+                 "--allow-latest only for exploratory runs")
+    if args.trials < 1:
+        ap.error("--trials must be at least 1")
+    # gpt-4.1 default keeps parity with LiveNewsBench's published grading.
     run(args.provider, args.arm, args.dataset_name, args.dataset_version,
-        args.trials, args.judge_model, args.env_file)
+        args.trials, args.judges or ["gpt-4.1"], args.agent_model,
+        args.study_id, args.env_file)
 
 
 if __name__ == "__main__":

@@ -290,6 +290,67 @@ def make_simpleqa_grader(client, judge_model: str = "gpt-4.1"):
     return simpleqa_grade
 
 
+def make_jury_grader(judges, template: str = None):
+    """Cross-vendor judge jury: majority vote over the SimpleQA 3-way grade.
+
+    `judges` is a list of (client, model_name) pairs. A single-vendor judge
+    grading a single-vendor agent invites self-preference bias, and one judge
+    gives no way to tell a hard row from a judge that simply disagrees with
+    itself. Majority vote fixes the first; recording every ballot plus
+    `unanimous` in metadata surfaces the second, so rows where the jury split
+    can be pulled out and inspected rather than silently averaged.
+
+    Emits ONE score per row. Jury reliability across rows (agreement rates,
+    per-judge bias) is an analysis question, computed from this metadata
+    downstream — not something a scorer should try to summarize.
+    """
+    template = template or SIMPLEQA_GRADER_TEMPLATE
+    valid = {"CORRECT", "INCORRECT", "NOT_ATTEMPTED"}
+
+    def jury_grade(input, output, expected, **kwargs):
+        prompt = template.format(
+            question=input.get("question", "") if isinstance(input, dict) else str(input),
+            target=json.dumps(_expected_answers(expected), ensure_ascii=False),
+            predicted=_output_answer(output),
+        )
+        ballots, errors = {}, {}
+        for client, model in judges:
+            try:
+                resp = client.chat.completions.create(
+                    model=model, temperature=0,
+                    messages=[{"role": "user", "content": prompt}])
+                grade = (resp.choices[0].message.content or "").strip().upper()
+                ballots[model] = grade if grade in valid else "INCORRECT"
+            except Exception as exc:            # a dead judge must not void the row
+                errors[model] = f"{type(exc).__name__}: {exc}"
+
+        if not ballots:
+            return {"name": "jury_grade", "score": None,
+                    "metadata": {"applicable": False, "judge_errors": errors}}
+
+        tally = Counter(ballots.values())
+        verdict, votes = tally.most_common(1)[0]
+        # A tie on an even/degraded panel is not a majority for CORRECT.
+        if tally.get("CORRECT", 0) * 2 <= len(ballots) and verdict == "CORRECT":
+            verdict = tally.most_common(2)[1][0] if len(tally) > 1 else "INCORRECT"
+        return {
+            "name": "jury_grade",
+            "score": 1.0 if verdict == "CORRECT" else 0.0,
+            "metadata": {
+                "applicable": True,
+                "verdict": verdict,
+                "ballots": ballots,
+                "n_judges": len(ballots),
+                "votes_for_verdict": votes,
+                "unanimous": len(tally) == 1,
+                "attempted": verdict != "NOT_ATTEMPTED",
+                "judge_errors": errors or None,
+            },
+        }
+
+    return jury_grade
+
+
 # ---------------------------------------------------------------------------
 # 2. Validity — LiveNewsBench leakage rule as a hard scorer
 # ---------------------------------------------------------------------------
@@ -368,6 +429,35 @@ def budget_economy(input, output, expected, **kwargs):
         "score": 1.0 if (s <= 5 and c <= 5) else 0.0,
         "metadata": {"used_searches": s, "used_clicks": c,
                      "trajectory_tokens": tokens},
+    }
+
+
+def dealbreaker_gate(input, output, expected, metadata=None, **kwargs):
+    """Hard-constraint gate: did this row violate a rule that invalidates it?
+
+    Answer quality and rule compliance currently sit side by side as unrelated
+    columns, so a provider can top the answer score while leaking gold sources
+    or blowing the budget. This collapses the non-negotiable rules into one
+    0/1 flag that analysis multiplies the answer score by, which is what makes
+    a gated headline number possible.
+
+    Composed from the existing scorers rather than reimplementing them, so the
+    rules cannot drift apart. A rule that does not apply to a row (the leakage
+    rule on RetrievalQA) cannot fail it.
+    """
+    gates = {"leakage_guard": leakage_guard(input, output, expected,
+                                            metadata=metadata, **kwargs),
+             "budget_economy": budget_economy(input, output, expected, **kwargs)}
+    violated = [name for name, res in gates.items() if res.get("score") == 0.0]
+    skipped = [name for name, res in gates.items() if res.get("score") is None]
+    return {
+        "name": "dealbreaker_gate",
+        "score": 0.0 if violated else 1.0,
+        "metadata": {
+            "violated": violated,
+            "not_applicable": skipped,
+            "gates_checked": [n for n in gates if n not in skipped],
+        },
     }
 
 
@@ -473,6 +563,58 @@ def snippet_sufficiency(input, output, expected, **kwargs):
     }
 
 
+def evidence_precision(input, output, expected, **kwargs):
+    """What FRACTION of the surfaced results actually carried the gold answer?
+
+    snippet_sufficiency is a recall question — did gold appear anywhere. This is
+    its precision counterpart: signal density on the decision surface. A
+    provider returning gold at rank 1 plus seven irrelevant results and one
+    returning gold in five of eight score identically on sufficiency, but the
+    second hands the agent a far cheaper read. Pairs with
+    compression_redundancy (are the results distinct?) to separate "diverse but
+    useless" from "dense and on-topic".
+
+    Per-search precision is in metadata because a provider that nails the first
+    query and then degrades looks different from one that is uniformly mediocre.
+
+    Expect low absolute values — most news results legitimately will not restate
+    the answer. Read it comparatively between providers, never as an absolute
+    quality bar. Uses the same conservative string containment as
+    snippet_sufficiency, and prefers `oracle_snippet_gold` labels when present.
+    """
+    aliases = _answer_aliases(expected)
+    per_search, total, hits = [], 0, 0
+    for s in _searches(output):
+        results = [r for r in s.get("results", []) if isinstance(r, dict)]
+        if not results:
+            continue
+        n_gold = 0
+        for r in results:
+            is_gold = r.get("oracle_snippet_gold")
+            if is_gold is None:
+                is_gold = _snippet_contains_gold(r, aliases)
+            n_gold += bool(is_gold)
+        per_search.append(round(n_gold / len(results), 4))
+        total += len(results)
+        hits += n_gold
+
+    if not total:
+        return {"name": "evidence_precision", "score": None,
+                "metadata": {"applicable": False,
+                             "reason": "no results surfaced"}}
+    return {
+        "name": "evidence_precision",
+        "score": hits / total,
+        "metadata": {
+            "applicable": True,
+            "gold_results": hits,
+            "n_results": total,
+            "precision_per_search": per_search,
+            "best_search_precision": max(per_search) if per_search else None,
+        },
+    }
+
+
 def token_discounted_gain(input, output, expected, tau: float = 4000.0, **kwargs):
     """Time-biased gain (Smucker & Clarke), with tokens as the clock.
 
@@ -556,9 +698,11 @@ def domain_entropy(input, output, expected, **kwargs):
 DETERMINISTIC_SCORERS = [
     qa_answer_match,
     leakage_guard,
+    dealbreaker_gate,
     budget_economy,
     temporal_grounding,
     snippet_sufficiency,
+    evidence_precision,
     token_discounted_gain,
     compression_redundancy,
     domain_entropy,
