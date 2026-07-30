@@ -26,9 +26,9 @@ Use the framework to define and test your own experiment:
    diversity, latency, and cost—not accuracy alone.
 
 The current example compares LiveNewsBench and RetrievalQA across Exa,
-Parallel, and You.com. The extensive **Design review** and **Open decisions**
-sections below identify choices that must be resolved before treating results
-as publication-quality.
+Parallel, and You.com. The **Remaining gaps** and **Open decisions** sections
+below identify choices that must be resolved before treating results as
+publication-quality.
 
 ## Included example configuration
 
@@ -104,35 +104,7 @@ metadata = upstream row fields (link, articles[], event_date, ...)
            + livenewsbench_release / livenewsbench_split / source_commit
 ```
 
-## Design review against the Vals Web Search Index
-
-The [Vals Web Search Index](https://www.vals.ai/benchmarks/web_search) is a
-useful reference because it isolates the search tool while holding the agent
-harness constant, analyzes cost and behavior rather than accuracy alone, breaks
-results down by task category, and estimates tool effects with paired
-task-aware statistics.
-
-| Design dimension | Vals pattern | This framework after review |
-|---|---|---|
-| Treatment isolation | Swap search tool; hold model and harness constant | Same principle; prompt, tools, budgets, normalizer, and fetcher are frozen |
-| Model dependence | Run each search treatment across multiple models | `--agent-model` and model-qualified condition IDs support a model matrix |
-| Parametric-memory control | Compare native and independent search | Adds `no_search` to measure marginal retrieval value; native model search is still missing |
-| Task difficulty | Expert tasks grouped by domain/category | Stable task keys and normalized category metadata enable paired and category-balanced analysis |
-| Statistics | Mixed-effects model with a random task intercept | Paired task bootstrap is implemented; mixed effects remain the publication standard |
-| Grading | Expert rubrics, dealbreakers, and a judge jury | Short-answer judge, deterministic floor, optional jury, and dealbreaker gate |
-| Cost | Model inference plus external search fees; Pareto frontier | Logs search spend and agent tokens separately; analysis requires an explicitly aggregated total cost |
-| Failure tails | Report runaway search-call distributions | Hard 5/5 cap prevents runaway spend, refused calls recover pressure beyond the cap, and analysis reports P95 calls |
-| Behavioral diagnostics | Calls, answer length, citations, source domains | Logs calls, answer length, surfaced-domain diversity, freshness, evidence density, and leakage |
-
-The most important additions from this review are the no-search control, model
-matrix, stable task/category/condition identifiers, task-paired uncertainty,
-category-balanced effects, tail search-call reporting, and a total-cost Pareto
-frontier. We intentionally did not copy long-form rubric grading: Vals evaluates
-legal and finance deliverables, while these datasets contain short-form factual
-answers. Adding invented rubric items would create judge complexity without
-valid ground truth.
-
-### Remaining gaps
+## Remaining gaps
 
 1. **No native model-search baseline.** `no_search` isolates retrieval uplift,
    but does not answer whether an independent API beats the model provider's
@@ -316,22 +288,8 @@ Not open questions. Listed so they do not get changed by accident.
   rubric would invent structure the dataset does not have. The rubric idea worth
   borrowing is *gating*, which is what `dealbreaker_gate` does.
 
-## Prior art
-
-[Vals AI's Web Search Index](https://www.vals.ai/benchmarks/web_search) runs the
-same core method — swap the search tool, hold the model and infrastructure fixed
-— over expert-authored legal and finance tasks. Worth reading for contrast, and
-several choices here are borrowed from it: the cross-vendor judge jury, gating on
-hard constraints, macro-averaging over categories, decomposing model cost from
-search fees, and treating tool-call runaway as a provider-attributable failure
-mode rather than noise.
-
-The differences are mostly about scope. That benchmark grades open-ended
-deliverables with rubrics and holds its test sets private to prevent
-contamination; this framework targets short-form factoid QA with public datasets,
-so contamination is a live threat here and the `no_search` control arm exists to
-measure it. It runs four agent models; this defaults to one, which is why
-`--agent-model` exists and why generalization across models is an open decision.
-Conversely, freshness is the whole point here and is not addressed there, and
-`leakage_guard` enforces source exclusion as a hard rule where that benchmark
-analyzes citations descriptively after the fact.
+> **Relationship to Vals:** This framework uses the same basic experimental
+> principle as [Vals AI's Web Search Index](https://www.vals.ai/benchmarks/web_search):
+> swap the search tool while holding the agent setup fixed. It adapts that idea
+> to freshness-focused, short-form QA and adds controls for public-dataset
+> contamination and source leakage.
