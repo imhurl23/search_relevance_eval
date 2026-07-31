@@ -8,7 +8,7 @@ or a claim that the current defaults are the right experimental design.
 The included implementation gives you a concrete starting point: one frozen
 web-research agent answers news questions while the search provider and search
 configuration are varied. The model snapshot, prompt, tool schemas,
-search/click budget, result normalization, and page fetcher are held constant so
+search budget, and result normalization are held constant so
 differences can be attributed as closely as possible to the search layer.
 
 Use the framework to define and test your own experiment:
@@ -42,7 +42,7 @@ as publication-quality.
 ## Included example configuration
 
 - Agent: `gpt-4o-2024-11-20` (override with `--agent-model`), temp 0, seed 42,
-  5 searches + 5 clicks
+  5 searches and no arbitrary webpage fetching
 - Providers: `exa`, `parallel`, `youdotcom`
 - Arms: `normalized` (uniform snippet budget), `native_fresh` (each vendor's own
   freshness knobs), `no_search` (control — no tools, parametric memory only)
@@ -60,7 +60,7 @@ cp .env.example .env
 ```
 
 Fill `.env`; every supported credential is loaded from that file and overrides
-or clears the corresponding ambient credential, per [AGENTS.md](AGENTS.md).
+or clears the corresponding ambient credential.
 
 ## Running
 
@@ -136,13 +136,14 @@ Corvus metadata maps `effective_ts` to `event_date` and source URLs to
 without a dataset-specific branch. `previous_answer` is retained for
 stale-answer analysis.
 
-The source adapters live in [corvus/sources.py](corvus/sources.py). They
-require a monitored organizational `CORVUS_CONTACT_EMAIL` and the
-single-deployment confirmation in `.env`. They run serially at one
-request/second with shared local locking, bounded backoff, and approved-host
-checks. They also preserve effective time separately from observation time.
-EDGAR Item 5.02 candidates require a reviewed `OfficerTransition`; only
-the reviewed excerpt's hash enters provenance. Wikidata changes use the cited
+EDGAR/Wikidata adapters live in [corvus/sources.py](corvus/sources.py);
+news/sports adapters live in
+[corvus/news_sports_sources.py](corvus/news_sports_sources.py). They require a
+monitored organizational `CORVUS_CONTACT_EMAIL`, and SEC additionally requires
+the single-deployment confirmation in `.env`. Requests are serial, locally
+rate-limited, retried with bounded backoff, and restricted to approved hosts.
+EDGAR Item 5.02 candidates require a reviewed `OfficerTransition`; only the
+reviewed excerpt's hash enters provenance. Wikidata changes use the cited
 reference's domain as the authority family, preventing an SEC-cited Wikidata
 claim from falsely counting as independent of EDGAR.
 
@@ -165,6 +166,80 @@ python -m corvus.cli.collect_sources wikidata-latest \
 EDGAR collection deliberately emits candidates rather than guessing officer
 names or effective dates from prose. A reviewed `OfficerTransition` must be
 created from the filing before `EdgarAdapter.emit_fact` produces a `FactEvent`.
+
+### News and sports sources
+
+The news/sports slice uses only metadata or derived results from sources with
+documented reuse terms:
+
+- Wikipedia Current Events supplies revision, section, permanent-link, and
+  cited-source URL metadata under CC BY-SA 4.0. Event prose is not copied and
+  cited pages are not fetched.
+- OpenLigaDB supplies football results under ODbL 1.0.
+- TheSportsDB supplies a small free-tier result sample through its official
+  API. Artwork, videos, and third-party media are excluded.
+
+Before making a live request, review the linked policies in
+[the compliance guide](docs/corvus-compliance.md). Set only the corresponding
+source attestation in `.env`—`CORVUS_WIKIPEDIA_TERMS_CONFIRMED`,
+`CORVUS_OPENLIGADB_LICENSE_CONFIRMED`, or
+`CORVUS_THESPORTSDB_TERMS_CONFIRMED`—after its attribution, share-alike, and API
+conditions have been accepted. Then collect bounded slices:
+
+```bash
+python -m corvus.cli.collect_sources wikipedia-current-events \
+    --date 2026-07-30 --output current-events.jsonl
+python -m corvus.cli.collect_sources openligadb-results \
+    --league bl1 --season 2026 --group-order 1 \
+    --output openligadb-results.jsonl
+python -m corvus.cli.collect_sources thesportsdb-results \
+    --date 2026-07-30 --sport Soccer \
+    --output thesportsdb-results.jsonl
+```
+
+Sports candidates do not become benchmark rows automatically. A reviewer must
+map each provider's event and team names to one canonical match identity and
+confirm when the result became effective; the scheduled start time is retained
+separately and is never silently treated as the completion time.
+Only matching final scores from two independent authorities qualify under the
+existing dual-authority rule.
+
+### Human-review schema
+
+Corvus review schema v2 separates two jobs that must not share a
+fact-verification label:
+
+- `claim_preparation` rows provide compliant source links and hints but no
+  assertion yet. They are not eligible for the `Fact verification` scorer.
+- `fact_verification` rows state one atomic claim with a canonical subject,
+  predicate, asserted value, time basis, and evidence links.
+
+Prepare both queues directly from the collected source candidates:
+
+```bash
+python -m corvus.cli.prepare_claim_review \
+    --edgar-review-queue filing-review-queue.jsonl \
+    --wikipedia-candidates wikipedia-current-events.jsonl \
+    --openligadb-results openligadb-results.jsonl \
+    --thesportsdb-results thesportsdb-results.jsonl \
+    --preparation-output claim-preparation.jsonl \
+    --verification-output fact-verification.jsonl \
+    --preparation-schema-output claim-preparation-schema.json \
+    --verification-schema-output fact-verification-schema.json
+```
+
+The generated Braintrust schemas enforce both `input` and `expected`.
+Fact-verification rows reserve `expected.fact_verification` for exactly
+`verified`, `insufficient_evidence`, or `contradicted`. Configure the UI scorer
+to write to that expected path and show it only when:
+
+```sql
+metadata.review_stage = 'fact_verification'
+```
+
+Import into new datasets rather than replacing the source review queues. When
+`--schema-file` is supplied, the compliance approval must bind the exact
+`schema_sha256` in addition to the artifact and source-policy hashes.
 
 Optional trap JSONL can be supplied with `--traps-file` and `--run-end`. A trap
 is accepted only when two resolvers and two authorities agree on its scheduled
@@ -261,7 +336,7 @@ conclusions. Settle them before publishing.
 
 | Provider | What `native_fresh` changes | Freshness? |
 |---|---|---|
-| Exa | `livecrawl: "always"`, `maxAgeHours: 24` | Yes |
+| Exa | `contents.maxAgeHours: 24` | Yes |
 | You.com | `freshness: "week"` | Yes, but 7× wider than Exa |
 | Parallel | `processor: "base"` → `"pro"` | No — a quality and cost tier |
 
@@ -276,7 +351,11 @@ cost/quality comparison. Options:
 - Split into `native_fresh` and `native_tier`. Doubles run cost.
 
 Even after that, Exa's 24 hours and You.com's week are different treatments.
-Aligning them means `freshness: "day"` or `maxAgeHours: 168`.
+Aligning them means `freshness: "day"` or `maxAgeHours: 168`. Note the two knobs
+are not the same kind of filter: `maxAgeHours` bounds the age of the *content Exa
+serves* (cache younger than 24 h, otherwise livecrawl), while You.com's
+`freshness` filters *which results are eligible* by publication recency. Exa's
+setting can return an old article freshly crawled; You.com's cannot.
 
 **2. The providers search different corpora.** Exa filters to
 `category: "news"`. Parallel has no category filter, so it searches the general
@@ -297,8 +376,9 @@ whether `native_fresh` caps all three or none.
 
 **4. Exa's search tier is not frozen.** `type` defaults to `"auto"`, which routes
 per query. Now pinned as `EXA_SEARCH_TYPE = "auto"` — same behavior, but visible.
-`"fast"` or `"deep"` would actually freeze it, at the cost of changing retrieval
-quality.
+Any of `instant`, `fast`, `deep-lite`, `deep`, or `deep-reasoning` would actually
+freeze it, at the cost of changing retrieval quality and — for the `deep` tiers —
+per-call price and latency.
 
 **5. The judge and the agent share a vendor.** The agent is `gpt-4o` and
 `--judge` defaults to `gpt-4.1`, which cannot rule out self-preference. Passing
@@ -310,18 +390,25 @@ deployed QA Answer Correctness scorer uses `openai/gpt-oss-120b`, a third answer
 to the same question. `qa_answer_match` needs no model at all, so its
 disagreement with the judge is worth reporting rather than smoothing over.
 
-**6. Cost numbers are unverified.** `SEARCH_COST` in [run_eval.py](run_eval.py)
-is hand-entered. Check all six `(provider, arm)` prices against current pricing
-pages. Exa's `native_fresh` now sends `livecrawl: "always"`, so confirm whether
-that arm costs more per call. Parallel pro against base needs its own check, and
-that cost difference is currently tangled up with the freshness treatment (see
-1). `_tok()` estimates tokens as `chars / 4`; use tiktoken before publishing
+**6. One provider's cost numbers are still unverified.** `SEARCH_PRICING` in
+[run_eval.py](run_eval.py) now carries three documented terms per
+`(provider, arm)` — per-call, per-result content, and per-result beyond 10 — and
+`search_cost_usd()` applies them to the results a call actually returned. Exa and
+You.com were checked against their pricing pages on 2026-07-30: Exa is $7/1k
+requests plus $1/1k pages *per content type*, so an 8-result call with highlights
+costs about $0.015, not the $0.005 previously recorded; You.com is $5/1k calls,
+not $0.004. Parallel's `base` and `pro` numbers are still hand-entered, and that
+cost difference remains tangled up with the freshness treatment (see 1).
+`_tok()` estimates tokens as `chars / 4`; use tiktoken before publishing
 token-normalized numbers, including `token_discounted_gain`.
 
 **7. Domain exclusion works differently per vendor.** Exa takes an
-`excludeDomains` array. Parallel's `source_policy.exclude_domains` covers
-subdomains automatically and caps at 200 combined. You.com takes a
-comma-separated string, mutually exclusive with `include_domains`. Apex-to-
+`excludeDomains` array, capped at 1200 items. Parallel's
+`source_policy.exclude_domains` covers subdomains automatically and caps at 200
+combined. You.com takes a comma-separated string, mutually exclusive with
+`include_domains` (sending both returns `422`); on `GET` it is bounded by URL
+length, and their docs point to `POST` for lists past a handful, up to 500. This
+eval sends well under that, so it stays on the fully documented `GET`. Apex-to-
 subdomain coverage is not uniform, so `leakage_guard` can fire for API reasons
 rather than retrieval behavior. Test it directly: one row per provider with the
 gold domain excluded, confirm zero leaks. The exclude list is ordered source
@@ -389,8 +476,8 @@ The following analysis responsibilities still require care:
   The analyzer deliberately refuses to treat search fees alone as total cost.
 - **Jury reliability.** Agreement rate and per-judge bias, from the `ballots`
   metadata.
-- **Runaway pressure.** `refused_searches` / `refused_clicks` count the tool
-  calls the 5/5 cap turned away. A provider that constantly pushes past the
+- **Runaway pressure.** `refused_searches` counts tool calls the five-search
+  cap turned away. A provider that constantly pushes past the
   budget would cost far more uncapped — a real failure mode that a hard cap
   otherwise hides completely.
 
@@ -398,18 +485,28 @@ The following analysis responsibilities still require care:
 
 Not open questions. Listed so they do not get changed by accident.
 
-- The page fetcher is provider-neutral. Using Exa `/contents` or You.com
-  `livecrawl` in `run_fetch` would put the provider back into the fetch step.
-  This limits the eval to search-layer quality.
+- Generic webpage fetching is disabled. Restoring it requires an explicit
+  domain allowlist plus source-specific terms, robots, pacing, redirect, and
+  retention controls.
 - You.com `livecrawl` stays off in `native_fresh`. It only fills
-  `result.contents`, which the agent never sees, so it would add latency and cost
-  without changing what is measured.
+  `result.contents`, which the agent never sees, so it would add latency and
+  $1/1k pages without changing what is measured.
+- You.com requests send `Cache-Control: no-cache`. Their docs note `GET`
+  responses are cacheable at CDN and proxy layers while `POST` responses are not,
+  and freshness is the quantity under measurement.
+- Exa's freshness arm sends `contents.maxAgeHours` only. The `livecrawl` string
+  parameter is deprecated in favor of it as of February 2026, and sending both
+  was self-contradictory — `livecrawl: "always"` refuses cache while
+  `maxAgeHours: 24` accepts day-old cache.
+- Exa's `contents.livecrawlTimeout` is pinned at the documented 10 s default so a
+  crawl stall is a declared condition rather than an accident, and stays under
+  the 30 s client timeout.
 - No adapter derives dates from `event_date`, and queries avoid temporal words.
   You.com uses the broader of query-implied and parameter freshness, so a dated
   query would un-blind the arms.
-- Raw pre-normalization payloads go to each tool span's metadata verbatim. The
-  decision-surface analysis needs them in the traces.
-- `notrace_io=True` on both tool spans. Otherwise `@traced` logs the return tuple
+- Raw pre-normalization provider payloads are not retained in traces.
+- `notrace_io=True` on the search tool span prevents `@traced` from logging the
+  return tuple.
   over the explicit `output=`.
 - A single gold answer, not a multi-item rubric. Rubric grading suits open-ended
   professional tasks; LiveNewsBench and RetrievalQA are short-form factoid QA

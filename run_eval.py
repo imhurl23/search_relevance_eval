@@ -54,7 +54,7 @@ from scorers import (DETERMINISTIC_SCORERS, make_jury_grader,
                      make_simpleqa_grader)
 
 # ---------------------------------------------------------------------------
-# Credentials. AGENTS.md: the .env key always overrides any ambient credential.
+# Credentials: values from .env always override ambient credentials.
 # ---------------------------------------------------------------------------
 
 
@@ -96,8 +96,19 @@ SNIPPET_CHARS = 400                    # normalized-arm snippet truncation
 N_RESULTS = 8
 
 # Exa search tier. Their default is "auto", which routes per query — pinning it
-# keeps the retrieval tier a declared experiment condition.
+# keeps the retrieval tier a declared experiment condition. Documented values:
+# instant | fast | auto | deep-lite | deep | deep-reasoning.
 EXA_SEARCH_TYPE = "auto"
+# Exa content freshness. maxAgeHours REPLACED the livecrawl string parameter
+# (Feb 2026): positive N serves cache younger than N hours and livecrawls
+# otherwise, 0 always livecrawls, -1 is cache-only, omitted livecrawls only when
+# no cache exists. Accepts -1..720. 24 = the declared "fresh within a day" arm.
+EXA_MAX_AGE_HOURS = 24
+# Exa's documented default is 10000 ms, max 90000. Pinned so a livecrawl stall
+# is a declared condition, and kept under the 30 s client timeout in _http.
+EXA_LIVECRAWL_TIMEOUT_MS = 10_000
+# Exa caps includeDomains + excludeDomains at 1200 items each.
+EXA_MAX_DOMAINS = 1200
 # Parallel's Search API is beta and requires this version header.
 PARALLEL_BETA = "search-extract-2025-10-10"
 # Combined include_domains + exclude_domains ceiling in a Parallel source_policy.
@@ -131,13 +142,39 @@ TOOLS = [
                        "required": ["query"]}}},
 ]
 
-# Approximate per-call search pricing (USD) for native cost metrics.
-# Verify against each vendor's current pricing page before publishing numbers.
-SEARCH_COST = {
-    ("exa", "normalized"): 0.005, ("exa", "native_fresh"): 0.005,       # + $1/1k pages if text requested
-    ("parallel", "normalized"): 0.004, ("parallel", "native_fresh"): 0.009,  # base vs pro tier
-    ("youdotcom", "normalized"): 0.004, ("youdotcom", "native_fresh"): 0.004,
+# Search pricing (USD) for native cost metrics. A flat per-call constant is
+# wrong for any vendor that bills content per page, so each entry carries three
+# documented terms and search_cost_usd() applies them to the results actually
+# returned.
+#
+# Exa (https://exa.ai/docs/reference/pricing, checked 2026-07-30):
+#   $7/1k requests for instant|fast|auto covering the first 10 results,
+#   +$1/1k results beyond 10, +$1/1k pages PER CONTENT TYPE. We request one
+#   content type (highlights), so 8 results add $0.008 — the old flat $0.005
+#   understated an Exa call by roughly 3x. Livecrawling via maxAgeHours is not
+#   billed separately from the content charge.
+# You.com (https://you.com/docs/api-reference/search, checked 2026-07-30):
+#   $5.00/1k calls, independent of `count`. livecrawl would add $1/1k pages,
+#   and we leave it off in both arms.
+# Parallel: still hand-entered and UNVERIFIED — see README open decision 6.
+SEARCH_PRICING = {
+    ("exa", "normalized"):         {"per_call": 0.007, "per_result_content": 0.001, "per_result_over_10": 0.001},
+    ("exa", "native_fresh"):       {"per_call": 0.007, "per_result_content": 0.001, "per_result_over_10": 0.001},
+    ("parallel", "normalized"):    {"per_call": 0.004, "per_result_content": 0.0,   "per_result_over_10": 0.0},
+    ("parallel", "native_fresh"):  {"per_call": 0.009, "per_result_content": 0.0,   "per_result_over_10": 0.0},
+    ("youdotcom", "normalized"):   {"per_call": 0.005, "per_result_content": 0.0,   "per_result_over_10": 0.0},
+    ("youdotcom", "native_fresh"): {"per_call": 0.005, "per_result_content": 0.0,   "per_result_over_10": 0.0},
 }
+
+
+def search_cost_usd(provider: str, arm: str, n_results: int) -> float:
+    """Documented per-call price plus per-page content charges."""
+    rate = SEARCH_PRICING.get((provider, arm))
+    if rate is None:
+        return 0.0
+    return (rate["per_call"]
+            + n_results * rate["per_result_content"]
+            + max(0, n_results - 10) * rate["per_result_over_10"])
 
 ARCHIVE_EXCLUDES = ["web.archive.org", "archive.org", "archive.is",
                     "archive.ph", "archive.today"]
@@ -245,16 +282,19 @@ def exa_search(query: str, arm: str, exclude_domains: list[str]):
         "query": query,
         "numResults": N_RESULTS,
         "category": "news",
-        "excludeDomains": exclude_domains,
+        "excludeDomains": exclude_domains[:EXA_MAX_DOMAINS],
         # numSentences/highlightsPerUrl are deprecated; maxCharacters is current
         # and matches the SNIPPET_CHARS budget enforced below.
         "contents": {"highlights": {"maxCharacters": SNIPPET_CHARS}},
     }
     if arm == "native_fresh":
-        # Exa's two documented freshness knobs. livecrawl="preferred" is
-        # deprecated, so this uses "always"; maxAgeHours accepts -1..720.
-        body["contents"]["livecrawl"] = "always"
-        body["contents"]["maxAgeHours"] = 24
+        # The whole `livecrawl` string parameter is deprecated in favor of
+        # maxAgeHours, not just its "preferred" value. Sending both was also
+        # self-contradictory: livecrawl="always" says never use cache while
+        # maxAgeHours=24 accepts cache up to a day old. maxAgeHours alone is the
+        # documented way to express this arm's treatment.
+        body["contents"]["maxAgeHours"] = EXA_MAX_AGE_HOURS
+        body["contents"]["livecrawlTimeout"] = EXA_LIVECRAWL_TIMEOUT_MS
     raw = _provider_json(
         "POST",
         "https://api.exa.ai/search",
@@ -316,23 +356,37 @@ def parallel_search(query: str, arm: str, exclude_domains: list[str]):
 
 
 def youdotcom_search(query: str, arm: str, exclude_domains: list[str]):
-    # GET with query params against ydc-index.io — NOT a JSON POST to api.you.com.
-    # exclude_domains is a single comma-separated string (repeated params are
-    # unsupported) and is mutually exclusive with include_domains.
-    params = {"query": query, "count": N_RESULTS,
-              "exclude_domains": ",".join(exclude_domains)}
+    # GET https://ydc-index.io/v1/search — the documented base host is
+    # ydc-index.io (no api. prefix), and GET is the only shape You.com publishes
+    # a full parameter spec for. Their docs do recommend POST for domain lists
+    # (up to 500 as a JSON array) because GET passes them comma-separated and is
+    # bounded by URL length, but the POST body schema is undocumented. Our list
+    # is a handful of domains, so GET stays well inside the documented path.
+    # exclude_domains is one comma-separated string and is mutually exclusive
+    # with include_domains (sending both returns 422).
+    params = {"query": query, "count": N_RESULTS}
+    if exclude_domains:
+        # Omit rather than send an empty string, which is not a documented value.
+        params["exclude_domains"] = ",".join(exclude_domains)
     if arm == "native_fresh":
         # day|week|month|year or YYYY-MM-DDtoYYYY-MM-DD. Broadest window that
         # still filters news; never derive this from event_date.
         params["freshness"] = "week"
         # NB: You.com also exposes a `livecrawl` param, but it only populates
         # result.contents — it would not change the snippet decision surface we
-        # measure, so enabling it would add latency and cost for no signal.
+        # measure, so enabling it would add latency and $1/1k pages for no signal.
     raw = _provider_json(
         "GET",
         "https://ydc-index.io/v1/search",
         params=params,
-        headers={"X-API-Key": os.environ["YDC_API_KEY"]},
+        headers={
+            "X-API-Key": os.environ["YDC_API_KEY"],
+            # You.com documents that GET responses are cacheable at CDN and
+            # proxy layers while POST responses are not. Freshness is the
+            # quantity under measurement here, so ask intermediaries not to
+            # serve a stale hit.
+            "Cache-Control": "no-cache",
+        },
     )
     # results.web[] carries `snippets`; results.news[] does not, so web is the
     # only shape comparable to the other providers' snippets.
@@ -345,7 +399,9 @@ def youdotcom_search(query: str, arm: str, exclude_domains: list[str]):
             "url": res.get("url", ""),
             "title": res.get("title") or "",
             "snippet": (snippets[0] if snippets else res.get("description", "") or "")[:SNIPPET_CHARS],
-            "published_date": res.get("page_age") or res.get("published_date"),
+            # `page_age` is the documented timestamp field on a web result;
+            # there is no `published_date` in this response shape.
+            "published_date": res.get("page_age"),
         })
     return results, raw
 
@@ -375,7 +431,7 @@ def run_search(provider: str, arm: str, query: str, exclude_domains: list[str]):
         output=results,
         metrics={"tokens": _tok(rendered),
                  "latency_s": latency,
-                 "search_cost_usd": SEARCH_COST.get((provider, arm), 0.0),
+                 "search_cost_usd": search_cost_usd(provider, arm, len(results)),
                  "n_results": len(results)},
     )
     return results, rendered, _tok(rendered)
@@ -436,6 +492,10 @@ def make_task(
         # Counting refusals recovers that signal without relaxing the cap.
         refused_searches, refused_clicks = 0, 0
         bad_tool_calls = 0
+        # Accumulated per call, not searches x flat rate: Exa bills content per
+        # page returned, so two calls that return different result counts do not
+        # cost the same.
+        search_cost = 0.0
         final = None
 
         for _ in range(2 * (MAX_SEARCHES + MAX_CLICKS) + 2):
@@ -473,6 +533,8 @@ def make_task(
                         query = args.get("query", "")
                         results, content, tok = run_search(
                             provider, arm, query, excludes)
+                        search_cost += search_cost_usd(
+                            provider, arm, len(results))
                         trajectory.append({"type": "search", "query": query,
                                            "tokens": tok, "results": results})
                 else:
@@ -510,7 +572,7 @@ def make_task(
         # the wrapped LLM spans, so keep the two decomposable rather than summing
         # them here. Total cost per row is an analysis-side join of the two.
         current_span().log(metrics={
-            "search_cost_usd": searches * SEARCH_COST.get((provider, arm), 0.0),
+            "search_cost_usd": search_cost,
             "used_searches": searches, "used_clicks": clicks,
             "refused_tool_calls": refused_searches + refused_clicks,
             "agent_prompt_tokens": prompt_tokens,
@@ -554,8 +616,8 @@ def _preflight(provider: str, arm: str) -> None:
     missing = [k for k in needed if not os.environ.get(k)]
     if missing:
         raise SystemExit(f"Missing env var(s): {', '.join(missing)}")
-    if arm != NO_SEARCH_ARM and (provider, arm) not in SEARCH_COST:
-        raise SystemExit(f"No SEARCH_COST entry for ({provider}, {arm}); "
+    if arm != NO_SEARCH_ARM and (provider, arm) not in SEARCH_PRICING:
+        raise SystemExit(f"No SEARCH_PRICING entry for ({provider}, {arm}); "
                          "cost metrics would silently be $0.")
 
 
@@ -635,6 +697,14 @@ def run(provider: str, arm: str, dataset_name: str, dataset_version: str | None,
             "budget": {"searches": MAX_SEARCHES, "clicks": MAX_CLICKS},
             "snippet_chars": SNIPPET_CHARS, "n_results": N_RESULTS,
             "exa_search_type": EXA_SEARCH_TYPE,
+            # The freshness treatment each provider actually received, so a run
+            # is interpretable without reading the adapter source.
+            "exa_max_age_hours": (
+                EXA_MAX_AGE_HOURS if (provider, arm) == ("exa", "native_fresh")
+                else None),
+            "youdotcom_freshness": (
+                "week" if (provider, arm) == ("youdotcom", "native_fresh")
+                else None),
             "git_commit": _git_commit(),
             "prompt_version": "frozen-v2-generic-factual",
         },
