@@ -7,7 +7,12 @@ from unittest.mock import patch
 
 import httpx
 
-from corvus.compliance import load_source_policy, require_provider_permission
+from corvus.compliance import (
+    load_source_policy,
+    require_import_approval,
+    require_provider_permission,
+    sha256_file,
+)
 from corvus.sources import PolicyHttpClient
 
 
@@ -58,6 +63,51 @@ class ComplianceGateTests(unittest.TestCase):
                 {"ok": True},
             )
         sleep.assert_called_once()
+
+    def test_schema_bound_approval_fails_when_schema_changes(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            artifact = root / "artifact.jsonl"
+            schema = root / "schema.json"
+            policy = root / "policy.json"
+            approval = root / "approval.json"
+            artifact.write_text("{}\n")
+            schema.write_text('{"input": {}}\n')
+            policy.write_text(
+                json.dumps(
+                    {
+                        "review_valid_until": (
+                            date.today() + timedelta(days=1)
+                        ).isoformat(),
+                        "sources": {},
+                    }
+                )
+            )
+            approval.write_text(
+                json.dumps(
+                    {
+                        "approval_id": "approval-1",
+                        "approved_by": "owner",
+                        "approved_at": "2026-01-01T00:00:00Z",
+                        "scope": "braintrust_private_dataset_import",
+                        "written_basis_reference": "test",
+                        "artifact_sha256": sha256_file(artifact),
+                        "source_policy_sha256": sha256_file(policy),
+                        "schema_sha256": sha256_file(schema),
+                        "braintrust_dpa_confirmed": True,
+                        "braintrust_retention_policy_confirmed": True,
+                        "source_distribution_rights_confirmed": True,
+                    }
+                )
+            )
+            schema.write_text('{"input": {"enforce": true}}\n')
+            with self.assertRaisesRegex(ValueError, "does not match dataset schema"):
+                require_import_approval(
+                    approval,
+                    artifact_path=artifact,
+                    source_policy_path=policy,
+                    schema_path=schema,
+                )
 
 
 if __name__ == "__main__":

@@ -22,6 +22,10 @@ trap observation must also affirm `distribution_rights_confirmed`.
 The builder verifies every declared source ID against the current policy. The
 Braintrust importer additionally requires an artifact-bound approval based on
 [`compliance_approval.example.json`](../config/corvus/compliance_approval.example.json).
+When a Braintrust JSON Schema is applied, the approval also binds its exact
+SHA-256. Claim-preparation and fact-verification queues are stored separately;
+a row cannot enter fact verification until it states one explicit atomic claim.
+Both stages remain metadata-only and exclude copied source prose and media.
 
 ## Enabled sources
 
@@ -72,6 +76,55 @@ Official references:
 [Wikimedia API etiquette](https://www.mediawiki.org/wiki/API:Etiquette/en),
 [Wikimedia maxlag guidance](https://www.mediawiki.org/wiki/Manual:Maxlag_parameter).
 
+### Wikipedia Current Events
+
+Status: approved with controls for metadata-only review candidates.
+
+- Collect page titles, section headings, revision IDs, revision timestamps,
+  permanent links, and cited external URLs only. Do not copy current-events
+  prose or fetch the cited pages.
+- Attribute Wikipedia and retain the revision link required for CC BY-SA reuse.
+- Use the same identified, serial, gzip-enabled, `maxlag=1` MediaWiki client as
+  the Wikidata adapter.
+- A linked publisher remains the underlying authority for a factual claim;
+  Wikipedia does not make two reports of the same article independent.
+
+Official references:
+[Wikimedia Terms of Use](https://foundation.wikimedia.org/wiki/Policy:Terms_of_Use/en),
+[developer reuse guidance](https://foundation.wikimedia.org/wiki/Legal:Wikimedia_Developer_App_Guidelines),
+[MediaWiki API etiquette](https://www.mediawiki.org/wiki/API:Etiquette/en).
+
+### OpenLigaDB and TheSportsDB
+
+Status: approved with controls for derived match results.
+
+- OpenLigaDB data is ODbL 1.0. Attribute OpenLigaDB and apply the license's
+  share-alike requirements if a derivative database is distributed.
+- TheSportsDB permits copying and modifying API output from official endpoints.
+  Credit it as the source, remain below 30 requests per minute on the free
+  tier, and do not resell or expose its API.
+- Do not retain artwork, videos, descriptions, news text, or other third-party
+  media from either source.
+- The adapters retain only event IDs, competition/team names, timestamps,
+  scores, attribution, and source URLs.
+- Provider-specific event and team names require human canonicalization.
+  OpenLigaDB and TheSportsDB count as independent authorities only after the
+  reviewer confirms they describe the same match.
+- API timestamps are retained as scheduled event starts. A reviewer-confirmed
+  completion timestamp is required before emitting a final-score `FactEvent`;
+  the scheduled start is never substituted as the result's effective time.
+- Live collection is gated separately by
+  `CORVUS_WIKIPEDIA_TERMS_CONFIRMED=yes`,
+  `CORVUS_OPENLIGADB_LICENSE_CONFIRMED=yes`, and
+  `CORVUS_THESPORTSDB_TERMS_CONFIRMED=yes`. Confirm only the source whose terms
+  have actually been reviewed.
+
+Official references:
+[OpenLigaDB license](https://openligadb.de/lizenz),
+[OpenLigaDB API](https://api.openligadb.de/index.html),
+[TheSportsDB terms](https://www.thesportsdb.com/docs_terms_of_use.php),
+[TheSportsDB API and rate limits](https://www.thesportsdb.com/docs_api_guide).
+
 ### Contact identity
 
 `CORVUS_CONTACT_EMAIL` lets the SEC or Wikimedia reach the operator about
@@ -113,6 +166,12 @@ Official references:
   explicitly grants storage rights.
 - GDELT Cloud is blocked for dataset distribution without a separate written
   redistribution license.
+- The Guardian Open Platform is blocked: its current terms prohibit automated
+  or AI-related use and require stored content to be refreshed or deleted
+  within 24 hours.
+- NewsAPI is blocked without a reviewed paid contract: its developer plan is
+  development-only, publisher rights vary, and public disclosure of API data
+  is restricted.
 - Common Crawl content is blocked as a publication source because origin-site
   terms and rights still apply. The index is not a blanket content license.
 - Sports feeds and election feeds require a per-league or per-jurisdiction

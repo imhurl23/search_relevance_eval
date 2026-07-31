@@ -25,6 +25,7 @@ def main() -> int:
     parser.add_argument("--provider-policy", type=Path, default=PROVIDER_POLICY_PATH)
     parser.add_argument("--artifact", type=Path)
     parser.add_argument("--import-approval", type=Path)
+    parser.add_argument("--schema-file", type=Path)
     args = parser.parse_args()
 
     failures: list[str] = []
@@ -63,6 +64,15 @@ def main() -> int:
             failures.append(f"{name}=yes not attested ({label})")
         else:
             print(f"PASS {label} attested")
+    for name, label in (
+        ("CORVUS_WIKIPEDIA_TERMS_CONFIRMED", "Wikipedia Current Events"),
+        ("CORVUS_OPENLIGADB_LICENSE_CONFIRMED", "OpenLigaDB"),
+        ("CORVUS_THESPORTSDB_TERMS_CONFIRMED", "TheSportsDB"),
+    ):
+        if env.get(name) == "yes":
+            print(f"PASS {label} terms attested")
+        else:
+            print(f"NOTICE {label} adapter disabled until {name}=yes")
 
     provider_policy = load_json_object(args.provider_policy)
     for provider, grant in sorted((provider_policy.get("providers") or {}).items()):
@@ -71,6 +81,8 @@ def main() -> int:
         else:
             print(f"PASS {provider}: benchmark path blocked")
 
+    if args.schema_file and not args.artifact:
+        failures.append("--schema-file requires --artifact and --import-approval")
     if bool(args.artifact) != bool(args.import_approval):
         failures.append("--artifact and --import-approval must be supplied together")
     elif args.artifact and args.import_approval:
@@ -78,8 +90,10 @@ def main() -> int:
             args.import_approval,
             artifact_path=args.artifact,
             source_policy_path=args.source_policy,
+            schema_path=args.schema_file,
         )
-        print("PASS private-import approval matches artifact and source policy")
+        suffix = ", source policy, and schema" if args.schema_file else " and source policy"
+        print(f"PASS private-import approval matches artifact{suffix}")
     else:
         print("PASS external Corvus import remains gated (no approval supplied)")
 

@@ -12,10 +12,16 @@ from pathlib import Path
 import braintrust
 
 from corvus.compliance import SOURCE_POLICY_PATH, require_import_approval, sha256_file
+from corvus.review_io import read_jsonl
+from corvus.review_schema import assert_metadata_only
 from import_livenewsbench import load_env
 
 
-DATASET_NAME = "Corvus-QA-EDGAR-Review-2026-07"
+DEFAULT_DATASET_NAME = "Corvus-QA-EDGAR-Review-2026-07"
+DEFAULT_DESCRIPTION = (
+    "Metadata-only SEC Item 5.02 review queue. Filing bodies and excerpts "
+    "are not stored in Braintrust."
+)
 
 
 def main() -> int:
@@ -24,22 +30,38 @@ def main() -> int:
     parser.add_argument("--compliance-approval", required=True, type=Path)
     parser.add_argument("--source-policy", type=Path, default=SOURCE_POLICY_PATH)
     parser.add_argument("--env-file", type=Path, default=Path(".env"))
+    parser.add_argument("--dataset-name", default=DEFAULT_DATASET_NAME)
+    parser.add_argument("--description", default=DEFAULT_DESCRIPTION)
+    parser.add_argument(
+        "--schema-file",
+        type=Path,
+        help="Optional Braintrust metadata.__schemas JSON object.",
+    )
     args = parser.parse_args()
 
     approval = require_import_approval(
         args.compliance_approval,
         artifact_path=args.source_file,
         source_policy_path=args.source_policy,
+        schema_path=args.schema_file,
     )
-    rows = [
-        json.loads(line)
-        for line in args.source_file.read_text().splitlines()
-        if line.strip()
-    ]
+    rows = read_jsonl(args.source_file)
     if not rows:
         raise ValueError("refusing to upload an empty review queue")
     if any(row["metadata"].get("contains_source_text") is not False for row in rows):
         raise ValueError("every review row must explicitly exclude source text")
+    for row in rows:
+        assert_metadata_only(row)
+    schemas = None
+    if args.schema_file:
+        schemas = json.loads(args.schema_file.read_text())
+        if not isinstance(schemas, dict) or not schemas:
+            raise ValueError("--schema-file must contain a non-empty JSON object")
+        for field in ("input", "expected"):
+            if not isinstance(schemas.get(field), dict):
+                raise ValueError(f"--schema-file is missing {field!r}")
+            if schemas[field].get("enforce") is not True:
+                raise ValueError(f"--schema-file {field!r} must set enforce=true")
 
     env = load_env(args.env_file)
     api_key = env.get("BRAINTRUST_API_KEY")
@@ -50,11 +72,8 @@ def main() -> int:
 
     dataset = braintrust.init_dataset(
         project_id=project_id,
-        name=DATASET_NAME,
-        description=(
-            "Metadata-only SEC Item 5.02 review queue. Filing bodies and excerpts "
-            "are not stored in Braintrust."
-        ),
+        name=args.dataset_name,
+        description=args.description,
         api_key=api_key,
         metadata={
             "artifact_sha256": sha256_file(args.source_file),
@@ -63,6 +82,12 @@ def main() -> int:
             "approval_scope": approval["scope"],
             "contains_source_text": False,
             "row_count": len(rows),
+            **(
+                {"schema_sha256": sha256_file(args.schema_file)}
+                if args.schema_file
+                else {}
+            ),
+            **({"__schemas": schemas} if schemas else {}),
         },
     )
     for row in rows:

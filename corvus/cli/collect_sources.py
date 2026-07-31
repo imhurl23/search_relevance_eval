@@ -12,11 +12,12 @@ from pathlib import Path
 
 from corvus.compliance import REPOSITORY_ROOT
 from corvus.sources import (
+    SEC_BULK_SUBMISSIONS,
     EdgarFilingCandidate,
     claim_entity_ids,
+    make_news_sports_source_adapters,
     make_official_source_adapters,
 )
-from corvus.sources import SEC_BULK_SUBMISSIONS
 
 
 def acquire_collector_lock():
@@ -110,8 +111,70 @@ def main() -> int:
     )
     crosswalk_parser.add_argument("--output", type=Path, required=True)
 
+    news_parser = subparsers.add_parser("wikipedia-current-events")
+    news_parser.add_argument("--date", type=date.fromisoformat, required=True)
+    news_parser.add_argument("--output", type=Path, required=True)
+
+    openliga_parser = subparsers.add_parser("openligadb-results")
+    openliga_parser.add_argument("--league", required=True)
+    openliga_parser.add_argument("--season", required=True)
+    openliga_parser.add_argument("--group-order", type=int)
+    openliga_parser.add_argument("--output", type=Path, required=True)
+
+    sportsdb_parser = subparsers.add_parser("thesportsdb-results")
+    sportsdb_parser.add_argument("--date", type=date.fromisoformat, required=True)
+    sportsdb_parser.add_argument("--sport")
+    sportsdb_parser.add_argument("--league-id")
+    sportsdb_parser.add_argument("--output", type=Path, required=True)
+
     args = parser.parse_args()
     collector_lock = acquire_collector_lock()
+    if args.command in {
+        "wikipedia-current-events",
+        "openligadb-results",
+        "thesportsdb-results",
+    }:
+        source_id = {
+            "wikipedia-current-events": "wikipedia_current_events",
+            "openligadb-results": "openligadb",
+            "thesportsdb-results": "thesportsdb",
+        }[args.command]
+        wikipedia, openligadb, thesportsdb = make_news_sports_source_adapters(
+            args.env_file,
+            enabled_sources={source_id},
+        )
+        if args.command == "wikipedia-current-events":
+            candidate = wikipedia.page_candidate(args.date)
+            write_jsonl(args.output, [candidate])
+            print(
+                f"Wrote metadata-only Wikipedia Current Events candidate to "
+                f"{args.output}; page text was not copied"
+            )
+        elif args.command == "openligadb-results":
+            candidates = openligadb.completed_results(
+                args.league,
+                args.season,
+                group_order=args.group_order,
+            )
+            write_jsonl(args.output, candidates)
+            print(
+                f"Wrote {len(candidates):,} completed OpenLigaDB results to "
+                f"{args.output}"
+            )
+        else:
+            candidates = thesportsdb.completed_results(
+                args.date,
+                sport=args.sport,
+                league_id=args.league_id,
+            )
+            write_jsonl(args.output, candidates)
+            print(
+                f"Wrote {len(candidates):,} completed TheSportsDB results to "
+                f"{args.output}"
+            )
+        collector_lock.close()
+        return 0
+
     edgar, wikidata = make_official_source_adapters(args.env_file)
 
     if args.command in {"edgar-candidates", "edgar-bulk-candidates"}:

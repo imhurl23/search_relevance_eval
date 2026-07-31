@@ -95,6 +95,7 @@ def require_import_approval(
     *,
     artifact_path: Path,
     source_policy_path: Path = SOURCE_POLICY_PATH,
+    schema_path: Path | None = None,
 ) -> dict[str, Any]:
     approval = load_json_object(approval_path)
     required = (
@@ -129,4 +130,9 @@ def require_import_approval(
         raise ValueError(f"{approval_path}: approval does not match dataset artifact")
     if approval["source_policy_sha256"] != sha256_file(source_policy_path):
         raise ValueError(f"{approval_path}: approval does not match source policy")
+    if schema_path is not None:
+        if not approval.get("schema_sha256"):
+            raise ValueError(f"{approval_path}: approval is missing schema_sha256")
+        if approval["schema_sha256"] != sha256_file(schema_path):
+            raise ValueError(f"{approval_path}: approval does not match dataset schema")
     return approval

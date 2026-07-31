@@ -43,6 +43,75 @@
       "api_etiquette_url": "https://www.mediawiki.org/wiki/API:Etiquette/en",
       "license_url": "https://www.wikidata.org/wiki/Wikidata:Licensing"
     },
+    "wikipedia_current_events": {
+      "status": "approved_with_controls",
+      "license": "CC-BY-SA-4.0",
+      "allowed_output": [
+        "page_titles",
+        "section_titles",
+        "revision_ids",
+        "revision_timestamps",
+        "source_urls"
+      ],
+      "controls": [
+        "require CORVUS_WIKIPEDIA_TERMS_CONFIRMED=yes before live collection",
+        "collect revision, section, and cited-URL metadata only; do not copy event prose or fetch cited pages",
+        "link to the permanent revision and preserve attribution",
+        "send a descriptive User-Agent with contact information",
+        "run requests serially at one request per second",
+        "send maxlag=1 and gzip support",
+        "respect Retry-After and exponentially back off on maxlag, rate-limit, and transient HTTP errors"
+      ],
+      "terms_url": "https://foundation.wikimedia.org/wiki/Policy:Terms_of_Use/en",
+      "developer_guidelines_url": "https://foundation.wikimedia.org/wiki/Legal:Wikimedia_Developer_App_Guidelines",
+      "api_etiquette_url": "https://www.mediawiki.org/wiki/API:Etiquette/en",
+      "data_url": "https://en.wikipedia.org/wiki/Portal:Current_events"
+    },
+    "openligadb": {
+      "status": "approved_with_controls",
+      "license": "ODbL-1.0",
+      "allowed_output": [
+        "derived_match_results",
+        "team_names",
+        "competition_names",
+        "event_dates",
+        "source_urls"
+      ],
+      "controls": [
+        "require CORVUS_OPENLIGADB_LICENSE_CONFIRMED=yes before live collection",
+        "use only the official API",
+        "run requests serially at no more than one request every two seconds",
+        "include OpenLigaDB attribution and the ODbL notice",
+        "apply ODbL share-alike requirements to any distributed derivative database",
+        "do not collect team artwork or unrelated user-submitted content"
+      ],
+      "license_url": "https://openligadb.de/lizenz",
+      "api_docs_url": "https://api.openligadb.de/index.html",
+      "data_url": "https://api.openligadb.de"
+    },
+    "thesportsdb": {
+      "status": "approved_with_controls",
+      "allowed_output": [
+        "derived_match_results",
+        "team_names",
+        "competition_names",
+        "event_dates",
+        "source_urls"
+      ],
+      "controls": [
+        "require CORVUS_THESPORTSDB_TERMS_CONFIRMED=yes before live collection",
+        "use only official API endpoints",
+        "use the documented free API key and never place a private key in a source URL",
+        "remain below the free-tier limit of 30 requests per minute",
+        "respect 429 responses and retry only with bounded backoff",
+        "credit TheSportsDB as the data source",
+        "do not collect artwork, videos, article text, or third-party media",
+        "do not resell or provide access to the API"
+      ],
+      "terms_url": "https://www.thesportsdb.com/docs_terms_of_use.php",
+      "api_docs_url": "https://www.thesportsdb.com/docs_api_guide",
+      "data_url": "https://www.thesportsdb.com/api/v1/json/123"
+    },
     "nvd": {
       "status": "approved_with_controls",
       "license": "US-public-domain",
@@ -114,6 +183,16 @@
       "status": "blocked_without_contract",
       "reason": "Dataset redistribution or materially transformed redistribution requires a separate written license.",
       "terms_url": "https://gdeltcloud.com/terms"
+    },
+    "guardian_open_platform": {
+      "status": "blocked_for_dataset_curation",
+      "reason": "Current terms prohibit automated or AI-related use and require stored content to be refreshed or deleted within 24 hours.",
+      "terms_url": "https://www.theguardian.com/open-platform/terms-and-conditions"
+    },
+    "newsapi": {
+      "status": "blocked_without_contract",
+      "reason": "The developer plan is development-only, third-party content rights vary, and public disclosure of API data requires express authorization.",
+      "terms_url": "https://newsapi.org/terms"
     },
     "common_crawl_content": {
       "status": "blocked_for_distribution",

@@ -193,6 +193,7 @@ QUESTION_TEMPLATES: dict[str, str] = {
     "latest_stable_version": "What is the latest stable release of {entity_name}?",
     "cvss_score": "What is the current CVSS score for {entity_name}?",
     "kev_status": "Is {entity_name} currently in CISA's Known Exploited Vulnerabilities catalog?",
+    "final_score": "What was the final score of {entity_name}?",
 }
 
 

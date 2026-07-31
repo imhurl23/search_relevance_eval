@@ -24,6 +24,11 @@ from corvus.compliance import (
     require_approved_sources,
 )
 from corvus.models import FactEvent
+from corvus.news_sports_sources import (
+    OpenLigaDbAdapter,
+    TheSportsDbAdapter,
+    WikipediaCurrentEventsAdapter,
+)
 from import_livenewsbench import load_env
 
 
@@ -119,7 +124,9 @@ class PolicyHttpClient:
         self._limiter = SharedHostLimiter(rate_limit_key, min_interval_seconds)
         self._max_attempts = max_attempts
 
-    def get_json(self, url: str, *, params: dict[str, Any] | None = None) -> dict:
+    def get_json_value(
+        self, url: str, *, params: dict[str, Any] | None = None
+    ) -> dict[str, Any] | list[Any]:
         request_host = (urlparse(url).hostname or "").lower()
         if not _host_allowed(request_host, self._allowed_hosts):
             raise ValueError(f"request host is not approved: {request_host!r}")
@@ -152,8 +159,8 @@ class PolicyHttpClient:
                     and value["error"].get("code") in {"maxlag", "ratelimited"}
                 )
                 if not retryable_api:
-                    if not isinstance(value, dict):
-                        raise ValueError(f"Expected object response from {url}")
+                    if not isinstance(value, (dict, list)):
+                        raise ValueError(f"Expected JSON object or array from {url}")
                     return value
             if attempt == self._max_attempts - 1:
                 if retryable_http:
@@ -163,6 +170,12 @@ class PolicyHttpClient:
             exponential = min(60.0, 2 ** attempt * 5.0)
             time.sleep(max(retry_after, exponential) + random.uniform(0, 0.5))
         raise AssertionError("unreachable")
+
+    def get_json(self, url: str, *, params: dict[str, Any] | None = None) -> dict:
+        value = self.get_json_value(url, params=params)
+        if not isinstance(value, dict):
+            raise ValueError(f"Expected object response from {url}")
+        return value
 
     def download(
         self,
@@ -680,17 +693,10 @@ def claim_entity_ids(entity: dict[str, Any], property_id: str) -> set[str]:
     return {value for value in values if value and value.startswith(("P", "Q"))}
 
 
-def make_official_source_adapters(
-    env_path: Path,
-    *,
-    sec_transport: httpx.BaseTransport | None = None,
-    wikidata_transport: httpx.BaseTransport | None = None,
-) -> tuple[EdgarAdapter, WikidataAdapter]:
-    """Create policy-compliant clients from .env, overriding ambient settings."""
-
+def _operator_context(
+    env_path: Path, *, require_single_deployment: bool
+) -> tuple[dict[str, str], str]:
     env = load_env(env_path)
-    assert_source_approved("sec_edgar")
-    assert_source_approved("wikidata")
     contact = env.get("CORVUS_CONTACT_EMAIL")
     if (
         not contact
@@ -703,12 +709,31 @@ def make_official_source_adapters(
             "set CORVUS_CONTACT_EMAIL_IS_ROLE_ACCOUNT=yes in .env only after "
             "confirming the address is a monitored organizational role inbox"
         )
-    if env.get("CORVUS_SINGLE_DEPLOYMENT_CONFIRMED") != "yes":
+    if (
+        require_single_deployment
+        and env.get("CORVUS_SINGLE_DEPLOYMENT_CONFIRMED") != "yes"
+    ):
         raise ValueError(
             "set CORVUS_SINGLE_DEPLOYMENT_CONFIRMED=yes in .env only after "
             "confirming no other machine or service uses this SEC request budget"
         )
     user_agent = f"CorvusQABot/0.1 ({contact}) httpx/{httpx.__version__}"
+    return env, user_agent
+
+
+def make_official_source_adapters(
+    env_path: Path,
+    *,
+    sec_transport: httpx.BaseTransport | None = None,
+    wikidata_transport: httpx.BaseTransport | None = None,
+) -> tuple[EdgarAdapter, WikidataAdapter]:
+    """Create policy-compliant clients from .env, overriding ambient settings."""
+
+    assert_source_approved("sec_edgar")
+    assert_source_approved("wikidata")
+    _env, user_agent = _operator_context(
+        env_path, require_single_deployment=True
+    )
     sec = PolicyHttpClient(
         user_agent=user_agent,
         # Deliberately 10x below SEC's aggregate ceiling. The local file lock
@@ -727,3 +752,73 @@ def make_official_source_adapters(
         transport=wikidata_transport,
     )
     return EdgarAdapter(sec), WikidataAdapter(wikidata)
+
+
+def make_news_sports_source_adapters(
+    env_path: Path,
+    *,
+    enabled_sources: set[str] | None = None,
+    wikipedia_transport: httpx.BaseTransport | None = None,
+    openligadb_transport: httpx.BaseTransport | None = None,
+    thesportsdb_transport: httpx.BaseTransport | None = None,
+) -> tuple[
+    WikipediaCurrentEventsAdapter,
+    OpenLigaDbAdapter,
+    TheSportsDbAdapter,
+]:
+    """Create news/sports clients after each requested source is attested."""
+
+    supported = {
+        "wikipedia_current_events",
+        "openligadb",
+        "thesportsdb",
+    }
+    requested = enabled_sources or supported
+    unknown = requested - supported
+    if unknown:
+        raise ValueError(f"unsupported news/sports sources: {sorted(unknown)}")
+    for source_id in sorted(requested):
+        assert_source_approved(source_id)
+    env, user_agent = _operator_context(
+        env_path, require_single_deployment=False
+    )
+    attestations = {
+        "wikipedia_current_events": "CORVUS_WIKIPEDIA_TERMS_CONFIRMED",
+        "openligadb": "CORVUS_OPENLIGADB_LICENSE_CONFIRMED",
+        "thesportsdb": "CORVUS_THESPORTSDB_TERMS_CONFIRMED",
+    }
+    for source_id in sorted(requested):
+        name = attestations[source_id]
+        if env.get(name) != "yes":
+            raise ValueError(
+                f"set {name}=yes in .env only after confirming the documented "
+                f"terms and attribution requirements for {source_id}"
+            )
+    wikipedia = PolicyHttpClient(
+        user_agent=user_agent,
+        min_interval_seconds=1.0,
+        allowed_hosts=("wikipedia.org",),
+        rate_limit_key="en.wikipedia.org",
+        transport=wikipedia_transport,
+    )
+    openligadb = PolicyHttpClient(
+        user_agent=user_agent,
+        # OpenLigaDB publishes no numeric limit; remain deliberately serial.
+        min_interval_seconds=2.0,
+        allowed_hosts=("api.openligadb.de",),
+        rate_limit_key="api.openligadb.de",
+        transport=openligadb_transport,
+    )
+    thesportsdb = PolicyHttpClient(
+        user_agent=user_agent,
+        # The free tier allows 30/minute. 2.1 seconds stays below that ceiling.
+        min_interval_seconds=2.1,
+        allowed_hosts=("thesportsdb.com",),
+        rate_limit_key="www.thesportsdb.com",
+        transport=thesportsdb_transport,
+    )
+    return (
+        WikipediaCurrentEventsAdapter(wikipedia),
+        OpenLigaDbAdapter(openligadb),
+        TheSportsDbAdapter(thesportsdb),
+    )
