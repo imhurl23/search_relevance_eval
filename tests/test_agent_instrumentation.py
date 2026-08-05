@@ -572,12 +572,23 @@ class ModelCostTest(unittest.TestCase):
         self.assertAlmostEqual(usd, 30.00)
 
     def test_unpriced_model_returns_none_not_zero(self):
-        # 0.0 would place the OSS arm at the origin of a cost frontier, reading
-        # as free. None keeps it out of the frontier entirely.
-        usd, confirmed = agents.model_cost_usd(
-            "openai/gpt-oss-120b", 1000, 1000)
+        # 0.0 would place an unpriced arm at the origin of a cost frontier,
+        # reading as free. None keeps it out of the frontier entirely.
+        usd, confirmed = agents.model_cost_usd("some/unlisted-model", 1000, 1000)
         self.assertIsNone(usd)
         self.assertFalse(confirmed)
+
+    def test_the_oss_arm_is_priced_so_substitution_is_a_cost_claim(self):
+        # "OSS + retrieval vs frontier without it" is a cost-ratio claim, and a
+        # cost-ratio claim needs both sides priced.
+        usd, confirmed = agents.model_cost_usd("openai/gpt-oss-120b", 1000, 1000)
+        self.assertTrue(confirmed)
+        self.assertGreater(usd, 0)
+
+    def test_oss_input_tokens_are_two_orders_cheaper_than_the_frontier_default(self):
+        oss_in = agents.MODEL_USD_PER_MTOK["openai/gpt-oss-120b"][0]
+        frontier_in = agents.MODEL_USD_PER_MTOK["claude-fable-5"][0]
+        self.assertAlmostEqual(frontier_in / oss_in, 100.0)
 
     def test_inference_dominates_a_realistic_native_row(self):
         # Sanity-check the finding this instrumentation exists to expose: five
@@ -668,6 +679,82 @@ class TaskWiringTest(unittest.TestCase):
         self.assertTrue(hooks.metadata["exclusion_enforced"])
         self.assertIn("source.example",
                       [d for d in hooks.metadata["excluded_source_domains"]])
+
+
+CORVUS_METADATA = {
+    "dataset": "Corvus-QA",
+    "attribute": "ceo_of",
+    "entity_type": "company",
+    "answer_class": "person",
+    "recency_rung": "within_7d",
+    "coverage_tier": "answerable",
+    "event_date": "2026-07-28",
+    "answer_aliases": ["C. CEO"],
+    "articles": [{"url": "https://authority.example/event"}],
+    "search_budget": 5,
+}
+
+
+class SecondDomainTest(unittest.TestCase):
+    """Corvus-QA is the second domain. One domain proves nothing: the closest
+    published comparison saw this effect go from ~+6 points to zero between two
+    domains."""
+
+    def test_leakage_rule_applies_to_corvus_rows(self):
+        # Previously gated on `livenewsbench_release`, so Corvus rows returned
+        # None -- while run_eval was already excluding their source domains at
+        # search time. The rule was enforced and never verified.
+        leaked = _row_output(
+            scorers.SURFACE_FULL,
+            [{"rank": 1, "url": "https://authority.example/event",
+              "snippet": "x", "published_date": "2026-07-29"}],
+            used_searches=1)
+        result = scorers.leakage_guard({}, leaked, "Current CEO",
+                                       metadata=CORVUS_METADATA)
+        self.assertEqual(result["score"], 0.0)
+
+    def test_rows_without_source_domains_stay_unmeasurable(self):
+        # RetrievalQA carries no source URLs. With nothing to check, 1.0 would
+        # assert a compliance nothing established.
+        result = scorers.leakage_guard(
+            {}, _row_output(scorers.SURFACE_FULL,
+                            [{"rank": 1, "url": "https://a.example/x"}],
+                            used_searches=1),
+            ["Team Alpha"], metadata={"source_revision": "abc"})
+        self.assertIsNone(result["score"])
+
+    def test_curated_aliases_are_used_when_the_dataset_supplies_them(self):
+        # Derived string variants cannot know "C. CEO" names the same person as
+        # "Current CEO". Ignoring curated aliases understates every
+        # surface/evidence metric, and unevenly across datasets -- which would
+        # read as a domain effect.
+        output = _row_output(
+            scorers.SURFACE_FULL,
+            [{"rank": 1, "url": "https://other.example/a", "title": "t",
+              "snippet": "the board named C. CEO to the role",
+              "published_date": "2026-07-29"}],
+            used_searches=1)
+        with_aliases = scorers.snippet_sufficiency(
+            {}, output, "Current CEO", metadata=CORVUS_METADATA)
+        without = scorers.snippet_sufficiency({}, output, "Current CEO")
+        self.assertEqual(with_aliases["score"], 1.0)
+        self.assertEqual(without["score"], 0.0)
+
+    def test_corvus_subgroup_variables_reach_row_metadata(self):
+        client = FakeAnthropicClient(ANTHROPIC_RESPONSE)
+        original = run_eval.get_agent_client
+        run_eval.get_agent_client = lambda v: client
+        self.addCleanup(setattr, run_eval, "get_agent_client", original)
+        task = run_eval.make_task(
+            provider="exa", arm="normalized", agent_model="claude-fable-5",
+            search_mode=agents.SEARCH_MODE_NATIVE, model_vendor="anthropic")
+        hooks = FakeHooks(CORVUS_METADATA, "Current CEO")
+        task({"question": "who is CEO?"}, hooks)
+        self.assertEqual(hooks.metadata["dataset_family"], "Corvus-QA")
+        self.assertEqual(hooks.metadata["recency_rung"], "within_7d")
+        self.assertEqual(hooks.metadata["coverage_tier"], "answerable")
+        # Would otherwise have been "uncategorized", making the domain unsliceable.
+        self.assertEqual(hooks.metadata["benchmark_category"], "ceo_of")
 
 
 class ClientConstructionTest(unittest.TestCase):

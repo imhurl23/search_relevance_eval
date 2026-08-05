@@ -547,10 +547,18 @@ def make_task(
         excludes = source_domains + ARCHIVE_EXCLUDES
         question = input["question"]
         task_key = hashlib.sha256(question.encode("utf-8")).hexdigest()[:16]
+        # Category is load-bearing for reporting, not decoration: the closest
+        # published comparison saw this effect swing from ~+6 points to zero
+        # across two domains, so a pooled number can hide a sign change. The
+        # Corvus-QA fallbacks are here because those rows carry none of the
+        # LiveNewsBench category fields and were all landing in "uncategorized",
+        # which would have made the second domain unsliceable.
         benchmark_category = (
             row_metadata.get("category")
             or row_metadata.get("event_category")
             or row_metadata.get("data_source")
+            or row_metadata.get("attribute")        # Corvus-QA: ceo_of, etc.
+            or row_metadata.get("entity_type")
             or "uncategorized"
         )
 
@@ -606,6 +614,19 @@ def make_task(
             "trial_index": hooks.trial_index,
             "task_key": task_key,
             "benchmark_category": benchmark_category,
+            # --- subgroup variables for stratified reporting ---
+            # Promoted to first-class row metadata because they answer the
+            # freshness question directly and only Corvus-QA supplies them:
+            # recency_rung buckets how recently the fact changed, and
+            # coverage_tier records whether a pinned reference search could find
+            # the answer at all. The latter is a headroom control: a row no search
+            # engine can answer measures the ceiling, not the provider.
+            "recency_rung": row_metadata.get("recency_rung"),
+            "coverage_tier": row_metadata.get("coverage_tier"),
+            "answer_class": row_metadata.get("answer_class"),
+            "dataset_family": row_metadata.get("dataset") or (
+                "LiveNewsBench" if row_metadata.get("livenewsbench_release")
+                else "unknown"),
             # --- observability declarations the scorers gate on ---
             "decision_surface": outcome["decision_surface"],
             "exclusion_enforced": outcome["exclusion_enforced"],

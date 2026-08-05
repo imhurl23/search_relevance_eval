@@ -60,6 +60,30 @@ as publication-quality.
 - Cost: `search_cost_usd`, `model_cost_usd`, and `total_cost_usd` per row, kept
   decomposable because inference dominates the bill (see Prior art)
 
+## What this study claims
+
+The design is committed in [docs/study-design.md](docs/study-design.md) before the
+runs, so the 23 conditions test stated hypotheses rather than producing a table
+that gets interpreted afterwards. Three claims, each requiring evidence a
+search-provider ranking cannot produce:
+
+| claim | question | needs |
+|---|---|---|
+| **A** marginal value | how much of accuracy is retrieval vs. what the model knew | `none` floor on every model |
+| **B** substitution *(candidate headline)* | can OSS + retrieval match frontier without it, at what cost ratio | OSS arm + both sides priced |
+| **C** mechanism | when one config wins, *through what* | the six mediator metrics |
+
+Claim B is the sharpest: `openai/gpt-oss-120b` is **100× cheaper per input token**
+than `claude-fable-5` ($0.10 vs $10.00), and retrieval costs $0.005–$0.015 per
+search — so "how much model can you trade for how much retrieval" has a concrete
+answer with budget consequences.
+
+Plus a methods contribution independent of all three: **vendor-native search is
+not auditable the way an API-backed pipeline is**, and `decision_surface` measures
+exactly how much. If a vendor's search cannot be inspected for source leakage,
+evidence sufficiency, or freshness, results obtained on it are not verifiable in
+the way API-based results are.
+
 ## Prior art
 
 [Vals AI's Web Search Index](https://www.vals.ai/benchmarks/web_search) runs the

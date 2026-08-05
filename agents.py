@@ -295,18 +295,32 @@ NATIVE_SEARCH_USD_PER_CALL = {"openai": 0.010, "anthropic": 0.010}
 #
 # A model absent from this table yields None, and the row records
 # model_cost_confirmed=False rather than a fabricated $0.00 — the same discipline
-# applied to the native search rate. Baseten does not publish per-token Model API
-# pricing in the docs we pinned, so the OSS arm is intentionally unpriced.
+# applied to the native search rate.
 # ---------------------------------------------------------------------------
 
 MODEL_USD_PER_MTOK: dict[str, tuple[float, float]] = {
+    # OpenAI (developers.openai.com/api/docs/pricing)
     "gpt-5.6-sol": (5.00, 30.00),
     "gpt-5.6-terra": (2.00, 12.00),
     "gpt-5.6-luna": (0.20, 1.20),
+    # Anthropic (platform.claude.com/docs/en/pricing)
     "claude-fable-5": (10.00, 50.00),
     "claude-opus-5": (5.00, 25.00),
     "claude-sonnet-5": (3.00, 15.00),
     "claude-haiku-4-5": (1.00, 5.00),
+    # Baseten Model APIs (baseten.co/pricing). Pricing the OSS arm is what makes
+    # the capability-substitution question answerable rather than rhetorical:
+    # gpt-oss-120b is 100x cheaper per input token than claude-fable-5, so
+    # "OSS + retrieval vs frontier without it" is a cost-ratio claim, and a
+    # cost-ratio claim needs both sides priced.
+    "openai/gpt-oss-120b": (0.10, 0.50),
+    "deepseek-ai/DeepSeek-V4-Pro": (1.74, 3.48),
+    "deepseek-ai/DeepSeek-V4-Flash-0731": (0.13, 0.26),
+    "moonshotai/Kimi-K3": (3.00, 15.00),
+    "moonshotai/Kimi-K2.6": (0.95, 4.00),
+    "zai-org/GLM-5.2": (1.40, 4.40),
+    "zai-org/GLM-4.7": (0.60, 2.20),
+    "nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B": (0.60, 2.40),
 }
 
 

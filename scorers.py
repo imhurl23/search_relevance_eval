@@ -227,15 +227,25 @@ def _all_results(output):
                 yield result
 
 
-def _answer_aliases(expected):
+def _answer_aliases(expected, metadata=None):
     """Gold answer plus trivial variants for cheap snippet-containment checks.
 
     Deliberately conservative (string-level). The SimpleQA judge remains the
     authority on the *answer*; this is only used for surface/evidence metrics,
     where a false negative is acceptable and a false positive is not.
+
+    Prefers a dataset's own curated aliases when it publishes them
+    (`metadata["answer_aliases"]`, which Corvus-QA does). Derived string variants
+    cannot know that "C. CEO" names the same person as "Current CEO", so on a
+    dataset that supplies aliases, ignoring them understates every
+    surface/evidence metric — and understates it unevenly across datasets, which
+    would look like a domain effect.
     """
     aliases = set()
-    for gold in _expected_answers(expected):
+    curated = (metadata or {}).get("answer_aliases")
+    curated = curated if isinstance(curated, (list, tuple, set)) else []
+    for gold in [*_expected_answers(expected),
+                 *(str(a) for a in curated if str(a).strip())]:
         aliases.update({gold, gold.lower()})
         aliases.add(re.sub(r"[^\w\s]", "", gold.lower()))
         aliases.add(re.sub(r"\s+", " ", gold.lower()).strip())
@@ -471,14 +481,24 @@ def leakage_guard(input, output, expected, metadata=None, **kwargs):
     the row (filter on it in analysis, don't average it away).
     """
     metadata = _metadata(metadata, kwargs)
-    release = metadata.get("livenewsbench_release")
-    if not release:
+    source_domains = sorted(
+        {_host(url) for url in iter_source_urls(metadata, None) if _host(url)}
+    )
+    if not source_domains:
+        # Applicability is decided by whether this row HAS gold source domains,
+        # not by which benchmark it came from. The previous test was
+        # `livenewsbench_release`, which made the rule silently inapplicable to
+        # Corvus-QA even though those rows carry articles[*].url and run_eval
+        # already excludes those domains at search time — the rule was being
+        # enforced and never verified. RetrievalQA rows carry no source URLs, so
+        # they remain None here, which is also the safe answer: with no domains to
+        # check, a 1.0 would assert compliance nothing established.
         return {
             "name": "leakage_guard",
             "score": None,
             "metadata": {
                 "applicable": False,
-                "reason": "LiveNewsBench-only rule",
+                "reason": "row carries no gold source domains to check",
             },
         }
 
@@ -507,9 +527,6 @@ def leakage_guard(input, output, expected, metadata=None, **kwargs):
             },
         }
 
-    source_domains = sorted(
-        {_host(url) for url in iter_source_urls(metadata, None) if _host(url)}
-    )
     bad = []
     for r in results:
         h = _host(r.get("url", ""))
@@ -705,7 +722,7 @@ def temporal_grounding(input, output, expected, metadata=None, **kwargs):
 # 5. Decision surface — snippet self-sufficiency & gold rank
 # ---------------------------------------------------------------------------
 
-def snippet_sufficiency(input, output, expected, **kwargs):
+def snippet_sufficiency(input, output, expected, metadata=None, **kwargs):
     """Was the gold answer visible in the snippet layer, without any click?
 
     Score = 1 if any (title+snippet) contains a gold alias. Metadata carries
@@ -727,7 +744,7 @@ def snippet_sufficiency(input, output, expected, **kwargs):
         # a near-perfect result. Both failure directions are avoided by None.
         return _not_measurable(
             "snippet_sufficiency", surface, "result snippets")
-    aliases = _answer_aliases(expected)
+    aliases = _answer_aliases(expected, _metadata(metadata, kwargs))
     best_rank, first_round, hits = None, None, 0
     for round_idx, s in enumerate(_searches(output)):
         for r in s.get("results", []):
@@ -753,7 +770,7 @@ def snippet_sufficiency(input, output, expected, **kwargs):
     }
 
 
-def evidence_precision(input, output, expected, **kwargs):
+def evidence_precision(input, output, expected, metadata=None, **kwargs):
     """What FRACTION of the surfaced results actually carried the gold answer?
 
     snippet_sufficiency is a recall question — did gold appear anywhere. This is
@@ -775,7 +792,7 @@ def evidence_precision(input, output, expected, **kwargs):
     surface = _surface(output)
     if surface not in _SNIPPET_SURFACES:
         return _not_measurable("evidence_precision", surface, "result snippets")
-    aliases = _answer_aliases(expected)
+    aliases = _answer_aliases(expected, _metadata(metadata, kwargs))
     per_search, total, hits = [], 0, 0
     for s in _searches(output):
         results = [r for r in s.get("results", []) if isinstance(r, dict)]
@@ -808,7 +825,8 @@ def evidence_precision(input, output, expected, **kwargs):
     }
 
 
-def token_discounted_gain(input, output, expected, tau: float = 4000.0, **kwargs):
+def token_discounted_gain(input, output, expected, tau: float = 4000.0,
+                          metadata=None, **kwargs):
     """Time-biased gain (Smucker & Clarke), with tokens as the clock.
 
     Walk the trajectory in order, accumulating tokens the agent had to ingest.
@@ -828,7 +846,7 @@ def token_discounted_gain(input, output, expected, tau: float = 4000.0, **kwargs
         return _not_measurable(
             "token_discounted_gain", surface,
             "snippets or per-search token accounting")
-    aliases = _answer_aliases(expected)
+    aliases = _answer_aliases(expected, _metadata(metadata, kwargs))
     cum = 0.0
     trajectory = _output_payload(output).get("trajectory", [])
     trajectory = trajectory if isinstance(trajectory, list) else []
