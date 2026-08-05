@@ -171,7 +171,9 @@ class VendorRegistryTest(unittest.TestCase):
 
     def test_frontier_models_are_pinned_snapshots_not_moving_aliases(self):
         # `gpt-5.6` is an alias for gpt-5.6-sol and will move to whatever sol
-        # becomes; an eval condition has to name the snapshot.
+        # becomes; an eval condition has to name the snapshot. The two frontier
+        # models are NOT asserted to be capability-equivalent — see the vendor
+        # registry comment; no primary contrast depends on that.
         self.assertEqual(agents.VENDORS["openai"].default_model, "gpt-5.6-sol")
         self.assertNotEqual(agents.VENDORS["openai"].default_model, "gpt-5.6")
 

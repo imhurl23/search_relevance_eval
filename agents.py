@@ -157,9 +157,21 @@ VENDORS: dict[str, VendorSpec] = {
         notes="Server-side search is structurally unavailable; native arm N/A.",
     ),
     # gpt-5.6-sol is pinned rather than the bare `gpt-5.6` alias, which points at
-    # sol today and will move. Sol is the tier-matched counterpart to
-    # claude-opus-5 ($5/$30 vs $5/$25); terra and luna are cheaper tiers and
-    # would confound the frontier comparison with a capability-tier difference.
+    # sol today and will move.
+    #
+    # Sol is NOT asserted to be equivalent to claude-opus-5. There is no
+    # vendor-neutral capability tier: matching on price pairs sol with opus-5
+    # ($5/$30 vs $5/$25), while matching on within-lineup position pairs sol with
+    # claude-fable-5 (Anthropic's flagship, $10/$50). Those two framings disagree,
+    # so any pairing here is a declared choice, not a measured equivalence.
+    #
+    # This is tolerable because no primary contrast depends on it: native-vs-
+    # harness and search-vs-none both hold the model fixed within a vendor, and
+    # cross-vendor native comparisons are already ruled out as two-variable. The
+    # pairing only bounds how far an oss-vs-frontier result generalizes — read
+    # that contrast as "vs this frontier model", never "vs frontier models".
+    # Swap with --agent-model claude-fable-5 for flagship-vs-flagship (2x cost,
+    # and the org must not be on zero data retention).
     #
     # NOTE the empty sampling dict: gpt-5-family reasoning models reject
     # `temperature` with a 400 ("only the default (1) is supported"), and do not

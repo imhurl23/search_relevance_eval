@@ -68,9 +68,21 @@ Two independent axes, set by `--model-vendor` and `--search-mode`:
 | frontier | `anthropic` (`claude-opus-5`) | ✅ | ✅ | ✅ `web_search_20250305` |
 
 Model IDs are pinned snapshots, not aliases: `gpt-5.6` is an alias for
-`gpt-5.6-sol` and will move. Sol is chosen as the tier-matched counterpart to
-`claude-opus-5` ($5/$30 vs $5/$25) — `terra` or `luna` would confound the
-frontier comparison with a capability-tier difference.
+`gpt-5.6-sol` and will move.
+
+**The two frontier models are not claimed to be equivalent.** There is no
+vendor-neutral capability tier. Matching on price pairs `gpt-5.6-sol` with
+`claude-opus-5` ($5/$30 vs $5/$25); matching on within-lineup position pairs sol
+with `claude-fable-5`, Anthropic's flagship ($10/$50). The two framings disagree,
+so the pairing is a declared choice, not a measurement.
+
+It is tolerable because no primary contrast depends on it — `native` vs `harness`
+and search vs `none` both hold the model fixed within a vendor, and cross-vendor
+native comparisons are already ruled out. What the pairing does bound is how far
+an oss-vs-frontier result generalizes: read that contrast as "vs *this* frontier
+model", not "vs frontier models". For flagship-vs-flagship, pass
+`--agent-model claude-fable-5` (about 2x the cost; requires the org not be on
+zero data retention). No code change needed.
 
 Eight cells. Three properties of this shape are load-bearing:
 
