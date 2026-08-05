@@ -908,8 +908,67 @@ def domain_entropy(input, output, expected, **kwargs):
                          "top_host": counts.most_common(1)[0]}}
 
 
+def gated_answer_match(input, output, expected, metadata=None, **kwargs):
+    """Answer correctness with hard-rule violations zeroed — one headline number.
+
+    `dealbreaker_gate` says analysis should multiply the answer score by it, but
+    nothing implemented that, so the two have been sitting side by side as
+    unrelated columns: an arm can top the answer score while leaking gold sources
+    or blowing the search budget. This composes them.
+
+    Vals AI's Web Search Index (vals.ai/benchmarks/web_search) independently
+    arrived at dealbreaker-gating as its scoring primitive, gating on load-bearing
+    *facts*; this gates on rule *compliance*. Both share the property that matters
+    — a violation cannot be averaged away by good performance elsewhere.
+
+    Composed from the existing scorers rather than reimplementing them, so the
+    rules cannot drift apart.
+
+    None-propagation is deliberate and asymmetric:
+      * no gold answer -> None (nothing to score)
+      * gate violated  -> 0.0  (measured, and invalidating)
+      * gate not measurable -> the answer score passes through, with
+        gate_applied=False recorded.
+
+    That last case is the no-tool control arm, which has no retrieval and so
+    cannot violate a retrieval rule. Dropping it to None would remove the
+    parametric baseline from the gated comparison, which is the one number every
+    search arm has to be subtracted from. Filter on gate_applied if you want the
+    strictly-gated subset.
+
+    Uses the deterministic matcher, not the LLM judge, so this number is
+    reproducible and costs nothing to recompute. A judge-gated headline needs an
+    analysis-side join instead — Braintrust scorers cannot read each other's
+    outputs.
+    """
+    answer = qa_answer_match(input, output, expected, **kwargs)
+    if answer.get("score") is None:
+        return {"name": "gated_answer_match", "score": None,
+                "metadata": {"applicable": False,
+                             "reason": "no gold answer on this row"}}
+    gate = dealbreaker_gate(input, output, expected, metadata=metadata, **kwargs)
+    gate_score = gate.get("score")
+    gate_applied = gate_score is not None
+    violated = gate_score == 0.0
+    return {
+        "name": "gated_answer_match",
+        "score": 0.0 if violated else answer["score"],
+        "metadata": {
+            "applicable": True,
+            "answer_score": answer["score"],
+            "match_type": answer.get("metadata", {}).get("match_type"),
+            "gate_applied": gate_applied,
+            "gate_violated": violated,
+            "violated_rules": gate.get("metadata", {}).get("violated", []),
+            "gates_checked": gate.get("metadata", {}).get("gates_checked", []),
+            "decision_surface": _surface(output),
+        },
+    }
+
+
 DETERMINISTIC_SCORERS = [
     qa_answer_match,
+    gated_answer_match,
     leakage_guard,
     dealbreaker_gate,
     budget_economy,

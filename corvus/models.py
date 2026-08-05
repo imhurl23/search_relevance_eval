@@ -1,9 +1,11 @@
 """Core schemas and deterministic row builder for the Corvus-QA dataset.
 
-Source adapters emit one ``FactEvent`` per observation.  The builder only turns
-an event into a benchmark row after independent attesters agree on the new
-value.  Keeping collection separate from question generation makes the
-eligibility rules testable without calling source APIs.
+Source adapters or explicit curation emit one ``FactEvent`` per observation.
+The builder consumes only those normalized observations; it never consumes
+source-specific candidates. It turns an event group into a benchmark row only
+after independent attesters agree on the new value. Keeping collection,
+curation, and question generation separate makes the eligibility rules testable
+without source APIs.
 
 Independence is measured on three separate axes, because conflating them either
 admits correlated errors or rejects genuinely independent evidence:

@@ -249,7 +249,7 @@ class EdgarFilingCandidate(BaseModel):
 
 
 class OfficerTransition(BaseModel):
-    """Reviewed Item 5.02 extraction; effective date must come from filing text."""
+    """Curated Item 5.02 fact; effective date must come from filing text."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -261,7 +261,7 @@ class OfficerTransition(BaseModel):
     evidence_excerpt_sha256: str = Field(
         min_length=64,
         max_length=64,
-        description="Hash of the reviewed filing excerpt; the excerpt is not distributed.",
+        description="Hash of the supporting filing excerpt; text is not distributed.",
     )
 
     @field_validator("effective_ts")
@@ -273,7 +273,7 @@ class OfficerTransition(BaseModel):
 
 
 class EdgarAdapter:
-    """Collect Item 5.02 candidates and emit reviewed officer transitions."""
+    """Collect Item 5.02 candidates and emit curated officer transitions."""
 
     def __init__(self, client: PolicyHttpClient):
         self.client = client
@@ -392,7 +392,7 @@ class EdgarAdapter:
         output_dir: Path,
         max_document_bytes: int = 30 * 1024 * 1024,
     ) -> list[dict[str, Any]]:
-        """Download each unique approved SEC primary document for local review."""
+        """Download each unique approved SEC primary document for local curation."""
         unique = {candidate.filing_url: candidate for candidate in candidates}
         ledger: list[dict[str, Any]] = []
         for index, candidate in enumerate(

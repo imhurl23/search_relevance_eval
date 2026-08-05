@@ -22,7 +22,6 @@ def main() -> int:
     parser.add_argument("--source-policy", type=Path, default=SOURCE_POLICY_PATH)
     parser.add_argument("--artifact", type=Path)
     parser.add_argument("--import-approval", type=Path)
-    parser.add_argument("--schema-file", type=Path)
     args = parser.parse_args()
 
     failures: list[str] = []
@@ -71,8 +70,6 @@ def main() -> int:
         else:
             print(f"NOTICE {label} adapter disabled until {name}=yes")
 
-    if args.schema_file and not args.artifact:
-        failures.append("--schema-file requires --artifact and --import-approval")
     if bool(args.artifact) != bool(args.import_approval):
         failures.append("--artifact and --import-approval must be supplied together")
     elif args.artifact and args.import_approval:
@@ -80,10 +77,8 @@ def main() -> int:
             args.import_approval,
             artifact_path=args.artifact,
             source_policy_path=args.source_policy,
-            schema_path=args.schema_file,
         )
-        suffix = ", source policy, and schema" if args.schema_file else " and source policy"
-        print(f"PASS private-import approval matches artifact{suffix}")
+        print("PASS private-import approval matches artifact and source policy")
     else:
         print("PASS external Corvus import remains gated (no approval supplied)")
 

@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Collect compliance-approved Corvus source observations and candidates."""
+"""Stage 1: collect compliance-approved source candidates or observations.
+
+Outputs are source-specific JSONL. Some commands emit normalized ``FactEvent``
+observations; others deliberately emit candidates that require explicit
+curation. Collection never creates final benchmark rows.
+"""
 
 from __future__ import annotations
 
@@ -49,6 +54,7 @@ def aware_datetime(value: str) -> datetime:
 
 
 def write_jsonl(path: Path, records) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w") as output:
         for record in records:
             output.write(record.model_dump_json() + "\n")
@@ -68,13 +74,20 @@ def load_candidates(path: Path) -> list[EdgarFilingCandidate]:
 
 
 def write_dict_jsonl(path: Path, records: list[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w") as output:
         for record in records:
             output.write(json.dumps(record, sort_keys=True) + "\n")
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description=(
+            "Stage 1 of Corvus-QA curation: collect bounded, compliant source "
+            "artifacts. Candidate artifacts must be curated into normalized "
+            "FactEvent JSONL before build_dataset."
+        )
+    )
     parser.add_argument("--env-file", type=Path, default=Path(".env"))
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -157,13 +170,6 @@ def main() -> int:
     wikidata_parser.add_argument("--canonical-entity-id")
     wikidata_parser.add_argument("--entity-type", default="wikidata_item")
     wikidata_parser.add_argument("--output", type=Path, required=True)
-
-    crosswalk_parser = subparsers.add_parser("wikidata-cik-leadership")
-    crosswalk_parser.add_argument("--review-queue", type=Path, required=True)
-    crosswalk_parser.add_argument(
-        "--priority", choices=("high", "medium", "low"), default="high"
-    )
-    crosswalk_parser.add_argument("--output", type=Path, required=True)
 
     news_parser = subparsers.add_parser("wikipedia-current-events")
     news_parser.add_argument("--date", type=date.fromisoformat, required=True)
@@ -311,7 +317,7 @@ def main() -> int:
         write_jsonl(args.output, candidates)
         print(
             f"Wrote {len(candidates)} Item 5.02 candidates to {args.output}. "
-            "Review the filing and create OfficerTransition records before emission."
+            "Curate the filing into OfficerTransition records before emission."
         )
         collector_lock.close()
         return 0
@@ -358,24 +364,6 @@ def main() -> int:
         write_dict_jsonl(args.ledger, ledger)
         print(
             f"Wrote {len(ledger):,} local filing-document records to {args.ledger}"
-        )
-        collector_lock.close()
-        return 0
-
-    if args.command == "wikidata-cik-leadership":
-        ciks = set()
-        with args.review_queue.open() as source:
-            for line in source:
-                if not line.strip():
-                    continue
-                record = json.loads(line)
-                if record.get("review_priority") == args.priority:
-                    ciks.add(record["cik"])
-        rows = wikidata.fetch_current_ceos_by_cik(ciks)
-        write_dict_jsonl(args.output, rows)
-        print(
-            f"Queried {len(ciks):,} unique CIKs in batches; wrote "
-            f"{len(rows):,} current Wikidata CEO/reference rows to {args.output}"
         )
         collector_lock.close()
         return 0

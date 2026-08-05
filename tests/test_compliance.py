@@ -59,15 +59,13 @@ class ComplianceGateTests(unittest.TestCase):
             )
         sleep.assert_called_once()
 
-    def test_schema_bound_approval_fails_when_schema_changes(self):
+    def test_artifact_bound_approval_fails_when_artifact_changes(self):
         with TemporaryDirectory() as directory:
             root = Path(directory)
             artifact = root / "artifact.jsonl"
-            schema = root / "schema.json"
             policy = root / "policy.json"
             approval = root / "approval.json"
             artifact.write_text("{}\n")
-            schema.write_text('{"input": {}}\n')
             policy.write_text(
                 json.dumps(
                     {
@@ -88,20 +86,18 @@ class ComplianceGateTests(unittest.TestCase):
                         "written_basis_reference": "test",
                         "artifact_sha256": sha256_file(artifact),
                         "source_policy_sha256": sha256_file(policy),
-                        "schema_sha256": sha256_file(schema),
                         "braintrust_dpa_confirmed": True,
                         "braintrust_retention_policy_confirmed": True,
                         "source_distribution_rights_confirmed": True,
                     }
                 )
             )
-            schema.write_text('{"input": {"enforce": true}}\n')
-            with self.assertRaisesRegex(ValueError, "does not match dataset schema"):
+            artifact.write_text('{"changed": true}\n')
+            with self.assertRaisesRegex(ValueError, "does not match dataset artifact"):
                 require_import_approval(
                     approval,
                     artifact_path=artifact,
                     source_policy_path=policy,
-                    schema_path=schema,
                 )
 
 

@@ -22,10 +22,10 @@ trap observation must also affirm `distribution_rights_confirmed`.
 The builder verifies every declared source ID against the current policy. The
 Braintrust importer additionally requires an artifact-bound approval based on
 [`compliance_approval.example.json`](../config/corvus/compliance_approval.example.json).
-When a Braintrust JSON Schema is applied, the approval also binds its exact
-SHA-256. Claim-preparation and fact-verification queues are stored separately;
-a row cannot enter fact verification until it states one explicit atomic claim.
-Both stages remain metadata-only and exclude copied source prose and media.
+Source candidates are curated directly into metadata-only `FactEvent` observations;
+curation artifacts must exclude copied source prose and media. Final Braintrust
+publication remains gated by an approval bound to the frozen artifact and the
+source policy.
 
 ## Enabled sources
 
@@ -46,7 +46,7 @@ Status: approved with controls for derived facts and provenance URLs.
 - Retries cover 429 and transient 5xx responses, honor numeric or HTTP-date
   `Retry-After`, and use capped exponential backoff with jitter.
 - Item 5.02 filing acceptance is recorded as `observed_ts`, never as the fact's
-  effective time. The effective time comes from a reviewed filing extraction.
+  effective time. The effective time comes from a curated filing extraction.
 - Only the excerpt's SHA-256 is retained; filing text is not distributed.
 
 Official references:
@@ -78,7 +78,7 @@ Official references:
 
 ### Wikipedia Current Events
 
-Status: approved with controls for metadata-only review candidates.
+Status: approved with controls for metadata-only curation candidates.
 
 - Collect page titles, section headings, revision IDs, revision timestamps,
   permanent links, and cited external URLs only. Do not copy current-events
@@ -109,8 +109,8 @@ Status: approved with controls for derived match results.
   scores, attribution, and source URLs.
 - Provider-specific event and team names require human canonicalization.
   OpenLigaDB and TheSportsDB count as independent authorities only after the
-  reviewer confirms they describe the same match.
-- API timestamps are retained as scheduled event starts. A reviewer-confirmed
+  curator confirms they describe the same match.
+- API timestamps are retained as scheduled event starts. A curator-confirmed
   completion timestamp is required before emitting a final-score `FactEvent`;
   the scheduled start is never substituted as the result's effective time.
 - Live collection is gated separately by

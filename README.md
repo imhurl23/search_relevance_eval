@@ -54,8 +54,56 @@ as publication-quality.
 - Datasets: `LiveNewsBench`, `RetrievalQA` — Braintrust, versioned with named
   snapshots; `Corvus-QA-dev` and `Corvus-QA-test` can be built and imported
   separately
-- Scorers: 10 deterministic plus one judge score per run, single or jury. See
-  [scorers.py](scorers.py)
+- Scorers: 11 deterministic plus one judge score per run, single or jury. See
+  [scorers.py](scorers.py). `gated_answer_match` is the composed headline number:
+  answer correctness with hard-rule violations zeroed
+- Cost: `search_cost_usd`, `model_cost_usd`, and `total_cost_usd` per row, kept
+  decomposable because inference dominates the bill (see Prior art)
+
+## Prior art
+
+[Vals AI's Web Search Index](https://www.vals.ai/benchmarks/web_search) runs the
+closest published comparison: **native provider search vs. Exa, holding the model
+constant** — the same within-vendor attribution boundary used here. Two expert
+domains (450 finance questions from FAB v2; 208 expert-authored legal tasks),
+scored with dealbreaker-gated partial credit and per-task rubrics, across Gemini
+3.5 Flash, Grok 4.5, Claude Fable 5, and GPT-5.6 Sol.
+
+Three of their findings shaped decisions in this repository:
+
+1. **The effect is domain-dependent.** Exa beat native search by ~6 points on
+   finance (p < 0.001, +14–18 on information-gathering categories) and was
+   statistically even on legal (p = 0.86). A single-domain result does not
+   generalize — which is why this repository reports per `benchmark_category` and
+   why pooling across categories is called out as a reporting error below.
+2. **Model inference dominates cost; search fees are near-negligible.** So a
+   search-fee-only comparison measures the wrong quantity. `model_cost_usd`,
+   `total_cost_usd`, and `search_share_of_cost` are now logged per row rather than
+   left to downstream aggregation. Native arms make this mandatory: their
+   search-result tokens are billed as input tokens on the model call, not as a
+   search fee.
+3. **The independent API was faster despite issuing more search calls.** Speed is
+   therefore not derivable from search count, so a row-level `latency_s` is logged
+   alongside the per-search tool-span latency.
+
+Their model pairing (`gpt-5.6-sol` × `claude-fable-5`) is adopted as the default
+here so results are legible next to that leaderboard.
+
+**What this repository adds that the Index does not cover:**
+
+| | Vals Web Search Index | this repository |
+|---|---|---|
+| search APIs | Exa | Exa, Parallel, You.com |
+| no-search parametric floor | not reported | ✅ every model |
+| OSS models | none | ✅ `gpt-oss-120b` |
+| domain | finance, legal | news freshness |
+| freshness treatments | not reported | `normalized` vs `native_fresh` |
+| decision-surface observability | not reported | declared per row, gates the scorers |
+
+Unverifiable from the public page, and therefore not assumed here: whether they
+used a no-search baseline, how many repetitions per item, whether Exa's retrieval
+tier and snippet budget were pinned, and whether both arms received matched
+prompts. Those four are exactly what this harness records explicitly.
 
 ## The test matrix
 
@@ -65,7 +113,7 @@ Two independent axes, set by `--model-vendor` and `--search-mode`:
 |---|---|---|---|---|
 | oss | `baseten` (`openai/gpt-oss-120b`) | ✅ | ✅ | ⛔ structurally unavailable |
 | frontier | `openai` (`gpt-5.6-sol`) | ✅ | ✅ | ✅ Responses `web_search` |
-| frontier | `anthropic` (`claude-opus-5`) | ✅ | ✅ | ✅ `web_search_20250305` |
+| frontier | `anthropic` (`claude-fable-5`) | ✅ | ✅ | ✅ `web_search_20250305` |
 
 Model IDs are pinned snapshots, not aliases: `gpt-5.6` is an alias for
 `gpt-5.6-sol` and will move.
@@ -617,6 +665,11 @@ metadata = upstream row fields (link, articles[], event_date, ...)
    paired effects per condition against one baseline; 22 contrasts inflate
    family-wise error. Pre-specify a small number of primary contrasts and label
    the rest exploratory.
+6b. **Do not report a pooled cross-category number.** The closest published
+    comparison found this effect swing from ~+6 points to zero across two
+    domains, so a single pooled figure can hide a sign change. `benchmark_category`
+    is logged on every row; report the breakdown, and treat the pooled mean as a
+    summary of the breakdown rather than the result.
 7. **`--trials 3` is unjustified.** No power analysis or minimum detectable
    effect has been computed for web-retrieval nondeterminism.
 8. **`zero_search_row` needs a stated exclusion rule.** Rows where the tool was
@@ -632,11 +685,15 @@ metadata = upstream row fields (link, articles[], event_date, ...)
 11. **Bootstrap, not mixed effects.** The included analysis is dependency-free
     and task-paired; final reporting should also fit condition fixed effects
     with task random intercepts.
-12. **Total cost requires trace aggregation.** Search fees and agent tokens are
-    logged, but child LLM-span cost must be aggregated into `total_cost_usd`
-    before a cost frontier is valid. Native arms make this mandatory rather than
-    optional: their search-result tokens are billed on the model spans, so a
-    search-fee-only comparison understates them.
+12. **Row cost is priced from pinned list prices, not billed usage.**
+    `model_cost_usd` and `total_cost_usd` are now computed per row from token
+    counts and `agents.MODEL_USD_PER_MTOK`, so the cost frontier no longer
+    depends on downstream span aggregation. Two caveats remain: the OSS arm is
+    **unpriced** (Baseten publishes no per-token Model API rate in the pinned
+    docs), so its `model_cost_usd` is `None` and `model_cost_confirmed=False`
+    — it must be excluded from cost comparisons rather than read as cheap; and
+    list prices ignore promotional rates, deliberately, so a recorded cost does
+    not change meaning when a promotion lapses.
 13. **No live smoke run yet.** Every adapter is asserted against the vendors'
     published response schemas offline; none has been executed against the real
     APIs. The Baseten model slug in particular is documented both as

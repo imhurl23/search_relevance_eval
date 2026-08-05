@@ -27,7 +27,7 @@ class JsonSourceClient(Protocol):
 
 
 class NewsPageCandidate(BaseModel):
-    """Metadata-only review candidate for a Wikipedia Current Events page."""
+    """Metadata-only curation candidate from a Wikipedia Current Events page."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -89,7 +89,7 @@ class SportsResultCandidate(BaseModel):
         canonical_away_team: str,
         effective_ts: datetime,
     ) -> FactEvent:
-        """Emit after team reconciliation and effective-time review."""
+        """Emit after team reconciliation and effective-time curation."""
 
         score = (
             f"{canonical_home_team} {self.home_score}-"
@@ -117,7 +117,7 @@ class SportsResultCandidate(BaseModel):
                 "source_home_team": self.home_team,
                 "source_away_team": self.away_team,
                 "event_start_ts": self.event_start_ts.isoformat(),
-                "effective_time_basis": "reviewer_confirmed_match_completion",
+                "effective_time_basis": "curator_confirmed_match_completion",
                 "license": self.license,
                 "attribution": self.attribution,
             },

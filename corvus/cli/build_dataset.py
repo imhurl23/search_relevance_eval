@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Build a frozen Corvus-QA JSONL artifact from normalized FactEvent JSONL."""
+"""Stage 2: freeze final Corvus-QA rows from curated FactEvent JSONL.
+
+This command is deliberately downstream of source collection and curation. It
+does not accept source-specific candidates. Curators must first produce one
+normalized ``FactEvent`` observation per attester/resolver.
+"""
 
 from __future__ import annotations
 
@@ -65,6 +70,7 @@ def coverage_key(item: CoverageAssessment) -> tuple[str, str, str]:
 
 
 def write_jsonl(path: Path, records) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w") as output:
         for record in records:
             if hasattr(record, "model_dump"):
@@ -73,9 +79,23 @@ def write_jsonl(path: Path, records) -> None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("events_file", type=Path)
-    parser.add_argument("output_file", type=Path)
+    parser = argparse.ArgumentParser(
+        description=(
+            "Stage 2 of Corvus-QA curation: apply deterministic eligibility "
+            "rules and freeze final benchmark rows from normalized FactEvents."
+        ),
+        epilog=(
+            "Inputs must be FactEvent JSONL, not collected candidates. Inspect "
+            "the output, rejection ledger, and manifest before "
+            "running corvus.cli.import_dataset."
+        ),
+    )
+    parser.add_argument(
+        "events_file",
+        type=Path,
+        help="Curated FactEvent JSONL (one observation per source).",
+    )
+    parser.add_argument("output_file", type=Path, help="Frozen CorvusRow JSONL artifact.")
     parser.add_argument("--split", required=True, choices=[item.value for item in DatasetSplit])
     parser.add_argument(
         "--freeze-id",

@@ -194,11 +194,28 @@ VENDORS: dict[str, VendorSpec] = {
         reasoning_effort=None,
         notes="Native search via the Responses API hosted web_search tool.",
     ),
+    # claude-fable-5 pairs with gpt-5.6-sol because that is the pairing Vals AI's
+    # Web Search Index ran (vals.ai/benchmarks/web_search), which makes results
+    # here legible next to a public native-vs-Exa leaderboard. It is
+    # flagship-vs-flagship, decided by precedent rather than by a price or tier
+    # argument — see the openai entry for why no such argument settles it.
+    # --agent-model claude-opus-5 is the cheaper alternative (about half the token
+    # cost) if leaderboard comparability is not wanted.
+    #
+    # Two Fable-5 specifics that matter for an eval:
+    #   * It requires 30-day data retention. Under zero data retention EVERY
+    #     request returns 400 regardless of payload, so check the org's retention
+    #     config before blaming the request.
+    #   * Its safety classifiers decline more often, returning HTTP 200 with
+    #     stop_reason="refusal". We record that as model_refused and do NOT enable
+    #     the server-side `fallbacks` parameter: a fallback would silently serve
+    #     the row from a different model, destroying the experimental condition
+    #     while reporting a score. A refusal must stay a refusal here.
     "anthropic": VendorSpec(
         name="anthropic",
         model_class="frontier",
         api_key_env="ANTHROPIC_API_KEY",
-        default_model="claude-opus-5",
+        default_model="claude-fable-5",
         supports_native_search=True,
         # Opus 5 removed temperature/top_p/top_k — sending any of them is a 400.
         sampling={},
@@ -260,6 +277,50 @@ def vendor_of(name: str) -> VendorSpec:
 # ---------------------------------------------------------------------------
 
 NATIVE_SEARCH_USD_PER_CALL = {"openai": 0.010, "anthropic": 0.010}
+
+# ---------------------------------------------------------------------------
+# Model token pricing, USD per million tokens: (input, output).
+#
+# This exists because search fees are the SMALL half of the bill. Vals AI's Web
+# Search Index (vals.ai/benchmarks/web_search) found model inference dominates
+# total cost and search fees are near-negligible when comparing native search
+# against an independent API. A search-fee-only comparison therefore does not
+# measure a slightly incomplete quantity — it measures the wrong one. The native
+# arms make that worse, since their search-result tokens are billed as input
+# tokens on the model call rather than as a search fee.
+#
+# Prices are list prices, checked 2026-08-05. Deliberately NOT using Sonnet 5's
+# promotional $2/$10 intro rate (expires 2026-08-31), so a run's recorded cost
+# does not silently change meaning when the promotion lapses.
+#
+# A model absent from this table yields None, and the row records
+# model_cost_confirmed=False rather than a fabricated $0.00 — the same discipline
+# applied to the native search rate. Baseten does not publish per-token Model API
+# pricing in the docs we pinned, so the OSS arm is intentionally unpriced.
+# ---------------------------------------------------------------------------
+
+MODEL_USD_PER_MTOK: dict[str, tuple[float, float]] = {
+    "gpt-5.6-sol": (5.00, 30.00),
+    "gpt-5.6-terra": (2.00, 12.00),
+    "gpt-5.6-luna": (0.20, 1.20),
+    "claude-fable-5": (10.00, 50.00),
+    "claude-opus-5": (5.00, 25.00),
+    "claude-sonnet-5": (3.00, 15.00),
+    "claude-haiku-4-5": (1.00, 5.00),
+}
+
+
+def model_cost_usd(model: str, prompt_tokens: int,
+                   completion_tokens: int) -> tuple[float | None, bool]:
+    """Return (usd, confirmed). None when the model has no pinned price.
+
+    Returning None rather than 0.0 keeps an unpriced arm out of a cost frontier
+    instead of placing it at the origin, which would read as "free".
+    """
+    rate = MODEL_USD_PER_MTOK.get(model)
+    if rate is None:
+        return None, False
+    return (prompt_tokens * rate[0] + completion_tokens * rate[1]) / 1_000_000, True
 
 # Models on which OpenAI bills the standard `web_search` rate. A non-reasoning
 # model routes to `web_search_preview` at 2.5x the price, so an unrecognized

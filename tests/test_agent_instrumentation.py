@@ -177,6 +177,14 @@ class VendorRegistryTest(unittest.TestCase):
         self.assertEqual(agents.VENDORS["openai"].default_model, "gpt-5.6-sol")
         self.assertNotEqual(agents.VENDORS["openai"].default_model, "gpt-5.6")
 
+    def test_anthropic_default_matches_the_vals_leaderboard_pairing(self):
+        # Vals AI's Web Search Index ran gpt-5.6-sol against claude-fable-5, so
+        # this pairing makes results here legible next to a public native-vs-Exa
+        # leaderboard. claude-opus-5 remains selectable via --agent-model.
+        self.assertEqual(agents.VENDORS["anthropic"].default_model,
+                         "claude-fable-5")
+        self.assertIn("claude-opus-5", agents.MODEL_USD_PER_MTOK)
+
     def test_effort_is_pinned_only_where_it_coexists_with_tools(self):
         # Anthropic can pin effort on both its arms. OpenAI cannot: reasoning
         # models reject reasoning_effort alongside function tools on chat
@@ -493,6 +501,47 @@ class ScorerSurfaceGatingTest(unittest.TestCase):
         self.assertIsNone(result["score"])
         self.assertEqual(result["metadata"]["gates_checked"], [])
 
+    def test_gated_answer_match_zeroes_a_leaking_row(self):
+        leaked = _row_output(
+            scorers.SURFACE_FULL,
+            [{"rank": 1, "url": "https://source.example/article", "title": "A",
+              "snippet": "Team Alpha won", "published_date": "2026-07-30"}],
+            used_searches=1)
+        result = scorers.gated_answer_match({}, leaked, "Team Alpha",
+                                            metadata=LNB_METADATA)
+        # The answer is right and the row is still zero — that is the point of
+        # gating, and it is what keeps a leak from being averaged away.
+        self.assertEqual(result["metadata"]["answer_score"], 1.0)
+        self.assertEqual(result["score"], 0.0)
+        self.assertIn("leakage_guard", result["metadata"]["violated_rules"])
+
+    def test_gated_answer_match_keeps_the_clean_row(self):
+        clean = _row_output(
+            scorers.SURFACE_FULL,
+            [{"rank": 1, "url": "https://other.example/a", "title": "A",
+              "snippet": "Team Alpha won", "published_date": "2026-07-30"}],
+            used_searches=1)
+        result = scorers.gated_answer_match({}, clean, "Team Alpha",
+                                            metadata=LNB_METADATA)
+        self.assertEqual(result["score"], 1.0)
+        self.assertTrue(result["metadata"]["gate_applied"])
+
+    def test_gated_answer_match_keeps_the_ungatable_control_arm(self):
+        # The no-tool arm cannot violate a retrieval rule. Dropping it to None
+        # would delete the parametric baseline that every search arm is measured
+        # against, so the answer score passes through, marked ungated.
+        control = _row_output(scorers.SURFACE_NONE)
+        result = scorers.gated_answer_match({}, control, "Team Alpha",
+                                            metadata=LNB_METADATA)
+        self.assertEqual(result["score"], 1.0)
+        self.assertFalse(result["metadata"]["gate_applied"])
+
+    def test_gated_answer_match_is_none_without_a_gold_answer(self):
+        result = scorers.gated_answer_match(
+            {}, _row_output(scorers.SURFACE_FULL, [], used_searches=1), None,
+            metadata=LNB_METADATA)
+        self.assertIsNone(result["score"])
+
     def test_legacy_rows_without_a_declared_surface_still_score(self):
         # Rows written before the tier existed always carried full harness
         # results, so they must not drop out of every trajectory metric.
@@ -509,6 +558,35 @@ class ScorerSurfaceGatingTest(unittest.TestCase):
 
 
 # --- CLI wiring -------------------------------------------------------------
+
+class ModelCostTest(unittest.TestCase):
+    """Search fees are the small half of the bill (Vals AI's Web Search Index
+    found inference dominates), so a search-fee-only comparison ranks arms on the
+    wrong quantity."""
+
+    def test_priced_models_produce_a_token_cost(self):
+        usd, confirmed = agents.model_cost_usd("claude-fable-5", 1_000_000, 0)
+        self.assertTrue(confirmed)
+        self.assertAlmostEqual(usd, 10.00)
+        usd, _ = agents.model_cost_usd("gpt-5.6-sol", 0, 1_000_000)
+        self.assertAlmostEqual(usd, 30.00)
+
+    def test_unpriced_model_returns_none_not_zero(self):
+        # 0.0 would place the OSS arm at the origin of a cost frontier, reading
+        # as free. None keeps it out of the frontier entirely.
+        usd, confirmed = agents.model_cost_usd(
+            "openai/gpt-oss-120b", 1000, 1000)
+        self.assertIsNone(usd)
+        self.assertFalse(confirmed)
+
+    def test_inference_dominates_a_realistic_native_row(self):
+        # Sanity-check the finding this instrumentation exists to expose: five
+        # native searches at $10/1k is $0.05, which a single search-heavy turn's
+        # tokens should dwarf on a frontier model.
+        search = 5 * agents.NATIVE_SEARCH_USD_PER_CALL["anthropic"]
+        inference, _ = agents.model_cost_usd("claude-fable-5", 60_000, 1_500)
+        self.assertGreater(inference, search)
+
 
 class FakeHooks:
     def __init__(self, metadata, expected):

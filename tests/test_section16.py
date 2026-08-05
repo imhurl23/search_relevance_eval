@@ -4,7 +4,6 @@ from datetime import date, datetime, timedelta, timezone
 import hashlib
 import unittest
 
-from corvus.cli.prepare_section16_review import section16_verification_row
 from corvus.models import DatasetSplit, build_rows
 from corvus.section16 import (
     Section16Adapter,
@@ -433,84 +432,6 @@ class CorroborationTests(unittest.TestCase):
         self.assertEqual(owner_event.attester_role, "reporting_owner")
         self.assertEqual(owner_event.authority_family, "sec")
         self.assertNotEqual(owner_event.attester_id, self.issuer_event().attester_id)
-
-
-class ReviewQueueTests(unittest.TestCase):
-    def row(self, **overrides):
-        kwargs = {
-            "entity_name": "EXAMPLE CORP",
-            "item_502_urls": [
-                "https://www.sec.gov/Archives/edgar/data/55242/a/example-8k.htm"
-            ],
-            "item_502_accessions": ["0000055242-26-000010"],
-            "review_priority": "high",
-        }
-        filing_overrides = overrides.pop("filing", {})
-        kwargs.update(overrides)
-        return section16_verification_row(filing(**filing_overrides), **kwargs)
-
-    def test_row_is_a_valid_fact_verification_row(self):
-        # section16_verification_row validates internally; assert the shape a
-        # reviewer and the Braintrust scorer depend on.
-        row = self.row()
-        self.assertEqual(row["metadata"]["review_stage"], "fact_verification")
-        self.assertTrue(row["metadata"]["verification_eligible"])
-        self.assertIsNone(row["expected"]["fact_verification"])
-        self.assertEqual(
-            row["input"]["claim"]["statement"],
-            "Amanda Marie Cole became Chief Executive Officer of EXAMPLE CORP, "
-            "effective 2026-07-21.",
-        )
-        self.assertEqual(row["input"]["claim"]["asserted_effective_ts"], "2026-07-21T00:00:00Z")
-
-    def test_both_attesters_are_shown_with_distinct_roles(self):
-        evidence = self.row()["input"]["evidence"]
-        self.assertEqual(
-            [(e["attester_role"], e["source_role"]) for e in evidence],
-            [("issuer", "candidate"), ("reporting_owner", "independent_verification")],
-        )
-        self.assertEqual({e["authority_family"] for e in evidence}, {"sec"})
-        self.assertEqual(
-            row_attesters := {e["attester_id"] for e in evidence},
-            {"CIK0000055242", "CIK0002147996"},
-        )
-        self.assertEqual(len(row_attesters), 2)
-
-    def test_previous_value_is_left_for_the_reviewer(self):
-        row = self.row()
-        self.assertIsNone(row["input"]["claim"]["previous_value"])
-        self.assertIs(row["metadata"]["old_value_attested"], False)
-
-    def test_blank_check_issuers_are_flagged_not_silently_kept(self):
-        row = self.row(entity_name="Osprey Acquisition Corp. III")
-        self.assertTrue(row["metadata"]["possible_blank_check_issuer"])
-        self.assertIn("possible-blank-check", row["tags"])
-
-    def test_operating_issuer_is_not_flagged(self):
-        self.assertFalse(self.row()["metadata"]["possible_blank_check_issuer"])
-        self.assertNotIn("possible-blank-check", self.row()["tags"])
-
-    def test_refuses_a_filing_with_no_mappable_office(self):
-        with self.assertRaises(ValueError):
-            self.row(filing={"officer_title": "Vice President"})
-
-    def test_name_as_filed_is_carried_for_spelling_review(self):
-        context = self.row()["input"]["context"]
-        self.assertEqual(context["edgar_owner_name_as_filed"], "Cole Amanda Marie")
-        self.assertEqual(context["section16_officer_title"], "Chief Executive Officer")
-
-    def test_row_id_is_stable_across_runs(self):
-        self.assertEqual(self.row()["id"], self.row()["id"])
-
-    def test_distinct_offices_at_one_issuer_are_distinct_rows(self):
-        ceo = self.row()
-        chair = self.row(
-            filing={"officer_title": "Chairman of the Board", "owner_cik": "0003000000"}
-        )
-        self.assertNotEqual(ceo["id"], chair["id"])
-        self.assertNotEqual(
-            ceo["input"]["claim"]["claim_id"], chair["input"]["claim"]["claim_id"]
-        )
 
 
 if __name__ == "__main__":

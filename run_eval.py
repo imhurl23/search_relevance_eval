@@ -555,6 +555,12 @@ def make_task(
         )
 
         client = get_agent_client(model_vendor)
+        # Wall-clock per row. Vals AI's Web Search Index reports an independent
+        # API completing FASTER than native search despite issuing more search
+        # calls, so speed is a real axis and not derivable from search count.
+        # Per-search latency already lands on the tool spans; this is the total a
+        # user would actually wait, including model turns.
+        t0 = time.perf_counter()
         if search_mode == SEARCH_MODE_NATIVE:
             outcome = _run_native(client, spec, agent_model, system_prompt,
                                   question, excludes)
@@ -562,6 +568,7 @@ def make_task(
             outcome = _run_harness(client, spec, agent_model, system_prompt,
                                    question, excludes, provider, arm,
                                    search_mode)
+        wall_clock_s = time.perf_counter() - t0
 
         surfaced = agents.surfaced_domains(outcome["trajectory"])
         # The confound that quietly voids a search arm: the tool was available
@@ -620,8 +627,26 @@ def make_task(
         # the wrapped LLM spans, so keep the two decomposable rather than summing
         # them here. Total cost per row is an analysis-side join of the two.
         final = outcome["final_answer"]
+        # Search fees are the small half of the bill. Reporting them alone would
+        # rank the arms on the wrong quantity, so the row carries both halves and
+        # their sum. model_cost_usd is None (not 0.0) for an unpriced model, which
+        # keeps that arm out of a cost frontier instead of placing it at the
+        # origin — where it would read as free.
+        inference_cost, cost_confirmed = agents.model_cost_usd(
+            agent_model, outcome["prompt_tokens"], outcome["completion_tokens"])
+        cost_metrics = {"search_cost_usd": outcome["search_cost"]}
+        if inference_cost is not None:
+            cost_metrics["model_cost_usd"] = inference_cost
+            cost_metrics["total_cost_usd"] = inference_cost + outcome["search_cost"]
+            # The share of spend that is NOT search. Vals found this dominates;
+            # logging it per row makes that checkable here rather than assumed.
+            total = inference_cost + outcome["search_cost"]
+            cost_metrics["search_share_of_cost"] = (
+                outcome["search_cost"] / total if total else 0.0)
+        hooks.metadata["model_cost_confirmed"] = cost_confirmed
         current_span().log(metrics={
-            "search_cost_usd": outcome["search_cost"],
+            **cost_metrics,
+            "latency_s": wall_clock_s,
             "used_searches": outcome["used_searches"],
             "used_clicks": outcome["used_clicks"],
             "refused_tool_calls": (

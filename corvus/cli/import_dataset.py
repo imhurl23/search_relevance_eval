@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
-"""Import one frozen Corvus-QA split into Braintrust and snapshot it."""
+"""Stage 3: publish one approved, frozen Corvus-QA split to Braintrust.
+
+It accepts only validated ``CorvusRow`` JSONL and verifies the build manifest,
+source policy, split, row count, and artifact-bound approval before replacing
+the selected dataset head and creating a snapshot.
+"""
 
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 import re
@@ -20,6 +24,7 @@ from corvus.compliance import (
     SOURCE_POLICY_PATH,
     require_approved_sources,
     require_import_approval,
+    sha256_file,
 )
 from corvus.models import CorvusRow, DatasetSplit
 from import_livenewsbench import load_env
@@ -45,17 +50,14 @@ def clear_dataset(dataset: Any) -> int:
     return len(ids)
 
 
-def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as source:
-        for chunk in iter(lambda: source.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 def main() -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("source_file", type=Path)
+    parser = argparse.ArgumentParser(
+        description=(
+            "Stage 3 of Corvus-QA curation: verify and publish one frozen "
+            "benchmark split, then create a named Braintrust snapshot."
+        )
+    )
+    parser.add_argument("source_file", type=Path, help="Frozen CorvusRow JSONL artifact.")
     parser.add_argument("--manifest", required=True, type=Path)
     parser.add_argument("--split", required=True, choices=[item.value for item in DatasetSplit])
     parser.add_argument("--env-file", type=Path, default=Path(".env"))
