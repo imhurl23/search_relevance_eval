@@ -934,10 +934,9 @@ def gated_answer_match(input, output, expected, metadata=None, **kwargs):
     unrelated columns: an arm can top the answer score while leaking gold sources
     or blowing the search budget. This composes them.
 
-    Vals AI's Web Search Index (vals.ai/benchmarks/web_search) independently
-    arrived at dealbreaker-gating as its scoring primitive, gating on load-bearing
-    *facts*; this gates on rule *compliance*. Both share the property that matters
-    — a violation cannot be averaged away by good performance elsewhere.
+    Gating is the right primitive here for one reason: a violation cannot be
+    averaged away by good performance elsewhere. A row that leaked a gold source
+    is not 90% valid.
 
     Composed from the existing scorers rather than reimplementing them, so the
     rules cannot drift apart.

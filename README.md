@@ -58,7 +58,7 @@ as publication-quality.
   [scorers.py](scorers.py). `gated_answer_match` is the composed headline number:
   answer correctness with hard-rule violations zeroed
 - Cost: `search_cost_usd`, `model_cost_usd`, and `total_cost_usd` per row, kept
-  decomposable because inference dominates the bill (see Prior art)
+  decomposable because inference dominates the bill (see Design premises)
 
 ## What this study claims
 
@@ -84,50 +84,30 @@ exactly how much. If a vendor's search cannot be inspected for source leakage,
 evidence sufficiency, or freshness, results obtained on it are not verifiable in
 the way API-based results are.
 
-## Prior art
+## Design premises
 
-[Vals AI's Web Search Index](https://www.vals.ai/benchmarks/web_search) runs the
-closest published comparison: **native provider search vs. Exa, holding the model
-constant** — the same within-vendor attribution boundary used here. Two expert
-domains (450 finance questions from FAB v2; 208 expert-authored legal tasks),
-scored with dealbreaker-gated partial credit and per-task rubrics, across Gemini
-3.5 Flash, Grok 4.5, Claude Fable 5, and GPT-5.6 Sol.
+Four premises the instrumentation is built on. Each is stated here because it
+determined a logging or reporting decision, and each is checkable on this data
+rather than taken on faith.
 
-Three of their findings shaped decisions in this repository:
-
-1. **The effect is domain-dependent.** Exa beat native search by ~6 points on
-   finance (p < 0.001, +14–18 on information-gathering categories) and was
-   statistically even on legal (p = 0.86). A single-domain result does not
-   generalize — which is why this repository reports per `benchmark_category` and
-   why pooling across categories is called out as a reporting error below.
-2. **Model inference dominates cost; search fees are near-negligible.** So a
-   search-fee-only comparison measures the wrong quantity. `model_cost_usd`,
-   `total_cost_usd`, and `search_share_of_cost` are now logged per row rather than
-   left to downstream aggregation. Native arms make this mandatory: their
-   search-result tokens are billed as input tokens on the model call, not as a
-   search fee.
-3. **The independent API was faster despite issuing more search calls.** Speed is
-   therefore not derivable from search count, so a row-level `latency_s` is logged
-   alongside the per-search tool-span latency.
-
-Their model pairing (`gpt-5.6-sol` × `claude-fable-5`) is adopted as the default
-here so results are legible next to that leaderboard.
-
-**What this repository adds that the Index does not cover:**
-
-| | Vals Web Search Index | this repository |
-|---|---|---|
-| search APIs | Exa | Exa, Parallel, You.com |
-| no-search parametric floor | not reported | ✅ every model |
-| OSS models | none | ✅ `gpt-oss-120b` |
-| domain | finance, legal | news freshness |
-| freshness treatments | not reported | `normalized` vs `native_fresh` |
-| decision-surface observability | not reported | declared per row, gates the scorers |
-
-Unverifiable from the public page, and therefore not assumed here: whether they
-used a no-search baseline, how many repetitions per item, whether Exa's retrieval
-tier and snippet budget were pinned, and whether both arms received matched
-prompts. Those four are exactly what this harness records explicitly.
+1. **Search spend is the small half of the bill.** Five native searches cost
+   $0.05; one search-heavy turn pulling 60k input tokens through a $10/MTok model
+   costs about $0.60. So a search-fee-only comparison measures the wrong quantity.
+   `model_cost_usd`, `total_cost_usd`, and `search_share_of_cost` are logged per
+   row, and that last field is what makes this premise falsifiable here. The
+   native arms are worst affected: their search-result tokens are billed as input
+   tokens on the model call, not as a search fee, so without this the arm with the
+   highest hidden cost reports the lowest.
+2. **Latency is not derivable from search count.** A layer issuing more but
+   faster calls can finish ahead of one issuing fewer slow ones, so a row-level
+   `latency_s` is logged alongside the per-search tool-span latency.
+3. **A retrieval effect measured in one domain is a single-domain result.** It can
+   be substantial in one and absent in another, so results are reported per
+   `benchmark_category` and pooling across categories is treated as a reporting
+   error (see below). Two domains are run for the same reason.
+4. **A rule violation cannot be averaged away.** A row that leaked a gold source
+   is not 90% valid, which is why `gated_answer_match` zeroes it rather than
+   discounting it.
 
 ## The test matrix
 
@@ -148,13 +128,18 @@ vendor-neutral capability tier. Matching on price pairs `gpt-5.6-sol` with
 with `claude-fable-5`, Anthropic's flagship ($10/$50). The two framings disagree,
 so the pairing is a declared choice, not a measurement.
 
-It is tolerable because no primary contrast depends on it — `native` vs `harness`
-and search vs `none` both hold the model fixed within a vendor, and cross-vendor
-native comparisons are already ruled out. What the pairing does bound is how far
-an oss-vs-frontier result generalizes: read that contrast as "vs *this* frontier
-model", not "vs frontier models". For flagship-vs-flagship, pass
-`--agent-model claude-fable-5` (about 2x the cost; requires the org not be on
-zero data retention). No code change needed.
+`claude-fable-5` is the default because flagship-vs-flagship is at least a
+definition both vendors publish, whereas a price match is an artifact of their
+margin decisions. It requires the org not be on zero data retention (every request
+400s otherwise) and declines more often, which `model_refused` records.
+`--agent-model claude-opus-5` is the cheaper alternative at about half the token
+cost.
+
+The pairing is tolerable because no primary contrast depends on it — `native` vs
+`harness` and search vs `none` both hold the model fixed within a vendor, and
+cross-vendor native comparisons are already ruled out. What it does bound is how
+far an oss-vs-frontier result generalizes: read that contrast as "vs *this*
+frontier model", not "vs frontier models".
 
 Eight cells. Three properties of this shape are load-bearing:
 
@@ -689,11 +674,11 @@ metadata = upstream row fields (link, articles[], event_date, ...)
    paired effects per condition against one baseline; 22 contrasts inflate
    family-wise error. Pre-specify a small number of primary contrasts and label
    the rest exploratory.
-6b. **Do not report a pooled cross-category number.** The closest published
-    comparison found this effect swing from ~+6 points to zero across two
-    domains, so a single pooled figure can hide a sign change. `benchmark_category`
-    is logged on every row; report the breakdown, and treat the pooled mean as a
-    summary of the breakdown rather than the result.
+6b. **Do not report a pooled cross-category number.** A retrieval effect can be
+    substantial in one category and absent in another, so a pooled figure can hide
+    a sign change. `benchmark_category` is logged on every row; report the
+    breakdown, and treat the pooled mean as a summary of it rather than the
+    result.
 7. **`--trials 3` is unjustified.** No power analysis or minimum detectable
    effect has been computed for web-retrieval nondeterminism.
 8. **`zero_search_row` needs a stated exclusion rule.** Rows where the tool was
@@ -904,8 +889,7 @@ Not open questions. Listed so they do not get changed by accident.
   rubric would invent structure the dataset does not have. The rubric idea worth
   borrowing is *gating*, which is what `dealbreaker_gate` does.
 
-> **Relationship to Vals:** This framework uses the same basic experimental
-> principle as [Vals AI's Web Search Index](https://www.vals.ai/benchmarks/web_search):
-> swap the search tool while holding the agent setup fixed. It adapts that idea
-> to freshness-focused, short-form QA and adds controls for public-dataset
-> contamination and source leakage.
+> **Experimental principle:** swap the search layer while holding the agent setup
+> fixed, and attribute only within a vendor. Applied here to freshness-focused,
+> short-form QA, with added controls for public-dataset contamination, source
+> leakage, and decision-surface observability.

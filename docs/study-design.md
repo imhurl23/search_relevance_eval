@@ -6,13 +6,12 @@ that gets interpreted afterwards — which is where a leaderboard comes from.
 
 ## Objective
 
-**Not** "which search wins." That is a ranking, and
-[Vals AI's Web Search Index](https://www.vals.ai/benchmarks/web_search) already
-produces one: independent API (Exa) beats native provider search by ~6 points on
-finance (p < 0.001), ties on legal (p = 0.86).
+**Not** "which search wins." That is a ranking: it orders search layers on one
+dataset and says nothing about why, for whom, or whether the order survives a
+change of domain.
 
 This study asks **what retrieval actually buys, for whom, and through what
-mechanism.** Three claims, each requiring evidence the ranking design cannot
+mechanism.** Three claims, each requiring evidence a ranking design cannot
 produce.
 
 ---
@@ -24,8 +23,9 @@ produce.
 
 **Why it needs saying:** on time-sensitive questions this is the whole quantity of
 interest, and an accuracy number without it is uninterpretable. A model scoring
-48% with search may be scoring 45% without it. Vals reports no parametric
-baseline, so their scores cannot be decomposed this way.
+48% with search may be scoring 45% without it — the headline number is identical
+and the finding is the opposite. A benchmark without a no-search arm cannot tell
+these apart.
 
 **Evidence required.** Per model: `search_mode=harness` minus `search_mode=none`,
 paired by `task_key`, on the same pinned dataset version. Reported per
@@ -69,8 +69,9 @@ must be reported, not smoothed over.
 
 > When one search configuration beats another, *through what*?
 
-**Why it needs saying:** Vals reports a 6-point gap and a domain-dependence
-finding they have no instruments to explain. Six metrics already logged here are
+**Why it needs saying:** an accuracy gap between two search layers is a result
+without an explanation, and an unexplained gap does not transfer — you cannot
+tell whether it will hold on your data. Six metrics already logged here are
 mediators, not decoration:
 
 | mediator | mechanism it isolates |
@@ -110,7 +111,8 @@ publishes this, and it falls out of instrumentation already built.
 ## Design
 
 Two treatment axes, 23 conditions, per README "The test matrix". Two domains,
-because one proves nothing given the +6 → 0 swing between Vals' two domains:
+because a retrieval effect measured in one domain is a single-domain result — it
+can be substantial in one and absent in another:
 
 | domain | dataset | why it's here |
 |---|---|---|

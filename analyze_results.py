@@ -76,9 +76,10 @@ def normalize_record(record: dict[str, Any], score_name: str) -> dict[str, Any] 
     if answer_words is None:
         answer_words = float(len(answer.split()))
 
-    # Deliberately do not treat search_cost_usd as total cost. Vals' analysis
-    # shows model inference usually dominates; only consume an explicitly
-    # aggregated total_cost_usd from a trace-level export.
+    # Deliberately do not treat search_cost_usd as total cost: model inference
+    # usually dominates it by an order of magnitude, so search spend alone ranks
+    # arms on the wrong quantity. Consume total_cost_usd, which run_eval now logs
+    # per row, or an explicitly aggregated trace-level export.
     total_cost = _number(record.get("total_cost_usd"))
     if total_cost is None:
         total_cost = _number(metrics.get("total_cost_usd"))
@@ -270,7 +271,7 @@ def render_report(
         "",
         "The confidence interval resamples paired tasks, not individual trials. "
         "For publication, fit a mixed-effects model with condition as a fixed "
-        "effect and task as a random intercept, matching the Vals methodology.",
+        "effect and task as a random intercept.",
     ])
     return "\n".join(lines)
 

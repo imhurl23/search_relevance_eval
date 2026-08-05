@@ -194,13 +194,14 @@ VENDORS: dict[str, VendorSpec] = {
         reasoning_effort=None,
         notes="Native search via the Responses API hosted web_search tool.",
     ),
-    # claude-fable-5 pairs with gpt-5.6-sol because that is the pairing Vals AI's
-    # Web Search Index ran (vals.ai/benchmarks/web_search), which makes results
-    # here legible next to a public native-vs-Exa leaderboard. It is
-    # flagship-vs-flagship, decided by precedent rather than by a price or tier
-    # argument — see the openai entry for why no such argument settles it.
+    # claude-fable-5 pairs with gpt-5.6-sol on within-lineup position: each is its
+    # vendor's most capable widely released model. That is a declared choice, not
+    # a measured equivalence — see the openai entry for why neither price nor tier
+    # settles the question. Flagship-vs-flagship is chosen over price parity
+    # because "the best each vendor offers" is at least a definition both vendors
+    # publish, whereas a price match is an artifact of their margin decisions.
     # --agent-model claude-opus-5 is the cheaper alternative (about half the token
-    # cost) if leaderboard comparability is not wanted.
+    # cost) when the extra capability is not worth 2x.
     #
     # Two Fable-5 specifics that matter for an eval:
     #   * It requires 30-day data retention. Under zero data retention EVERY
@@ -281,13 +282,16 @@ NATIVE_SEARCH_USD_PER_CALL = {"openai": 0.010, "anthropic": 0.010}
 # ---------------------------------------------------------------------------
 # Model token pricing, USD per million tokens: (input, output).
 #
-# This exists because search fees are the SMALL half of the bill. Vals AI's Web
-# Search Index (vals.ai/benchmarks/web_search) found model inference dominates
-# total cost and search fees are near-negligible when comparing native search
-# against an independent API. A search-fee-only comparison therefore does not
-# measure a slightly incomplete quantity — it measures the wrong one. The native
-# arms make that worse, since their search-result tokens are billed as input
-# tokens on the model call rather than as a search fee.
+# This exists because search fees are the SMALL half of the bill. Work the
+# arithmetic: five native searches cost 5 x $0.010 = $0.05, while one
+# search-heavy turn that pulls 60k input tokens through a $10/MTok model costs
+# $0.60 — roughly 12x the search spend. A search-fee-only comparison therefore
+# does not measure a slightly incomplete quantity, it measures the wrong one.
+#
+# The native arms are worst affected, because their search-result tokens are
+# billed as input tokens on the model call rather than as a search fee. Without
+# this table the arm with the highest hidden token cost is the one that reports
+# the lowest cost.
 #
 # Prices are list prices, checked 2026-08-05. Deliberately NOT using Sonnet 5's
 # promotional $2/$10 intro rate (expires 2026-08-31), so a run's recorded cost

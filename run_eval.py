@@ -563,11 +563,11 @@ def make_task(
         )
 
         client = get_agent_client(model_vendor)
-        # Wall-clock per row. Vals AI's Web Search Index reports an independent
-        # API completing FASTER than native search despite issuing more search
-        # calls, so speed is a real axis and not derivable from search count.
-        # Per-search latency already lands on the tool spans; this is the total a
-        # user would actually wait, including model turns.
+        # Wall-clock per row. Latency is not derivable from search count: a layer
+        # issuing more but faster calls can finish ahead of one issuing fewer slow
+        # ones, so speed has to be measured rather than inferred. Per-search
+        # latency already lands on the tool spans; this is the total a user would
+        # actually wait, model turns included.
         t0 = time.perf_counter()
         if search_mode == SEARCH_MODE_NATIVE:
             outcome = _run_native(client, spec, agent_model, system_prompt,
@@ -659,8 +659,9 @@ def make_task(
         if inference_cost is not None:
             cost_metrics["model_cost_usd"] = inference_cost
             cost_metrics["total_cost_usd"] = inference_cost + outcome["search_cost"]
-            # The share of spend that is NOT search. Vals found this dominates;
-            # logging it per row makes that checkable here rather than assumed.
+            # What fraction of the bill the search layer actually is. Logged per
+            # row so the assumption that inference dominates stays checkable on
+            # this data instead of being carried as a premise.
             total = inference_cost + outcome["search_cost"]
             cost_metrics["search_share_of_cost"] = (
                 outcome["search_cost"] / total if total else 0.0)

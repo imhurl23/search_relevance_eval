@@ -177,10 +177,10 @@ class VendorRegistryTest(unittest.TestCase):
         self.assertEqual(agents.VENDORS["openai"].default_model, "gpt-5.6-sol")
         self.assertNotEqual(agents.VENDORS["openai"].default_model, "gpt-5.6")
 
-    def test_anthropic_default_matches_the_vals_leaderboard_pairing(self):
-        # Vals AI's Web Search Index ran gpt-5.6-sol against claude-fable-5, so
-        # this pairing makes results here legible next to a public native-vs-Exa
-        # leaderboard. claude-opus-5 remains selectable via --agent-model.
+    def test_anthropic_default_is_the_flagship_pairing(self):
+        # Paired with gpt-5.6-sol on within-lineup position: each is its vendor's
+        # most capable widely released model. claude-opus-5 stays selectable via
+        # --agent-model when the extra capability is not worth 2x.
         self.assertEqual(agents.VENDORS["anthropic"].default_model,
                          "claude-fable-5")
         self.assertIn("claude-opus-5", agents.MODEL_USD_PER_MTOK)
@@ -560,9 +560,8 @@ class ScorerSurfaceGatingTest(unittest.TestCase):
 # --- CLI wiring -------------------------------------------------------------
 
 class ModelCostTest(unittest.TestCase):
-    """Search fees are the small half of the bill (Vals AI's Web Search Index
-    found inference dominates), so a search-fee-only comparison ranks arms on the
-    wrong quantity."""
+    """Search fees are the small half of the bill, so a search-fee-only
+    comparison ranks arms on the wrong quantity."""
 
     def test_priced_models_produce_a_token_cost(self):
         usd, confirmed = agents.model_cost_usd("claude-fable-5", 1_000_000, 0)
@@ -696,9 +695,9 @@ CORVUS_METADATA = {
 
 
 class SecondDomainTest(unittest.TestCase):
-    """Corvus-QA is the second domain. One domain proves nothing: the closest
-    published comparison saw this effect go from ~+6 points to zero between two
-    domains."""
+    """Corvus-QA is the second domain. One domain cannot establish that a
+    retrieval effect generalizes — it can be positive in one and absent in
+    another, so a single-domain result is a single-domain result."""
 
     def test_leakage_rule_applies_to_corvus_rows(self):
         # Previously gated on `livenewsbench_release`, so Corvus rows returned
