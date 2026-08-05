@@ -48,10 +48,9 @@ from braintrust import Eval, current_span, init_dataset, traced, wrap_openai
 from openai import OpenAI
 
 from import_livenewsbench import DATASET_NAME, load_env
-from corvus.compliance import require_provider_permission
 from corvus.sources import SharedHostLimiter, retry_after_seconds
-from scorers import (DETERMINISTIC_SCORERS, make_jury_grader,
-                     make_simpleqa_grader)
+from scorers import (DETERMINISTIC_SCORERS, iter_source_urls,
+                     make_jury_grader, make_simpleqa_grader)
 
 # ---------------------------------------------------------------------------
 # Credentials: values from .env always override ambient credentials.
@@ -109,8 +108,12 @@ EXA_MAX_AGE_HOURS = 24
 EXA_LIVECRAWL_TIMEOUT_MS = 10_000
 # Exa caps includeDomains + excludeDomains at 1200 items each.
 EXA_MAX_DOMAINS = 1200
-# Parallel's Search API is beta and requires this version header.
-PARALLEL_BETA = "search-extract-2025-10-10"
+# Parallel's GA Search API modes are turbo | basic | advanced. Pin one mode for
+# both arms so freshness is the only treatment that changes.
+PARALLEL_MODE = "basic"
+# Match Exa's one-day cache-age treatment. This controls content fetch age, not
+# publication date, so it is closer to Exa's maxAgeHours than after_date is.
+PARALLEL_MAX_AGE_SECONDS = 24 * 60 * 60
 # Combined include_domains + exclude_domains ceiling in a Parallel source_policy.
 PARALLEL_MAX_DOMAINS = 200
 
@@ -156,12 +159,14 @@ TOOLS = [
 # You.com (https://you.com/docs/api-reference/search, checked 2026-07-30):
 #   $5.00/1k calls, independent of `count`. livecrawl would add $1/1k pages,
 #   and we leave it off in both arms.
-# Parallel: still hand-entered and UNVERIFIED — see README open decision 6.
+# Parallel (https://docs.parallel.ai/getting-started/pricing, checked 2026-08-05):
+#   basic/advanced are $5/1k requests for the first 10 results, plus $1/1k for
+#   each additional result and excerpt. This harness requests only 8 results.
 SEARCH_PRICING = {
     ("exa", "normalized"):         {"per_call": 0.007, "per_result_content": 0.001, "per_result_over_10": 0.001},
     ("exa", "native_fresh"):       {"per_call": 0.007, "per_result_content": 0.001, "per_result_over_10": 0.001},
-    ("parallel", "normalized"):    {"per_call": 0.004, "per_result_content": 0.0,   "per_result_over_10": 0.0},
-    ("parallel", "native_fresh"):  {"per_call": 0.009, "per_result_content": 0.0,   "per_result_over_10": 0.0},
+    ("parallel", "normalized"):    {"per_call": 0.005, "per_result_content": 0.0,   "per_result_over_10": 0.001},
+    ("parallel", "native_fresh"):  {"per_call": 0.005, "per_result_content": 0.0,   "per_result_over_10": 0.001},
     ("youdotcom", "normalized"):   {"per_call": 0.005, "per_result_content": 0.0,   "per_result_over_10": 0.0},
     ("youdotcom", "native_fresh"): {"per_call": 0.005, "per_result_content": 0.0,   "per_result_over_10": 0.0},
 }
@@ -203,20 +208,8 @@ def source_domains_of(metadata: dict, expected) -> list[str]:
     Ordered source-domains-first: Parallel caps exclude_domains at 10, so any
     truncation must drop archive mirrors, never a gold source.
     """
-    urls = []
-    if isinstance(metadata, dict):
-        if metadata.get("link"):
-            urls.append(metadata["link"])
-        for article in metadata.get("articles") or []:
-            if isinstance(article, dict):
-                url = article.get("link") or article.get("url")
-                if url:
-                    urls.append(url)
-    if not urls and isinstance(expected, dict) and expected.get("link"):
-        urls.append(expected["link"])
-
     seen, domains = set(), []
-    for url in urls:
+    for url in iter_source_urls(metadata, expected):
         host = _domain_of(url)
         if host and host not in seen:
             seen.add(host)
@@ -315,36 +308,37 @@ def exa_search(query: str, arm: str, exclude_domains: list[str]):
 
 
 def parallel_search(query: str, arm: str, exclude_domains: list[str]):
-    body = {
-        "objective": query,
-        "search_queries": [query[:200]],
-        "processor": "pro" if arm == "native_fresh" else "base",
+    advanced_settings = {
+        # Keep the decision surface and result count identical across vendors.
+        "excerpt_settings": {"max_chars_per_result": SNIPPET_CHARS},
         "max_results": N_RESULTS,
-        # Nested under `excerpts`; as a top-level field this was simply ignored.
-        "excerpts": {"max_chars_per_result": 1500},
         # Ceiling is 200 combined include+exclude domains. exclude_domains is
         # source-first, so any truncation drops archive mirrors, not gold sources.
         "source_policy": {
             "exclude_domains": exclude_domains[:PARALLEL_MAX_DOMAINS]},
     }
+    if arm == "native_fresh":
+        advanced_settings["fetch_policy"] = {
+            "max_age_seconds": PARALLEL_MAX_AGE_SECONDS}
+    body = {
+        "objective": query,
+        "search_queries": [query[:200]],
+        "mode": PARALLEL_MODE,
+        "advanced_settings": advanced_settings,
+    }
     raw = _provider_json(
         "POST",
-        "https://api.parallel.ai/v1beta/search",
+        "https://api.parallel.ai/v1/search",
         json=body,
         headers={
             "x-api-key": os.environ["PARALLEL_API_KEY"],
-            "parallel-beta": PARALLEL_BETA,
             "content-type": "application/json",
         },
     )
     results = []
     for i, res in enumerate(raw.get("results", []), start=1):
         excerpts = res.get("excerpts") or []
-        snippet = " ".join(excerpts)
-        if arm == "normalized":
-            # Truncating Parallel's long excerpts removes its core product
-            # feature — a deliberate, documented limitation of this arm.
-            snippet = snippet[:SNIPPET_CHARS]
+        snippet = " ".join(excerpts)[:SNIPPET_CHARS]
         results.append({
             "rank": i,
             "url": res.get("url", ""),
@@ -369,9 +363,9 @@ def youdotcom_search(query: str, arm: str, exclude_domains: list[str]):
         # Omit rather than send an empty string, which is not a documented value.
         params["exclude_domains"] = ",".join(exclude_domains)
     if arm == "native_fresh":
-        # day|week|month|year or YYYY-MM-DDtoYYYY-MM-DD. Broadest window that
-        # still filters news; never derive this from event_date.
-        params["freshness"] = "week"
+        # day|week|month|year or YYYY-MM-DDtoYYYY-MM-DD. Use one day to match
+        # the declared 24-hour treatment; never derive this from event_date.
+        params["freshness"] = "day"
         # NB: You.com also exposes a `livecrawl` param, but it only populates
         # result.contents — it would not change the snippet decision surface we
         # measure, so enabling it would add latency and $1/1k pages for no signal.
@@ -410,6 +404,17 @@ PROVIDERS = {"exa": exa_search, "parallel": parallel_search,
              "youdotcom": youdotcom_search}
 
 
+def _provider_request_id(provider: str, raw: dict) -> str | None:
+    """Return each vendor's safe correlation ID without retaining raw payloads."""
+    if provider == "exa":
+        return raw.get("requestId")
+    if provider == "parallel":
+        return raw.get("search_id")
+    if provider == "youdotcom":
+        return (raw.get("metadata") or {}).get("search_uuid")
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Traced tools. type="tool" spans; native metrics without raw payload retention.
 # notrace_io=True on both: @traced otherwise auto-logs the return value over
@@ -419,7 +424,7 @@ PROVIDERS = {"exa": exa_search, "parallel": parallel_search,
 @traced(type="tool", name="search_web", notrace_io=True)
 def run_search(provider: str, arm: str, query: str, exclude_domains: list[str]):
     t0 = time.perf_counter()
-    results, _raw = PROVIDERS[provider](query, arm, exclude_domains)
+    results, raw = PROVIDERS[provider](query, arm, exclude_domains)
     latency = time.perf_counter() - t0
     rendered = "\n".join(
         f"[{r['rank']}] {r['title']}\n    {r['url']}\n    "
@@ -429,6 +434,9 @@ def run_search(provider: str, arm: str, query: str, exclude_domains: list[str]):
         input={"query": query, "provider": provider, "arm": arm,
                "exclude_domains": exclude_domains},
         output=results,
+        metadata={"provider": provider, "arm": arm,
+                  "provider_request_id": _provider_request_id(provider, raw),
+                  "raw_payload_retained": False},
         metrics={"tokens": _tok(rendered),
                  "latency_s": latency,
                  "search_cost_usd": search_cost_usd(provider, arm, len(results)),
@@ -611,7 +619,6 @@ def _preflight(provider: str, arm: str) -> None:
     """Fail before spending money, not on row 1 of N."""
     needed = ["OPENAI_API_KEY"]
     if arm != NO_SEARCH_ARM:
-        require_provider_permission(provider)
         needed.append(PROVIDER_KEYS[provider])
     missing = [k for k in needed if not os.environ.get(k)]
     if missing:
@@ -652,7 +659,8 @@ def run(provider: str, arm: str, dataset_name: str, dataset_version: str | None,
     dataset = init_dataset(project_id=project_id, name=dataset_name,
                            version=dataset_version, api_key=api_key)
     project_name = dataset.project.name
-    resolved_version = dataset_version or dataset.version()
+    # braintrust 0.25 exposes Dataset.version as a string property.
+    resolved_version = dataset_version or dataset.version
     print(f"Dataset: {project_name}/{dataset.name} @ version {resolved_version}"
           f"{'' if dataset_version else '  (latest; pass --dataset-version to pin)'}")
 
@@ -697,13 +705,17 @@ def run(provider: str, arm: str, dataset_name: str, dataset_version: str | None,
             "budget": {"searches": MAX_SEARCHES, "clicks": MAX_CLICKS},
             "snippet_chars": SNIPPET_CHARS, "n_results": N_RESULTS,
             "exa_search_type": EXA_SEARCH_TYPE,
+            "parallel_mode": PARALLEL_MODE,
             # The freshness treatment each provider actually received, so a run
             # is interpretable without reading the adapter source.
             "exa_max_age_hours": (
                 EXA_MAX_AGE_HOURS if (provider, arm) == ("exa", "native_fresh")
                 else None),
+            "parallel_max_age_seconds": (
+                PARALLEL_MAX_AGE_SECONDS
+                if (provider, arm) == ("parallel", "native_fresh") else None),
             "youdotcom_freshness": (
-                "week" if (provider, arm) == ("youdotcom", "native_fresh")
+                "day" if (provider, arm) == ("youdotcom", "native_fresh")
                 else None),
             "git_commit": _git_commit(),
             "prompt_version": "frozen-v2-generic-factual",

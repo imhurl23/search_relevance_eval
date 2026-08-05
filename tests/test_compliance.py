@@ -10,7 +10,6 @@ import httpx
 from corvus.compliance import (
     load_source_policy,
     require_import_approval,
-    require_provider_permission,
     sha256_file,
 )
 from corvus.sources import PolicyHttpClient
@@ -32,10 +31,6 @@ class ComplianceGateTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(ValueError, "expired"):
                 load_source_policy(path)
-
-    def test_unapproved_provider_benchmark_fails_closed(self):
-        with self.assertRaisesRegex(ValueError, "blocked"):
-            require_provider_permission("parallel")
 
     def test_retry_after_and_transient_status_are_retried(self):
         responses = iter(

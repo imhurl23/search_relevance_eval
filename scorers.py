@@ -106,12 +106,29 @@ def _expected_answers(expected) -> list[str]:
     if value is None:
         return []
     values = value if isinstance(value, (list, tuple, set)) else [value]
-    return [str(item).strip() for item in values if str(item).strip()]
+    return [item_str for item in values if (item_str := str(item).strip())]
 
 
 def _metadata(metadata, kwargs) -> dict[str, Any]:
     value = metadata if isinstance(metadata, dict) else kwargs.get("metadata")
     return value if isinstance(value, dict) else {}
+
+
+def iter_source_urls(metadata, expected=None):
+    """Yield source URLs from metadata first, then fall back to a legacy expected payload."""
+    if isinstance(metadata, dict):
+        if metadata.get("link"):
+            yield metadata["link"]
+        for article in metadata.get("articles") or []:
+            if isinstance(article, dict):
+                url = article.get("link") or article.get("url")
+                if url:
+                    yield url
+        return
+    if isinstance(expected, dict):
+        link = expected.get("link")
+        if link:
+            yield link
 
 
 def _searches(output):
@@ -391,15 +408,9 @@ def leakage_guard(input, output, expected, metadata=None, **kwargs):
             },
         }
 
-    source_urls = []
-    if metadata.get("link"):
-        source_urls.append(metadata["link"])
-    for article in metadata.get("articles", []):
-        if isinstance(article, dict):
-            url = article.get("link") or article.get("url")
-            if url:
-                source_urls.append(url)
-    source_domains = sorted({_host(url) for url in source_urls if _host(url)})
+    source_domains = sorted(
+        {_host(url) for url in iter_source_urls(metadata, None) if _host(url)}
+    )
     bad = []
     for r in _all_results(output):
         h = _host(r.get("url", ""))

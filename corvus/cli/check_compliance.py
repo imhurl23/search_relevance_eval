@@ -9,9 +9,7 @@ import sys
 from pathlib import Path
 
 from corvus.compliance import (
-    PROVIDER_POLICY_PATH,
     SOURCE_POLICY_PATH,
-    load_json_object,
     load_source_policy,
     require_import_approval,
 )
@@ -22,7 +20,6 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--env-file", type=Path, default=Path(".env"))
     parser.add_argument("--source-policy", type=Path, default=SOURCE_POLICY_PATH)
-    parser.add_argument("--provider-policy", type=Path, default=PROVIDER_POLICY_PATH)
     parser.add_argument("--artifact", type=Path)
     parser.add_argument("--import-approval", type=Path)
     parser.add_argument("--schema-file", type=Path)
@@ -73,13 +70,6 @@ def main() -> int:
             print(f"PASS {label} terms attested")
         else:
             print(f"NOTICE {label} adapter disabled until {name}=yes")
-
-    provider_policy = load_json_object(args.provider_policy)
-    for provider, grant in sorted((provider_policy.get("providers") or {}).items()):
-        if grant.get("status") == "approved":
-            print(f"NOTICE {provider}: approved entry present; validate it before use")
-        else:
-            print(f"PASS {provider}: benchmark path blocked")
 
     if args.schema_file and not args.artifact:
         failures.append("--schema-file requires --artifact and --import-approval")

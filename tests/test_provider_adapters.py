@@ -1,10 +1,12 @@
-"""Pin the Exa and You.com request shapes to their published specs.
+"""Pin all three provider request shapes to their published specs.
 
 These adapters are the only place the eval touches a paid third-party API, and a
 silently-wrong parameter does not raise — it changes the retrieval condition and
 therefore the result. Each assertion below corresponds to a documented rule:
 
 Exa (https://exa.ai/docs/reference/search, /reference/pricing)
+Parallel (https://docs.parallel.ai/search/search-quickstart,
+          /search/search-migration-guide, /getting-started/pricing)
 You.com (https://you.com/docs/api-reference/search)
 """
 
@@ -13,12 +15,14 @@ import unittest
 from unittest.mock import patch
 
 os.environ.setdefault("EXA_API_KEY", "test-exa-key")
+os.environ.setdefault("PARALLEL_API_KEY", "test-parallel-key")
 os.environ.setdefault("YDC_API_KEY", "test-ydc-key")
 
 import run_eval
 
 
 EXA_RESPONSE = {
+    "requestId": "exa-request-id",
     "results": [
         {
             "url": "https://publisher.example/story",
@@ -27,6 +31,18 @@ EXA_RESPONSE = {
             "publishedDate": "2026-07-29T00:00:00Z",
         }
     ]
+}
+
+PARALLEL_RESPONSE = {
+    "search_id": "parallel-search-id",
+    "results": [
+        {
+            "url": "https://publisher.example/story",
+            "title": "Story",
+            "excerpts": ["p" * 5000],
+            "publish_date": "2026-07-29T00:00:00Z",
+        }
+    ],
 }
 
 YDC_RESPONSE = {
@@ -159,7 +175,7 @@ class YouDotComAdapterTests(unittest.TestCase):
         normalized, _ = self._call("normalized")
         self.assertNotIn("freshness", normalized["params"])
         fresh, _ = self._call("native_fresh")
-        self.assertIn(fresh["params"]["freshness"], {"day", "week", "month", "year"})
+        self.assertEqual(fresh["params"]["freshness"], "day")
 
     def test_livecrawl_stays_off_in_both_arms(self):
         for arm in ("normalized", "native_fresh"):
@@ -188,6 +204,75 @@ class YouDotComAdapterTests(unittest.TestCase):
         self.assertEqual(results, [])
 
 
+class ParallelAdapterTests(unittest.TestCase):
+    def _call(self, arm, exclude_domains=("gold.example", "web.archive.org")):
+        calls, patcher = _capture(PARALLEL_RESPONSE)
+        with patcher:
+            results, _ = run_eval.parallel_search("q", arm, list(exclude_domains))
+        return calls[0], results
+
+    def test_ga_endpoint_and_auth_header(self):
+        call, _ = self._call("normalized")
+        self.assertEqual(call["method"], "POST")
+        self.assertEqual(call["url"], "https://api.parallel.ai/v1/search")
+        self.assertEqual(
+            call["headers"]["x-api-key"], os.environ["PARALLEL_API_KEY"])
+        self.assertNotIn("parallel-beta", call["headers"])
+
+    def test_mode_is_pinned_and_processor_removed(self):
+        call, _ = self._call("normalized")
+        self.assertEqual(call["json"]["mode"], run_eval.PARALLEL_MODE)
+        self.assertIn(run_eval.PARALLEL_MODE, {"turbo", "basic", "advanced"})
+        self.assertNotIn("processor", call["json"])
+
+    def test_ga_settings_are_nested_and_equivalent(self):
+        call, _ = self._call("normalized")
+        body = call["json"]
+        settings = body["advanced_settings"]
+        self.assertNotIn("max_results", body)
+        self.assertNotIn("source_policy", body)
+        self.assertNotIn("excerpts", body)
+        self.assertEqual(settings["max_results"], run_eval.N_RESULTS)
+        self.assertEqual(
+            settings["excerpt_settings"]["max_chars_per_result"],
+            run_eval.SNIPPET_CHARS,
+        )
+        self.assertEqual(
+            settings["source_policy"]["exclude_domains"],
+            ["gold.example", "web.archive.org"],
+        )
+
+    def test_freshness_is_the_only_arm_specific_request_setting(self):
+        normalized, _ = self._call("normalized")
+        fresh, _ = self._call("native_fresh")
+        normalized_settings = normalized["json"]["advanced_settings"]
+        fresh_settings = fresh["json"]["advanced_settings"]
+        self.assertNotIn("fetch_policy", normalized_settings)
+        self.assertEqual(
+            fresh_settings["fetch_policy"]["max_age_seconds"],
+            run_eval.PARALLEL_MAX_AGE_SECONDS,
+        )
+        without_freshness = dict(fresh_settings)
+        without_freshness.pop("fetch_policy")
+        self.assertEqual(without_freshness, normalized_settings)
+
+    def test_normalized_result_shape_and_snippet_cap_match_other_providers(self):
+        _, results = self._call("native_fresh")
+        self.assertEqual(
+            sorted(results[0]),
+            ["published_date", "rank", "snippet", "title", "url"],
+        )
+        self.assertEqual(len(results[0]["snippet"]), run_eval.SNIPPET_CHARS)
+        self.assertEqual(results[0]["published_date"], "2026-07-29T00:00:00Z")
+
+    def test_domain_limit_is_enforced(self):
+        domains = ["d%d.example" % i for i in range(250)]
+        call, _ = self._call("normalized", domains)
+        excluded = call["json"]["advanced_settings"]["source_policy"][
+            "exclude_domains"]
+        self.assertEqual(len(excluded), run_eval.PARALLEL_MAX_DOMAINS)
+
+
 class SearchCostTests(unittest.TestCase):
     def test_exa_bills_per_call_plus_one_content_type_per_page(self):
         # $7/1k requests + $1/1k pages for highlights.
@@ -209,6 +294,47 @@ class SearchCostTests(unittest.TestCase):
         self.assertAlmostEqual(
             run_eval.search_cost_usd("youdotcom", "native_fresh", 20), 0.005
         )
+
+    def test_parallel_uses_current_mode_pricing(self):
+        self.assertAlmostEqual(
+            run_eval.search_cost_usd("parallel", "normalized", 8), 0.005
+        )
+        self.assertAlmostEqual(
+            run_eval.search_cost_usd("parallel", "native_fresh", 20),
+            0.005 + 10 * 0.001,
+        )
+
+
+class InstrumentationTests(unittest.TestCase):
+    def test_each_provider_emits_the_same_trace_fields(self):
+        responses = {
+            "exa": EXA_RESPONSE,
+            "parallel": PARALLEL_RESPONSE,
+            "youdotcom": YDC_RESPONSE,
+        }
+        expected_ids = {
+            "exa": "exa-request-id",
+            "parallel": "parallel-search-id",
+            "youdotcom": "uuid",
+        }
+        expected_log_keys = {"input", "output", "metadata", "metrics"}
+        expected_metric_keys = {
+            "tokens", "latency_s", "search_cost_usd", "n_results"}
+        for provider, response in responses.items():
+            span = unittest.mock.Mock()
+            calls, transport = _capture(response)
+            with transport, patch.object(run_eval, "current_span", return_value=span):
+                run_eval.run_search.__wrapped__(
+                    provider, "normalized", "q", ["gold.example"])
+            self.assertEqual(len(calls), 1)
+            logged = span.log.call_args.kwargs
+            self.assertEqual(set(logged), expected_log_keys)
+            self.assertEqual(set(logged["metrics"]), expected_metric_keys)
+            self.assertEqual(logged["input"]["provider"], provider)
+            self.assertEqual(logged["metadata"]["provider"], provider)
+            self.assertEqual(
+                logged["metadata"]["provider_request_id"], expected_ids[provider])
+            self.assertFalse(logged["metadata"]["raw_payload_retained"])
 
     def test_every_provider_arm_pair_is_priced(self):
         for provider in run_eval.PROVIDERS:

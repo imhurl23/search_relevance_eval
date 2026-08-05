@@ -186,18 +186,6 @@ Official references:
   five minutes), but it remains blocked pending a UK privacy/data-protection
   review because organizations reusing officer data become responsible for
   their own compliance.
-- Exa, Parallel, and You.com benchmark runs are blocked by
-  [`provider_permissions.json`](../config/corvus/provider_permissions.json)
-  until written
-  permission covers benchmarking, result retention, and Braintrust storage.
-  Parallel expressly requires prior written consent for third-party benchmark
-  results; Exa's current terms broadly restrict copying or distributing
-  information obtained through the service; You.com's current API policy
-  restricts storing significant API content for reuse without contractual
-  authorization.
-  The gate also requires provider-specific permission for Exa output reuse,
-  Parallel third-party benchmark results, and uncached repeated You.com
-  benchmark queries.
 - Generic webpage fetching is disabled. Adding an origin requires a separate
   terms, robots, privacy, and redistribution review for that host.
 

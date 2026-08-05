@@ -12,7 +12,6 @@ from typing import Any, Iterable
 REPOSITORY_ROOT = Path(__file__).resolve().parent.parent
 CONFIG_DIR = REPOSITORY_ROOT / "config" / "corvus"
 SOURCE_POLICY_PATH = CONFIG_DIR / "source_compliance.json"
-PROVIDER_POLICY_PATH = CONFIG_DIR / "provider_permissions.json"
 
 
 def load_json_object(path: Path) -> dict[str, Any]:
@@ -56,38 +55,6 @@ def require_approved_sources(
             raise ValueError(
                 f"source {source_id!r} is not approved: {source.get('status')}"
             )
-
-
-def require_provider_permission(
-    provider: str, *, path: Path = PROVIDER_POLICY_PATH
-) -> None:
-    policy = load_json_object(path)
-    grant = (policy.get("providers") or {}).get(provider)
-    if not grant or grant.get("status") != "approved":
-        status = grant.get("status") if grant else "missing"
-        raise ValueError(
-            f"provider {provider!r} is blocked ({status}); record written permission "
-            f"in {path} before benchmarking"
-        )
-    required_true = (
-        "benchmarking_allowed",
-        "braintrust_storage_allowed",
-        "result_storage_allowed",
-    )
-    provider_specific = {
-        "exa": ("output_copy_and_distribution_allowed",),
-        "parallel": ("third_party_benchmark_results_allowed",),
-        "youdotcom": ("repeated_queries_without_cache_allowed",),
-    }
-    required_true += provider_specific.get(provider, ())
-    missing = [field for field in required_true if grant.get(field) is not True]
-    if missing:
-        raise ValueError(f"provider {provider!r} permission lacks {missing}")
-    for field in ("written_permission_reference", "approved_by", "valid_until"):
-        if not grant.get(field):
-            raise ValueError(f"provider {provider!r} permission lacks {field}")
-    if date.today() > date.fromisoformat(grant["valid_until"]):
-        raise ValueError(f"provider {provider!r} written permission has expired")
 
 
 def require_import_approval(

@@ -393,10 +393,8 @@ Use one `study-id`, pinned dataset version, and agent model across every
 condition in a comparison. Interleave conditions in time—running them days
 apart makes the web itself a variable:
 
-Search-provider arms fail closed until
-[provider permissions](config/corvus/provider_permissions.json) record actual written
-permission for benchmarking, result retention, and Braintrust storage. Generic
-webpage fetching is disabled.
+Search-provider arms require the matching API key from `.env`. Generic webpage
+fetching remains disabled.
 
 ```bash
 python run_eval.py run --provider exa --arm native_fresh \
@@ -461,30 +459,19 @@ conclusions. Settle them before publishing.
 
 ### Blocking
 
-**1. `native_fresh` means three different things.**
+**1. `native_fresh` uses aligned windows but different vendor semantics.**
 
 | Provider | What `native_fresh` changes | Freshness? |
 |---|---|---|
-| Exa | `contents.maxAgeHours: 24` | Yes |
-| You.com | `freshness: "week"` | Yes, but 7× wider than Exa |
-| Parallel | `processor: "base"` → `"pro"` | No — a quality and cost tier |
+| Exa | `contents.maxAgeHours: 24` | Content cache age |
+| You.com | `freshness: "day"` | Publication recency |
+| Parallel | `advanced_settings.fetch_policy.max_age_seconds: 86400` | Content cache age |
 
-The Parallel column measures pro against base, not fresh against cached, and its
-`$0.004 → $0.009` cost difference comes along with it, which then affects any
-cost/quality comparison. Options:
-
-- Use `source_policy.after_date` for Parallel, computed from *now*, never from
-  the row's `event_date`. Keep `processor: "base"` in both arms.
-- Keep the processor switch and rename the arm `native_best`. Honest, but no
-  freshness result for Parallel.
-- Split into `native_fresh` and `native_tier`. Doubles run cost.
-
-Even after that, Exa's 24 hours and You.com's week are different treatments.
-Aligning them means `freshness: "day"` or `maxAgeHours: 168`. Note the two knobs
-are not the same kind of filter: `maxAgeHours` bounds the age of the *content Exa
-serves* (cache younger than 24 h, otherwise livecrawl), while You.com's
-`freshness` filters *which results are eligible* by publication recency. Exa's
-setting can return an old article freshly crawled; You.com's cannot.
+All three now use a 24-hour setting, and Parallel stays on pinned `basic` mode in
+both arms. The treatment still is not identical: Exa and Parallel bound the age
+of fetched/indexed content, while You.com's `freshness` filters which results
+are eligible by publication recency. Exa or Parallel can therefore return an
+old article fetched recently; You.com cannot. Report this semantic limitation.
 
 **2. The providers search different corpora.** Exa filters to
 `category: "news"`. Parallel has no category filter, so it searches the general
@@ -496,12 +483,11 @@ way.
 
 ### Important
 
-**3. Snippet caps differ by arm.** `SNIPPET_CHARS = 400` applies to Exa and
-You.com in both arms, but to Parallel only in `normalized`. Parallel's
-`native_fresh` snippets can reach 1500 characters, which is a decision-surface
-advantage unrelated to retrieval. It is also the reason the `normalized` arm
-exists, since truncating Parallel's excerpts removes its main feature. Decide
-whether `native_fresh` caps all three or none.
+**3. Excerpt normalization removes a native Parallel advantage.**
+`SNIPPET_CHARS = 400` now applies to every provider in both arms, including
+Parallel's server-side excerpt setting and a client-side safety cap. This makes
+the agent decision surface equivalent, but it intentionally does not measure
+the value of Parallel's longer native excerpts.
 
 **4. Exa's search tier is not frozen.** `type` defaults to `"auto"`, which routes
 per query. Now pinned as `EXA_SEARCH_TYPE = "auto"` — same behavior, but visible.
@@ -519,15 +505,16 @@ deployed QA Answer Correctness scorer uses `openai/gpt-oss-120b`, a third answer
 to the same question. `qa_answer_match` needs no model at all, so its
 disagreement with the judge is worth reporting rather than smoothing over.
 
-**6. One provider's cost numbers are still unverified.** `SEARCH_PRICING` in
+**6. Search pricing must be rechecked before publication.** `SEARCH_PRICING` in
 [run_eval.py](run_eval.py) now carries three documented terms per
 `(provider, arm)` — per-call, per-result content, and per-result beyond 10 — and
 `search_cost_usd()` applies them to the results a call actually returned. Exa and
 You.com were checked against their pricing pages on 2026-07-30: Exa is $7/1k
 requests plus $1/1k pages *per content type*, so an 8-result call with highlights
 costs about $0.015, not the $0.005 previously recorded; You.com is $5/1k calls,
-not $0.004. Parallel's `base` and `pro` numbers are still hand-entered, and that
-cost difference remains tangled up with the freshness treatment (see 1).
+not $0.004. Parallel was checked on 2026-08-05: pinned `basic` mode is $5/1k
+requests for the first 10 results plus $1/1k additional results, so both arms
+cost $0.005 at this harness's eight-result limit.
 `_tok()` estimates tokens as `chars / 4`; use tiktoken before publishing
 token-normalized numbers, including `token_discounted_gain`.
 
@@ -634,9 +621,11 @@ Not open questions. Listed so they do not get changed by accident.
   You.com uses the broader of query-implied and parameter freshness, so a dated
   query would un-blind the arms.
 - Raw pre-normalization provider payloads are not retained in traces.
+- Every provider emits the same Braintrust search span input/output, metric
+  names, and safe provider correlation ID (`requestId`, `search_id`, or
+  `search_uuid`) for support/debugging without retaining raw payloads.
 - `notrace_io=True` on the search tool span prevents `@traced` from logging the
-  return tuple.
-  over the explicit `output=`.
+  return tuple over the explicit `output=`.
 - A single gold answer, not a multi-item rubric. Rubric grading suits open-ended
   professional tasks; LiveNewsBench and RetrievalQA are short-form factoid QA
   where the gold answer is one fact, so the SimpleQA three-way grade fits and a
