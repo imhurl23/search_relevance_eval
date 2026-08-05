@@ -5,11 +5,14 @@ that measure how a web-search API affects an LLM's ability to answer fresh,
 time-sensitive questions**. It is not a finished benchmark, a provider ranking,
 or a claim that the current defaults are the right experimental design.
 
-The included implementation gives you a concrete starting point: one frozen
-web-research agent answers news questions while the search provider and search
-configuration are varied. The model snapshot, prompt, tool schemas,
-search budget, and result normalization are held constant so
-differences can be attributed as closely as possible to the search layer.
+The included implementation gives you a concrete starting point: a web-research
+agent answers news questions across two treatment axes — the **model class**
+(open-weights vs. frontier) and the **search mode** (no search, a harness-owned
+search tool over a search API, or the model vendor's own server-side search). The
+prompt, tool contract, search budget, and result normalization are held constant
+within a condition so differences can be attributed as closely as possible to the
+axis under test. See [The test matrix](#the-test-matrix) for the eight cells and
+for which comparisons the instrumentation actually supports.
 
 Use the framework to define and test your own experiment:
 
@@ -33,7 +36,9 @@ as publication-quality.
 
 ## Repository layout
 
-- `corvus/` — Corvus-QA schemas, source adapters, review helpers, and CLI modules
+- `agents.py` — per-vendor agent clients, native-search adapters, and the
+  decision-surface tiers the scorers gate on
+- `corvus/` — Corvus-QA schemas, source adapters, builders, and CLI modules
 - `config/corvus/` — machine-readable source policies and approval templates
 - `docs/` — compliance and operational documentation
 - `tests/` — offline unit and smoke-test fixtures
@@ -41,26 +46,145 @@ as publication-quality.
 
 ## Included example configuration
 
-- Agent: `gpt-4o-2024-11-20` (override with `--agent-model`), temp 0, seed 42,
-  5 searches and no arbitrary webpage fetching
-- Providers: `exa`, `parallel`, `youdotcom`
-- Arms: `normalized` (uniform snippet budget), `native_fresh` (each vendor's own
-  freshness knobs), `no_search` (control — no tools, parametric memory only)
+- Agent: per-vendor pinned model (override with `--agent-model`), 5 searches and
+  no arbitrary webpage fetching
+- Search APIs (`--search-mode harness`): `exa`, `parallel`, `youdotcom`
+- Freshness treatments (`--arm`, harness only): `normalized` (uniform snippet
+  budget), `native_fresh` (each vendor's own freshness knobs)
 - Datasets: `LiveNewsBench`, `RetrievalQA` — Braintrust, versioned with named
   snapshots; `Corvus-QA-dev` and `Corvus-QA-test` can be built and imported
   separately
 - Scorers: 10 deterministic plus one judge score per run, single or jury. See
   [scorers.py](scorers.py)
 
+## The test matrix
+
+Two independent axes, set by `--model-vendor` and `--search-mode`:
+
+| `model_class` | vendor | `none` | `harness` | `native` |
+|---|---|---|---|---|
+| oss | `baseten` (`openai/gpt-oss-120b`) | ✅ | ✅ | ⛔ structurally unavailable |
+| frontier | `openai` (`gpt-5.6-sol`) | ✅ | ✅ | ✅ Responses `web_search` |
+| frontier | `anthropic` (`claude-opus-5`) | ✅ | ✅ | ✅ `web_search_20250305` |
+
+Model IDs are pinned snapshots, not aliases: `gpt-5.6` is an alias for
+`gpt-5.6-sol` and will move. Sol is chosen as the tier-matched counterpart to
+`claude-opus-5` ($5/$30 vs $5/$25) — `terra` or `luna` would confound the
+frontier comparison with a capability-tier difference.
+
+Eight cells. Three properties of this shape are load-bearing:
+
+**`native` is only attributable within a vendor.** If GPT gets native search and
+Claude gets the harness tool, model identity is confounded with search mode. So
+each frontier vendor runs all three modes, and its native arm is compared to its
+own harness and `none` arms — never across vendors.
+
+**Every model needs a `none` arm.** Without a parametric floor, a high
+native-search score cannot be separated from what the model already knew, and
+LiveNewsBench rows predating a model's cutoff are answerable with no search.
+
+**`--search-mode native` and `--arm native_fresh` are different things.**
+`native_fresh` is a *search API's* freshness parameter (Exa `maxAgeHours`, You.com
+`freshness=day`). `native` is the *model vendor's* own server-side search. The
+runner rejects combining them, and `condition_id` keeps them distinct.
+
+```bash
+# frontier, native search (per vendor)
+python run_eval.py run --model-vendor anthropic --search-mode native \
+  --dataset-version <xact-id> --study-id matrix-v1 --trials 3
+python run_eval.py run --model-vendor openai --search-mode native \
+  --dataset-version <xact-id> --study-id matrix-v1 --trials 3
+
+# frontier, harness search — same vendors, so native-vs-harness is attributable
+python run_eval.py run --model-vendor anthropic --search-mode harness \
+  --provider exa --arm native_fresh --dataset-version <xact-id> --study-id matrix-v1
+
+# OSS with and without search
+python run_eval.py run --model-vendor baseten --search-mode harness \
+  --provider exa --arm native_fresh --dataset-version <xact-id> --study-id matrix-v1
+python run_eval.py run --model-vendor baseten --search-mode none \
+  --dataset-version <xact-id> --study-id matrix-v1
+```
+
+### What is not comparable across arms, and why
+
+Server-side search does not expose the decision surface the harness tool does.
+Each row carries a `decision_surface` tier, and the scorers gate on it:
+
+| tier | fields present | arms | scorers that go N/A |
+|---|---|---|---|
+| `full` | rank, url, title, snippet, published_date | harness | — |
+| `no_snippet` | rank, url, title, published_date | Anthropic native | the 4 snippet-derived scorers |
+| `urls_only` | rank, url, title (cited results only) | OpenAI native | snippet scorers **and** `temporal_grounding` |
+| `none` | nothing | `--search-mode none` | all trajectory scorers, including `leakage_guard` |
+
+A gated scorer returns `None` (excluded from averages), never a score. This
+matters because the natural failure is silent, not loud: with an empty trajectory
+`leakage_guard` returns 1.0 because it saw no URLs to leak, `budget_economy`
+returns 1.0 because it saw no searches, `dealbreaker_gate` passes with zero rules
+evaluated, and `search_cost_usd` is $0.00. A native arm would top compliance and
+cost by construction. Cross-arm comparisons are therefore valid on the judge
+score, `qa_answer_match`, cost, and latency — and on the decision-surface metrics
+only within a tier.
+
+Two things do hold across all search arms: gold-source exclusion is enforced
+everywhere (harness `excludeDomains`, Anthropic `blocked_domains`, OpenAI
+`filters.blocked_domains`, recorded as `exclusion_enforced`), and both native
+arms bill at the same published $10/1k searches.
+
+Two things that look comparable but are not: the *token* cost of native search
+differs sharply from the harness arms even though the per-search price matches
+(Anthropic basic web search loads every result into context; OpenAI's
+`search_context_size=medium` loads an undisclosed amount; the harness arms load
+exactly 8 × 400 chars), and the *quantity of evidence* per search is therefore
+not held constant between native and harness. Cost comparisons should be read as
+search-call spend plus separately-reported token spend, never as one number.
+
+### Confounds the runner records rather than hides
+
+- **`zero_search_row`** — the tool was available and the model never used it, so
+  the row is a no-search row wearing a search arm's label. Weak OSS tool-calling
+  and a native model that declines to search both land here. Filter on it.
+- **`sampling_params` / `sampling_pinned`** — temp 0 + seed 42 is *not holdable on
+  either frontier vendor*. Claude Opus 5 rejects `temperature`/`top_p`/`top_k`
+  with a 400, and gpt-5-family models reject `temperature` ("only the default (1)
+  is supported") and offer no `seed`. Only the OSS arm pins sampling. The run
+  records what each arm actually received instead of implying parity.
+- **`reasoning_effort` / `reasoning_effort_pinned`** — pinned to `high` on
+  Anthropic (effort and tools coexist on the Messages API), left at the vendor
+  default on OpenAI (reasoning models reject `reasoning_effort` alongside function
+  tools on chat completions, so pinning it on the native arm alone would make
+  effort differ between OpenAI's own native and harness arms — the exact contrast
+  under test).
+- **`search_budget_enforced`** — the 5-search cap is API-enforced everywhere
+  except the **OpenAI native arm**: its hosted `web_search` publishes no
+  `max_uses`, so that one arm can exceed the budget every other arm is held to.
+  `budget_economy` scores the observed count, which is what surfaces a violation,
+  but the arm is not actually constrained. This is a live limitation on the
+  native-vs-harness contrast within OpenAI.
+- **`date_field_semantics`** — `temporal_grounding` reads `published_date`, but
+  Exa/Parallel report true publication dates while You.com and Anthropic native
+  report *last-modified* (`page_age`). Those are different constructs: a
+  re-rendered page looks fresh without carrying new information. Freshness results
+  must not be pooled across the two semantics.
+- **`prompt_version`** — the native arm's system prompt cannot describe a tool
+  schema it does not own. Budget and answer format are held identical; the tool
+  sentence differs, and that difference is declared.
+- **`model_refused`, `answer_truncated`, `search_errors`, `pause_turns`** — a
+  policy refusal or a truncated answer would otherwise score as a wrong answer
+  and be misattributed to retrieval.
+
 ## Setup
 
 ```bash
-python -m venv .venv && .venv/bin/pip install -r requirements.txt
+python -m venv .venv && .venv/bin/python -m pip install -r requirements.txt
 cp .env.example .env
 ```
 
 Fill `.env`; every supported credential is loaded from that file and overrides
-or clears the corresponding ambient credential.
+or clears the corresponding ambient credential. Each arm needs only its own
+vendor's key — `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or `BASETEN_API_KEY` —
+plus a search-API key when `--search-mode harness`.
 
 The suite is stdlib `unittest` and needs no test runner beyond the
 dependencies above. It makes no network requests:
@@ -69,19 +193,88 @@ dependencies above. It makes no network requests:
 .venv/bin/python -m unittest discover -s tests -t .
 ```
 
-## Running
+## Dataset curation pipeline
 
-The importers push datasets, not the eval:
+There are two dataset families in this repository, and they use different
+curation paths:
+
+- **Upstream benchmarks** (`LiveNewsBench`, `RetrievalQA`) are imported from a
+  pinned upstream revision. Their importers push datasets; `run_eval.py` does
+  not.
+- **Corvus-QA** is curated locally from bounded source observations,
+  deterministic eligibility rules, and an artifact-bound publication approval.
+
+Import the upstream benchmarks with:
 
 ```bash
 python import_livenewsbench.py <datasets_root> --source-commit <sha>
 python import_retrievalqa.py <source_file> --source-revision <rev> --source-sha256 <sha>
 ```
 
-### Building Corvus-QA
+### Canonical Corvus-QA flow
+
+Corvus-QA has three stages. Keep their artifacts separate; source-specific
+candidates and normalized `FactEvent` observations are not interchangeable.
+
+| Stage | Command or owner | Input | Output |
+|---|---|---|---|
+| 1. Collect and curate | `corvus.cli.collect_sources` plus source-specific curation | bounded source query | normalized `FactEvent` JSONL, one observation per attester/resolver |
+| 2. Freeze | `corvus.cli.build_dataset` | curated `FactEvent` JSONL | final `CorvusRow` JSONL, rejection ledger, and manifest |
+| 3. Publish | approval + `corvus.cli.import_dataset` | one frozen split and manifest | versioned `Corvus-QA-dev` or `Corvus-QA-test` snapshot |
+
+Some collectors already emit `FactEvent` observations. Others emit candidates
+because the source does not contain enough structured information to infer an
+answer safely. Curating those candidates into `FactEvent` JSONL is explicit
+source-specific work: resolve the canonical entity and value, set the effective
+time, identify the resolver/attester/authority, and retain provenance. Curation
+happens directly in the normalized event artifact.
+
+Use this directory pattern for a freeze so provenance remains auditable:
+
+```text
+curation/<freeze-id>/
+  01-sources/          # immutable candidates, observations, collection manifests
+  02-events/           # curated, normalized FactEvent JSONL
+  03-freeze/           # CorvusRow JSONL, rejections, manifest, approval
+```
+
+The abbreviated command flow is:
+
+```bash
+# 1. Collect a bounded source slice. This Wikidata command emits FactEvents.
+python -m corvus.cli.collect_sources wikidata-latest \
+    --qid Q123 --property P169 --attribute ceo_of \
+    --canonical-entity-id CIK0000123456 --entity-type company \
+    --effective-ts 2026-07-28T09:00:00Z \
+    --output curation/<freeze-id>/01-sources/wikidata-events.jsonl
+
+# Curate any candidate-only sources into 02-events/events-dev.jsonl, preserving
+# one normalized observation per resolver and attester.
+
+# 2. Apply eligibility rules and freeze one split.
+python -m corvus.cli.build_dataset \
+    curation/<freeze-id>/02-events/events-dev.jsonl \
+    curation/<freeze-id>/03-freeze/corvus-dev.jsonl \
+    --split dev --freeze-id <freeze-id> --as-of <timestamp-with-timezone>
+
+# 3. After inspecting all three build outputs and approving the artifact,
+#    publish the split and create its immutable Braintrust snapshot.
+python -m corvus.cli.import_dataset \
+    curation/<freeze-id>/03-freeze/corvus-dev.jsonl \
+    --manifest curation/<freeze-id>/03-freeze/corvus-dev.jsonl.manifest.json \
+    --split dev --compliance-approval <freeze-approval.json>
+```
+
+Before publication, start from
+[`config/corvus/compliance_approval.example.json`](config/corvus/compliance_approval.example.json).
+The approval must bind the frozen artifact and source-policy hashes. The
+repository never generates this human approval automatically.
+
+### Corvus-QA artifact contract
 
 Corvus-QA sources fact transitions rather than authored questions. Each source
-adapter should emit one JSONL `FactEvent` observation with this shape:
+adapter or source-specific curator must emit one JSONL `FactEvent` observation
+with this shape:
 
 ```json
 {
@@ -105,6 +298,11 @@ adapter should emit one JSONL `FactEvent` observation with this shape:
   "provenance": {}
 }
 ```
+
+`FactEvent` is the only curation artifact accepted by `build_dataset`. A source
+candidate lacks a curated assertion, while a `CorvusRow` is already a frozen
+benchmark example. Passing either artifact type to the builder is a pipeline
+error.
 
 #### Three axes of independence
 
@@ -172,8 +370,8 @@ news/sports adapters live in
 monitored organizational `CORVUS_CONTACT_EMAIL`, and SEC additionally requires
 the single-deployment confirmation in `.env`. Requests are serial, locally
 rate-limited, retried with bounded backoff, and restricted to approved hosts.
-EDGAR Item 5.02 candidates require a reviewed `OfficerTransition`; only the
-reviewed excerpt's hash enters provenance. Wikidata changes use the cited
+EDGAR Item 5.02 candidates require a curated `OfficerTransition`; only the
+supporting excerpt's hash enters provenance. Wikidata changes use the cited
 reference's domain as the authority family, preventing an SEC-cited Wikidata
 claim from falsely counting as independent of EDGAR.
 
@@ -194,7 +392,7 @@ python -m corvus.cli.collect_sources wikidata-latest \
 ```
 
 EDGAR collection deliberately emits candidates rather than guessing officer
-names or effective dates from prose. A reviewed `OfficerTransition` must be
+names or effective dates from prose. A curated `OfficerTransition` must be
 created from the filing before `EdgarAdapter.emit_fact` produces a `FactEvent`.
 
 ### Section 16 corroboration
@@ -251,7 +449,7 @@ filing is out of scope under the source policy.
 
 Section 16 corroborates the **new value and the effective date only**. A Form 3
 is an initial statement and says nothing about a predecessor, so
-`previous_answer` stays single-attested from the reviewed 8-K, and every
+`previous_answer` stays single-attested from the curated 8-K, and every
 Section 16 observation records `old_value_attested: false` in provenance.
 
 Measured yield on the July 2026 development window: 490 Form 3 filings paired
@@ -261,40 +459,21 @@ are blank-check shells with no realistic search footprint. See
 window is not enough for a publication test set; widen the window or add Form 4
 before treating this as the test split.
 
-#### Section 16 review queue
+#### Section 16 curation checks
 
-Corroborated candidates skip claim preparation. A Form 3 states the office and
-the event date as structured fields, so the claim is already atomic and the
-reviewer confirms rather than extracts:
+Pairing is only candidate generation. Before emitting the issuer and reporting
+owner as two `FactEvent` observations, the curator must confirm:
 
-```bash
-python -m corvus.cli.prepare_section16_review \
-    --section16-filings section16/form3_filings.jsonl \
-    --section16-refs section16/form3_refs.jsonl \
-    --item-502-candidates edgar-item-502-candidates.jsonl \
-    --review-queue filing-review-queue.jsonl \
-    --output section16/fact_verification_upload.jsonl \
-    --schema-output section16/fact_verification_schema.json
-```
+1. The Item 5.02 filing describes the same appointment as the paired Form 3.
+2. The effective dates agree; a mismatch is rejected rather than corrected
+   silently.
+3. The published name and top-office mapping are unambiguous.
+4. The issuer is useful for the benchmark rather than an obvious blank-check
+   shell with no realistic search footprint.
 
-Each row carries both filings as evidence, labelled by `attester_role` so a
-reviewer can see that two links published through one channel are still two
-accounts of the event. Four things the reviewer must decide, in the row's
-instructions:
-
-1. **Does the 8-K describe this appointment?** Pairing is by date over a wide
-   window, so a Form 3 can sit beside an unrelated Item 5.02 at the same issuer.
-2. **Does the effective date match?** A mismatch is `contradicted` with the
-   8-K's date in `correction` — this is the transcription error that dual
-   attestation exists to catch.
-3. **Who was the predecessor?** Section 16 does not attest it.
-4. **Would anyone ask this question?** Rows matching the blank-check name
-   heuristic are tagged `possible-blank-check` rather than dropped, because a
-   name is not a reliable classifier. Pass `--exclude-blank-check` to drop them
-   instead.
-
-Import with `corvus.cli.import_review_dataset` into a **new** dataset, never
-over the source queues, and bind the schema hash in the compliance approval.
+The two observations must retain distinct `resolver_id`, `attester_id`, and
+`attester_role` values even though both documents are published through SEC.
+The predecessor remains single-attested unless another source confirms it.
 
 ### News and sports sources
 
@@ -326,49 +505,12 @@ python -m corvus.cli.collect_sources thesportsdb-results \
     --output thesportsdb-results.jsonl
 ```
 
-Sports candidates do not become benchmark rows automatically. A reviewer must
+Sports candidates do not become benchmark rows automatically. A curator must
 map each provider's event and team names to one canonical match identity and
 confirm when the result became effective; the scheduled start time is retained
 separately and is never silently treated as the completion time.
 Only matching final scores from two independent authorities qualify under the
 existing dual-authority rule.
-
-### Human-review schema
-
-Corvus review schema v2 separates two jobs that must not share a
-fact-verification label:
-
-- `claim_preparation` rows provide compliant source links and hints but no
-  assertion yet. They are not eligible for the `Fact verification` scorer.
-- `fact_verification` rows state one atomic claim with a canonical subject,
-  predicate, asserted value, time basis, and evidence links.
-
-Prepare both queues directly from the collected source candidates:
-
-```bash
-python -m corvus.cli.prepare_claim_review \
-    --edgar-review-queue filing-review-queue.jsonl \
-    --wikipedia-candidates wikipedia-current-events.jsonl \
-    --openligadb-results openligadb-results.jsonl \
-    --thesportsdb-results thesportsdb-results.jsonl \
-    --preparation-output claim-preparation.jsonl \
-    --verification-output fact-verification.jsonl \
-    --preparation-schema-output claim-preparation-schema.json \
-    --verification-schema-output fact-verification-schema.json
-```
-
-The generated Braintrust schemas enforce both `input` and `expected`.
-Fact-verification rows reserve `expected.fact_verification` for exactly
-`verified`, `insufficient_evidence`, or `contradicted`. Configure the UI scorer
-to write to that expected path and show it only when:
-
-```sql
-metadata.review_stage = 'fact_verification'
-```
-
-Import into new datasets rather than replacing the source review queues. When
-`--schema-file` is supplied, the compliance approval must bind the exact
-`schema_sha256` in addition to the artifact and source-policy hashes.
 
 Optional trap JSONL can be supplied with `--traps-file` and `--run-end`. A trap
 is accepted only when two resolvers and two authorities agree on its scheduled
@@ -437,20 +579,57 @@ metadata = upstream row fields (link, articles[], event_date, ...)
 
 ## Remaining gaps
 
-1. **No native model-search baseline.** `no_search` isolates retrieval uplift,
-   but does not answer whether an independent API beats the model provider's
-   own search tool.
-2. **No automated time blocking.** Conditions must still be manually
+1. **The native-vs-harness contrast varies the prompt too.** The native arm's
+   system prompt cannot describe a tool schema it does not own, so that contrast
+   changes both search mode and one prompt sentence. Budget and answer format are
+   held identical and `prompt_version` records which text ran, but the two
+   variables cannot be fully separated by this design. A prompt-only control arm
+   (harness tool, native-style wording) would bound the effect; it is not built.
+2. **The OpenAI native arm is not held to the search budget.** Its hosted
+   `web_search` exposes no `max_uses`, so `search_budget_enforced` is False there
+   and only there. `budget_economy` reports the observed count, so violations are
+   visible, but the arm is genuinely less constrained than the seven others.
+3. **Freshness is unanswerable on one native arm.** OpenAI native returns no
+   per-result dates, so `temporal_grounding` — the repository's headline
+   construct — is `None` for that entire arm. Freshness conclusions cover the
+   harness arms and Anthropic native only.
+4. **Two date fields mean two different things.** Exa and Parallel report
+   publication dates; You.com and Anthropic native report last-modified. Rows
+   carry `date_field_semantics`; results must not be pooled across the two.
+5. **Judge and agent share a vendor on the OpenAI arms.** The default `gpt-4.1`
+   judge cannot rule out self-preference when grading a `gpt-5.6-sol` agent, and
+   that bias is confounded with the native-search treatment. Use a cross-vendor
+   jury (`--judge` is repeatable, and `ANTHROPIC_API_KEY` is now configured) for
+   any reported frontier comparison.
+6. **No multiplicity control across 23 conditions.** The analysis computes
+   paired effects per condition against one baseline; 22 contrasts inflate
+   family-wise error. Pre-specify a small number of primary contrasts and label
+   the rest exploratory.
+7. **`--trials 3` is unjustified.** No power analysis or minimum detectable
+   effect has been computed for web-retrieval nondeterminism.
+8. **`zero_search_row` needs a stated exclusion rule.** Rows where the tool was
+   available and unused are no-search rows inside a search arm. They are flagged
+   but not automatically excluded, and the exclusion rate is itself
+   arm-dependent — an OSS tool-calling failure and a frontier model's decision
+   not to search are different phenomena with the same flag.
+9. **No automated time blocking.** Conditions must still be manually
    interleaved. Publication runs should randomize or round-robin conditions at
    task level to reduce web-time confounding.
-3. **No expert multi-step task domain.** Results do not generalize to legal,
-   finance, or other professional research workflows.
-4. **Bootstrap, not mixed effects.** The included analysis is dependency-free
-   and task-paired; final reporting should also fit condition fixed effects
-   with task random intercepts.
-5. **Total cost requires trace aggregation.** Search fees and agent tokens are
-   logged, but child LLM-span cost must be aggregated into `total_cost_usd`
-   before a cost frontier is valid.
+10. **No expert multi-step task domain.** Results do not generalize to legal,
+    finance, or other professional research workflows.
+11. **Bootstrap, not mixed effects.** The included analysis is dependency-free
+    and task-paired; final reporting should also fit condition fixed effects
+    with task random intercepts.
+12. **Total cost requires trace aggregation.** Search fees and agent tokens are
+    logged, but child LLM-span cost must be aggregated into `total_cost_usd`
+    before a cost frontier is valid. Native arms make this mandatory rather than
+    optional: their search-result tokens are billed on the model spans, so a
+    search-fee-only comparison understates them.
+13. **No live smoke run yet.** Every adapter is asserted against the vendors'
+    published response schemas offline; none has been executed against the real
+    APIs. The Baseten model slug in particular is documented both as
+    `openai/gpt-oss-120b` and, in a migration note, as
+    `baseten/openai/gpt-oss-120b`.
 
 ## Open decisions
 

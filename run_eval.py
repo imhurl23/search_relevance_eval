@@ -1,7 +1,16 @@
 """Starter Braintrust harness for web-search API x LLM freshness experiments.
 
-Within one condition block, the agent is frozen (model snapshot, temperature,
-prompt, tools, and budget); provider + arm are the treatment variables.
+Two treatment axes, defined in agents.py and selected on the command line:
+
+    --model-vendor   baseten (OSS) | openai (frontier) | anthropic (frontier)
+    --search-mode    none (parametric) | harness (our tool) | native (vendor's own)
+
+Within one condition block everything else is frozen (model snapshot, prompt,
+tool contract, and budget). Sampling is the one thing that cannot be frozen
+across vendors — Claude Opus 5 rejects temperature/top_p/top_k, and Baseten does
+not document seed support — so each run records what it actually sent rather than
+implying parity.
+
 Braintrust-native throughout:
 
   * reads a versioned LiveNewsBench or RetrievalQA dataset from the project
@@ -25,16 +34,24 @@ Usage:
     # dataset push lives in import_livenewsbench.py, not here:
     python import_livenewsbench.py <datasets_root> --source-commit <sha>
 
-    # per (provider, arm): interleave these in time, don't run days apart
-    python run_eval.py run --provider exa --arm native_fresh \
-      --dataset-version <xact-id> --study-id freshness-v1 --trials 3
+    # one command per matrix cell; interleave them in time, don't run days apart
+    python run_eval.py run --model-vendor openai --search-mode harness \
+      --provider exa --arm native_fresh \
+      --dataset-version <xact-id> --study-id matrix-v1 --trials 3
+    python run_eval.py run --model-vendor openai --search-mode native \
+      --dataset-version <xact-id> --study-id matrix-v1 --trials 3
+    python run_eval.py run --model-vendor baseten --search-mode none \
+      --dataset-version <xact-id> --study-id matrix-v1 --trials 3
+
+Native search is only attributable WITHIN a vendor: run each frontier vendor's
+none/harness/native arms together, and compare its native arm to its own harness
+arm — not to the other vendor's. See README "The test matrix".
 """
 
 from __future__ import annotations
 
 import argparse
 import hashlib
-import json
 import os
 import re
 import subprocess
@@ -47,6 +64,10 @@ import httpx
 from braintrust import Eval, current_span, init_dataset, traced, wrap_openai
 from openai import OpenAI
 
+import agents
+from agents import (SEARCH_MODE_HARNESS, SEARCH_MODE_NATIVE, SEARCH_MODE_NONE,
+                    SEARCH_MODES, SURFACE_FULL, SURFACE_NONE, VENDORS,
+                    make_harness_session, native_search_rate_usd, vendor_of)
 from import_livenewsbench import DATASET_NAME, load_env
 from corvus.sources import SharedHostLimiter, retry_after_seconds
 from scorers import (DETERMINISTIC_SCORERS, iter_source_urls,
@@ -61,6 +82,8 @@ RUNTIME_ENV_NAMES = (
     "BRAINTRUST_API_KEY",
     "BRAINTRUST_PROJECT_ID",
     "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "BASETEN_API_KEY",
     "EXA_API_KEY",
     "PARALLEL_API_KEY",
     "YDC_API_KEY",
@@ -89,7 +112,11 @@ def load_runtime_env(env_path: Path) -> tuple[str, str]:
 # Frozen-agent constants. Changing ANY of these is a new experiment condition.
 # ---------------------------------------------------------------------------
 
-AGENT_MODEL = "gpt-4o-2024-11-20"      # pin an exact snapshot; judge = gpt-4.1 (different lineage at minimum — ideally use a non-OpenAI judge)
+# Default agent model per vendor lives in agents.VENDORS. This constant is the
+# fallback for --model-vendor openai, kept so existing invocations that pass
+# --agent-model explicitly behave unchanged.
+DEFAULT_MODEL_VENDOR = "openai"
+AGENT_MODEL = VENDORS[DEFAULT_MODEL_VENDOR].default_model
 MAX_SEARCHES, MAX_CLICKS = 5, 0
 SNIPPET_CHARS = 400                    # normalized-arm snippet truncation
 N_RESULTS = 8
@@ -130,20 +157,34 @@ determine the answer within budget, reply exactly: I could not find this."""
 # retrieval quality from what the model already knew, and LiveNewsBench rows
 # older than the agent's training cutoff are answerable with no search at all.
 # Subtract this arm from every provider arm to get retrieval's marginal value.
+# Required for EVERY model, not just the OSS one: a frontier native-search score
+# with no parametric floor under it cannot be separated from recall.
 NO_SEARCH_ARM = "no_search"
 NO_SEARCH_SYSTEM_PROMPT = """\
 You are answering a time-sensitive factual question from memory. You have no tools and no web
 access. When you know the answer, reply with ONLY the final answer, as concisely
 as possible. If you do not know, reply exactly: I could not find this."""
 
-TOOLS = [
-    {"type": "function", "function": {
-        "name": "search_web",
-        "description": "Search the web for news. Returns ranked results.",
-        "parameters": {"type": "object",
-                       "properties": {"query": {"type": "string"}},
-                       "required": ["query"]}}},
-]
+# Native (server-side) search arm. The tool contract genuinely differs — the
+# model provider owns the search, so there is no per-call schema to describe and
+# no way to state a result format. Budget and answer format are held identical to
+# FROZEN_SYSTEM_PROMPT; the tool sentence is the only intentional difference, and
+# it is a declared confound rather than an oversight (prompt_version records it).
+NATIVE_SEARCH_SYSTEM_PROMPT = """\
+You are a web research agent answering a time-sensitive factual question. You have built-in web
+search. You may use at most 5 searches. When you know the answer, stop searching
+and reply with ONLY the final answer, as concisely as possible. If you cannot
+determine the answer within budget, reply exactly: I could not find this."""
+
+PROMPT_VERSIONS = {
+    SEARCH_MODE_HARNESS: "frozen-v2-generic-factual",
+    SEARCH_MODE_NONE: "no-search-v2-parametric",
+    SEARCH_MODE_NATIVE: "native-search-v1-generic-factual",
+}
+
+# The harness tool schema lives in agents.SEARCH_TOOL_* — one definition
+# translated per wire protocol, so the OpenAI and Anthropic harness arms cannot
+# drift into offering subtly different tools.
 
 # Search pricing (USD) for native cost metrics. A flat per-call constant is
 # wrong for any vendor that bills content per page, so each entry carries three
@@ -449,16 +490,37 @@ def run_search(provider: str, arm: str, query: str, exclude_domains: list[str]):
 # Frozen agent loop
 # ---------------------------------------------------------------------------
 
-# Built lazily: constructing OpenAI() at import time raises on a missing
-# OPENAI_API_KEY, which would crash `--help` and preempt _preflight's clear
-agent_client = None
+# Built lazily: constructing a vendor client at import time raises on a missing
+# key, which would crash `--help` and preempt _preflight's clear message.
+def get_agent_client(vendor: str):
+    """Traced client for one vendor. wrap_anthropic keeps Claude's Messages-API
+    calls in the same span tree as the OpenAI-compatible ones, so token and cost
+    rollups are comparable across arms."""
+    if vendor == "anthropic":
+        from braintrust import wrap_anthropic
+
+        return agents.get_client(vendor, wrap_anthropic)
+    return agents.get_client(vendor, wrap_openai)
 
 
-def get_agent_client():
-    global agent_client
-    if agent_client is None:
-        agent_client = wrap_openai(OpenAI())
-    return agent_client
+def _system_prompt_for(search_mode: str) -> str:
+    if search_mode == SEARCH_MODE_NONE:
+        return NO_SEARCH_SYSTEM_PROMPT
+    if search_mode == SEARCH_MODE_NATIVE:
+        return NATIVE_SEARCH_SYSTEM_PROMPT
+    return FROZEN_SYSTEM_PROMPT
+
+
+def condition_label(search_mode: str, provider: str, arm: str,
+                    model_vendor: str) -> str:
+    """One slug per matrix cell. Distinguishes the two collision-prone names:
+    `arm=native_fresh` is a SEARCH VENDOR's freshness parameter, while
+    `search_mode=native` is the MODEL vendor's own server-side search."""
+    if search_mode == SEARCH_MODE_NONE:
+        return "no_search"
+    if search_mode == SEARCH_MODE_NATIVE:
+        return f"native-{model_vendor}"
+    return f"harness-{provider}-{arm}"
 
 
 def make_task(
@@ -468,7 +530,13 @@ def make_task(
     study_id: str = "freshness-v1",
     dataset_name: str = DATASET_NAME,
     dataset_version: str | None = None,
+    search_mode: str = SEARCH_MODE_HARNESS,
+    model_vendor: str = DEFAULT_MODEL_VENDOR,
 ):
+    spec = vendor_of(model_vendor)
+    system_prompt = _system_prompt_for(search_mode)
+    condition = condition_label(search_mode, provider, arm, model_vendor)
+    condition_id = f"{model_vendor}:{agent_model}::{condition}"
 
     def task(input: dict, hooks) -> dict:
         # Leakage excludes come from row METADATA (link + articles[*]), which is
@@ -477,9 +545,6 @@ def make_task(
         row_metadata = hooks.metadata or {}
         source_domains = source_domains_of(row_metadata, hooks.expected)
         excludes = source_domains + ARCHIVE_EXCLUDES
-        no_search = arm == NO_SEARCH_ARM
-        condition = "no_search" if no_search else f"{provider}-{arm}"
-        condition_id = f"{agent_model}::{condition}"
         question = input["question"]
         task_key = hashlib.sha256(question.encode("utf-8")).hexdigest()[:16]
         benchmark_category = (
@@ -489,79 +554,44 @@ def make_task(
             or "uncategorized"
         )
 
-        messages = [{"role": "system", "content":
-                     NO_SEARCH_SYSTEM_PROMPT if no_search else FROZEN_SYSTEM_PROMPT},
-                    {"role": "user", "content": question}]
-        trajectory, searches, clicks = [], 0, 0
-        prompt_tokens, completion_tokens = 0, 0
-        # Attempts REFUSED because the search budget was already spent. The cap
-        # is the benchmark protocol, but it also hides tool-call runaway, which is a
-        # provider-attributable cost failure mode elsewhere in the literature.
-        # Counting refusals recovers that signal without relaxing the cap.
-        refused_searches, refused_clicks = 0, 0
-        bad_tool_calls = 0
-        # Accumulated per call, not searches x flat rate: Exa bills content per
-        # page returned, so two calls that return different result counts do not
-        # cost the same.
-        search_cost = 0.0
-        final = None
+        client = get_agent_client(model_vendor)
+        if search_mode == SEARCH_MODE_NATIVE:
+            outcome = _run_native(client, spec, agent_model, system_prompt,
+                                  question, excludes)
+        else:
+            outcome = _run_harness(client, spec, agent_model, system_prompt,
+                                   question, excludes, provider, arm,
+                                   search_mode)
 
-        for _ in range(2 * (MAX_SEARCHES + MAX_CLICKS) + 2):
-            # Once both budgets are spent there is nothing left to call, so drop
-            # the tools and force a final answer instead of burning turns on
-            # "budget exhausted" replies until the loop cap trips.
-            out_of_budget = searches >= MAX_SEARCHES and clicks >= MAX_CLICKS
-            kwargs = {} if (no_search or out_of_budget) else {"tools": TOOLS}
-            resp = get_agent_client().chat.completions.create(
-                model=agent_model, temperature=0, seed=42,
-                messages=messages, **kwargs)
-            usage = getattr(resp, "usage", None)
-            prompt_tokens += int(getattr(usage, "prompt_tokens", 0) or 0)
-            completion_tokens += int(getattr(usage, "completion_tokens", 0) or 0)
-            msg = resp.choices[0].message
-            if not msg.tool_calls:
-                final = (msg.content or "").strip()
-                break
-            messages.append(msg)
-            for tc in msg.tool_calls:
-                name = tc.function.name
-                try:
-                    args = json.loads(tc.function.arguments or "{}")
-                except json.JSONDecodeError:
-                    args = {}
-                if not isinstance(args, dict):
-                    args = {}
+        surfaced = agents.surfaced_domains(outcome["trajectory"])
+        # The confound that quietly voids a search arm: the tool was available
+        # and the model never used it, so the row is a no-search row wearing a
+        # search arm's label. Weak OSS tool-calling and a native model that
+        # decides not to search both land here. Filter on it in analysis — do
+        # not average it away.
+        search_available = search_mode != SEARCH_MODE_NONE
+        zero_search_row = bool(search_available and outcome["used_searches"] == 0)
 
-                if name == "search_web":
-                    if searches >= MAX_SEARCHES:
-                        refused_searches += 1
-                        content = "Search budget exhausted."
-                    else:
-                        searches += 1
-                        query = args.get("query", "")
-                        results, content, tok = run_search(
-                            provider, arm, query, excludes)
-                        search_cost += search_cost_usd(
-                            provider, arm, len(results))
-                        trajectory.append({"type": "search", "query": query,
-                                           "tokens": tok, "results": results})
-                else:
-                    bad_tool_calls += 1
-                    content = f"Unknown tool: {name}. Use search_web."
-                messages.append({"role": "tool", "tool_call_id": tc.id,
-                                 "content": content})
-        if final is None:
-            final = "I could not find this."
-
-        surfaced_domains = {
-            _domain_of(result.get("url", ""))
-            for step in trajectory if step.get("type") == "search"
-            for result in step.get("results", [])
-            if _domain_of(result.get("url", ""))
-        }
         hooks.metadata.update({
-            "provider": "none" if no_search else provider,
-            "arm": arm, "agent_model": agent_model,
+            # --- matrix axes: the four fields any slice should key on ---
+            "model_class": spec.model_class,
+            "model_vendor": model_vendor,
+            "search_mode": search_mode,
+            "search_provider": (
+                provider if search_mode == SEARCH_MODE_HARNESS
+                else f"{model_vendor}_native" if search_mode == SEARCH_MODE_NATIVE
+                else "none"
+            ),
+            # Freshness treatment applies to harness arms only; None elsewhere
+            # keeps `native_fresh` from being read as "native search".
+            "freshness_treatment": (
+                arm if search_mode == SEARCH_MODE_HARNESS else None),
+            # --- kept for continuity with runs made before the axes existed ---
+            "provider": (
+                provider if search_mode == SEARCH_MODE_HARNESS else "none"
+                if search_mode == SEARCH_MODE_NONE else f"{model_vendor}_native"),
+            "arm": arm,
+            "agent_model": agent_model,
             "study_id": study_id,
             "condition_id": condition_id,
             "dataset_name": dataset_name,
@@ -569,35 +599,174 @@ def make_task(
             "trial_index": hooks.trial_index,
             "task_key": task_key,
             "benchmark_category": benchmark_category,
+            # --- observability declarations the scorers gate on ---
+            "decision_surface": outcome["decision_surface"],
+            "exclusion_enforced": outcome["exclusion_enforced"],
             "excluded_source_domains": source_domains,
-            "bad_tool_calls": bad_tool_calls,
-            "refused_searches": refused_searches,
-            "refused_clicks": refused_clicks,
+            "search_budget": MAX_SEARCHES,
+            # --- per-row integrity flags ---
+            "zero_search_row": zero_search_row,
+            "bad_tool_calls": outcome["bad_tool_calls"],
+            "refused_searches": outcome["refused_searches"],
+            "refused_clicks": outcome["refused_clicks"],
+            "search_errors": outcome["search_errors"],
+            "model_refused": outcome["refused"],
+            "answer_truncated": outcome["truncated"],
+            "pause_turns": outcome["pause_turns"],
             "as_of": datetime.now(timezone.utc).isoformat(),
         })
         # Task-span metrics; Braintrust rolls these into the experiment summary.
         # search_cost_usd is search spend ONLY — model inference cost comes from
         # the wrapped LLM spans, so keep the two decomposable rather than summing
         # them here. Total cost per row is an analysis-side join of the two.
+        final = outcome["final_answer"]
         current_span().log(metrics={
-            "search_cost_usd": search_cost,
-            "used_searches": searches, "used_clicks": clicks,
-            "refused_tool_calls": refused_searches + refused_clicks,
-            "agent_prompt_tokens": prompt_tokens,
-            "agent_completion_tokens": completion_tokens,
-            "agent_total_tokens": prompt_tokens + completion_tokens,
+            "search_cost_usd": outcome["search_cost"],
+            "used_searches": outcome["used_searches"],
+            "used_clicks": outcome["used_clicks"],
+            "refused_tool_calls": (
+                outcome["refused_searches"] + outcome["refused_clicks"]),
+            "agent_prompt_tokens": outcome["prompt_tokens"],
+            "agent_completion_tokens": outcome["completion_tokens"],
+            "agent_total_tokens": (
+                outcome["prompt_tokens"] + outcome["completion_tokens"]),
             "answer_words": len(final.split()),
             "answer_chars": len(final),
-            "distinct_surfaced_domains": len(surfaced_domains),
+            "distinct_surfaced_domains": len(surfaced),
+            "zero_search_row": int(zero_search_row),
+            "n_search_errors": len(outcome["search_errors"]),
         })
-        return {"final_answer": final, "trajectory": trajectory,
-                "used_searches": searches, "used_clicks": clicks,
-                "refused_searches": refused_searches,
-                "refused_clicks": refused_clicks,
-                "agent_prompt_tokens": prompt_tokens,
-                "agent_completion_tokens": completion_tokens}
+        return {
+            "final_answer": final,
+            "trajectory": outcome["trajectory"],
+            # Consumed by scorers.py to decide which metrics are computable on
+            # this row. Without it a native arm's empty snippet layer reads as a
+            # clean pass rather than an unobservable one.
+            "decision_surface": outcome["decision_surface"],
+            "used_searches": outcome["used_searches"],
+            "used_clicks": outcome["used_clicks"],
+            "refused_searches": outcome["refused_searches"],
+            "refused_clicks": outcome["refused_clicks"],
+            "citations": outcome["citations"],
+            "agent_prompt_tokens": outcome["prompt_tokens"],
+            "agent_completion_tokens": outcome["completion_tokens"],
+        }
 
     return task
+
+
+def _blank_outcome(decision_surface: str) -> dict:
+    return {
+        "final_answer": "", "trajectory": [], "used_searches": 0,
+        "used_clicks": 0, "refused_searches": 0, "refused_clicks": 0,
+        "bad_tool_calls": 0, "search_cost": 0.0, "prompt_tokens": 0,
+        "completion_tokens": 0, "decision_surface": decision_surface,
+        "exclusion_enforced": False, "citations": [], "search_errors": [],
+        "refused": False, "truncated": False, "pause_turns": 0,
+    }
+
+
+def _run_harness(client, spec, agent_model, system_prompt, question, excludes,
+                 provider, arm, search_mode) -> dict:
+    """Tool-calling loop for the harness arm and the no-tool control arm.
+
+    Identical driver for both: the control arm is this loop with the tool never
+    offered, so the two differ only in tool availability.
+    """
+    out = _blank_outcome(
+        SURFACE_FULL if search_mode == SEARCH_MODE_HARNESS else SURFACE_NONE)
+    out["exclusion_enforced"] = search_mode == SEARCH_MODE_HARNESS
+    tools_allowed = search_mode == SEARCH_MODE_HARNESS
+
+    session = make_harness_session(client, spec, agent_model, system_prompt)
+    session.add_user(question)
+    final = None
+
+    for _ in range(2 * (MAX_SEARCHES + MAX_CLICKS) + 2):
+        # Once both budgets are spent there is nothing left to call, so drop
+        # the tools and force a final answer instead of burning turns on
+        # "budget exhausted" replies until the loop cap trips.
+        out_of_budget = (out["used_searches"] >= MAX_SEARCHES
+                         and out["used_clicks"] >= MAX_CLICKS)
+        turn = session.step(tools_enabled=tools_allowed and not out_of_budget)
+        out["prompt_tokens"] += turn.prompt_tokens
+        out["completion_tokens"] += turn.completion_tokens
+        if turn.refused:
+            out["refused"] = True
+            break
+        if turn.truncated:
+            out["truncated"] = True
+        if not turn.tool_calls:
+            final = turn.text
+            break
+
+        results_to_send = []
+        for call in turn.tool_calls:
+            if call["malformed"]:
+                out["bad_tool_calls"] += 1
+            if call["name"] == agents.SEARCH_TOOL_NAME:
+                if out["used_searches"] >= MAX_SEARCHES:
+                    out["refused_searches"] += 1
+                    content = "Search budget exhausted."
+                else:
+                    out["used_searches"] += 1
+                    query = call["arguments"].get("query", "")
+                    results, content, tok = run_search(
+                        provider, arm, query, excludes)
+                    # Accumulated per call, not searches x flat rate: Exa bills
+                    # content per page returned, so two calls returning
+                    # different result counts do not cost the same.
+                    out["search_cost"] += search_cost_usd(
+                        provider, arm, len(results))
+                    out["trajectory"].append({
+                        "type": "search", "query": query,
+                        "tokens": tok, "results": results})
+            else:
+                out["bad_tool_calls"] += 1
+                content = (f"Unknown tool: {call['name']}. "
+                           f"Use {agents.SEARCH_TOOL_NAME}.")
+            results_to_send.append((call["id"], content))
+        session.add_tool_results(results_to_send)
+
+    out["final_answer"] = final if final else "I could not find this."
+    return out
+
+
+def _run_native(client, spec, agent_model, system_prompt, question,
+                excludes) -> dict:
+    """Server-side search arm — the model provider runs the search."""
+    if spec.name == "anthropic":
+        run = agents.anthropic_native_search(
+            client, agent_model, system_prompt, question, excludes,
+            MAX_SEARCHES)
+    elif spec.name == "openai":
+        run = agents.openai_native_search(
+            client, agent_model, system_prompt, question, excludes)
+    else:
+        raise SystemExit(
+            f"--search-mode native is unavailable for --model-vendor {spec.name}: "
+            "no server-side search exists for this vendor.")
+
+    rate, _confirmed = native_search_rate_usd(spec.name, agent_model)
+    out = _blank_outcome(run.surface)
+    out.update({
+        "final_answer": run.final_answer or "I could not find this.",
+        "trajectory": run.trajectory,
+        "used_searches": run.n_searches,
+        # Native search enforces max_uses server-side where the API supports it,
+        # so a per-call refusal count is not observable. Recorded as 0 rather
+        # than fabricated — budget_economy reads used_searches, not this.
+        "search_cost": rate * run.n_searches,
+        "prompt_tokens": run.prompt_tokens,
+        "completion_tokens": run.completion_tokens,
+        "exclusion_enforced": run.exclusion_enforced,
+        "citations": run.citations,
+        "search_errors": run.search_errors,
+        "refused": run.refused,
+        "truncated": run.truncated,
+        "pause_turns": run.pause_turns,
+    })
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -615,17 +784,46 @@ def _git_commit() -> str:
         return "unknown"
 
 
-def _preflight(provider: str, arm: str) -> None:
+def _preflight(provider: str, arm: str, search_mode: str, model_vendor: str,
+               agent_model: str) -> None:
     """Fail before spending money, not on row 1 of N."""
-    needed = ["OPENAI_API_KEY"]
-    if arm != NO_SEARCH_ARM:
+    spec = vendor_of(model_vendor)
+
+    # Structurally impossible cells first: no point sending someone to provision
+    # a credential for an arm that cannot exist.
+    if search_mode == SEARCH_MODE_NATIVE and not spec.supports_native_search:
+        raise SystemExit(
+            f"--search-mode native is not available for --model-vendor "
+            f"{model_vendor}. {spec.notes} Run this vendor with "
+            "--search-mode harness or none.")
+
+    needed = [spec.api_key_env]
+    if search_mode == SEARCH_MODE_HARNESS:
         needed.append(PROVIDER_KEYS[provider])
     missing = [k for k in needed if not os.environ.get(k)]
     if missing:
         raise SystemExit(f"Missing env var(s): {', '.join(missing)}")
-    if arm != NO_SEARCH_ARM and (provider, arm) not in SEARCH_PRICING:
+
+    if search_mode == SEARCH_MODE_HARNESS and (provider, arm) not in SEARCH_PRICING:
         raise SystemExit(f"No SEARCH_PRICING entry for ({provider}, {arm}); "
                          "cost metrics would silently be $0.")
+
+    if search_mode == SEARCH_MODE_NATIVE:
+        rate, confirmed = native_search_rate_usd(model_vendor, agent_model)
+        if not confirmed:
+            # Do not let an unrecognized model be priced at the cheaper rate by
+            # default: OpenAI bills non-reasoning models through
+            # web_search_preview at $25/1k instead of $10/1k.
+            print(f"WARNING: {agent_model} is not a recognized reasoning model; "
+                  f"pricing native search at ${rate:.3f}/search "
+                  "(web_search_preview rate). Verify before reporting cost.")
+        if model_vendor == "anthropic":
+            try:
+                import anthropic  # noqa: F401
+            except ImportError:
+                raise SystemExit(
+                    "--model-vendor anthropic requires the anthropic SDK: "
+                    "pip install -r requirements.txt") from None
 
 
 def build_judges(specs: list[str]):
@@ -652,9 +850,11 @@ def build_judges(specs: list[str]):
 
 def run(provider: str, arm: str, dataset_name: str, dataset_version: str | None,
         trials: int, judge_specs: list[str], agent_model: str, study_id: str,
-        env_path: Path):
+        env_path: Path, search_mode: str = SEARCH_MODE_HARNESS,
+        model_vendor: str = DEFAULT_MODEL_VENDOR):
     api_key, project_id = load_runtime_env(env_path)
-    _preflight(provider, arm)
+    _preflight(provider, arm, search_mode, model_vendor, agent_model)
+    spec = vendor_of(model_vendor)
 
     dataset = init_dataset(project_id=project_id, name=dataset_name,
                            version=dataset_version, api_key=api_key)
@@ -669,13 +869,26 @@ def run(provider: str, arm: str, dataset_name: str, dataset_version: str | None,
     # several convene a jury. Both emit exactly one score per row.
     judge = (make_simpleqa_grader(judges[0][0], judge_model=judges[0][1])
              if len(judges) == 1 else make_jury_grader(judges))
-    if arm == NO_SEARCH_ARM:
-        print("Control arm: no tools. Subtract this from provider arms to get "
-              "retrieval's marginal value.")
-    condition = "no_search" if arm == NO_SEARCH_ARM else f"{provider}-{arm}"
-    condition_id = f"{agent_model}::{condition}"
+    if search_mode == SEARCH_MODE_NONE:
+        print("Control arm: no tools. Subtract this from the search arms of the "
+              "SAME vendor to get retrieval's marginal value.")
+    if search_mode == SEARCH_MODE_NATIVE:
+        print(f"Native arm: {model_vendor} runs the search server-side. "
+              "Decision-surface metrics are partially unobservable here — see "
+              "decision_surface in the row metadata; compare only against this "
+              "vendor's own harness and no_search arms.")
+
+    condition = condition_label(search_mode, provider, arm, model_vendor)
+    condition_id = f"{model_vendor}:{agent_model}::{condition}"
     model_slug = re.sub(r"[^a-zA-Z0-9_.-]+", "-", agent_model)
     experiment_name = f"{study_id}-{dataset.name}-{model_slug}-{condition}"
+    native_rate, rate_confirmed = native_search_rate_usd(model_vendor, agent_model)
+    # Sampling parity is NOT achievable across vendors: Claude Opus 5 rejects
+    # temperature/top_p/top_k, and Baseten does not document seed support. Record
+    # what each arm received instead of implying a frozen sampling config.
+    sampling = dict(spec.sampling)
+    if spec.seed_supported:
+        sampling["seed"] = agents.AGENT_SEED
 
     Eval(
         project_name,
@@ -688,12 +901,27 @@ def run(provider: str, arm: str, dataset_name: str, dataset_version: str | None,
             study_id,
             dataset.name,
             str(resolved_version),
+            search_mode,
+            model_vendor,
         ),
         scores=[judge, *DETERMINISTIC_SCORERS],
         trial_count=trials,          # web nondeterminism > model nondeterminism
         max_concurrency=8,
         metadata={
-            "provider": "none" if arm == NO_SEARCH_ARM else provider,
+            # --- matrix axes ---
+            "model_class": spec.model_class,
+            "model_vendor": model_vendor,
+            "search_mode": search_mode,
+            "search_provider": (
+                provider if search_mode == SEARCH_MODE_HARNESS
+                else f"{model_vendor}_native" if search_mode == SEARCH_MODE_NATIVE
+                else "none"),
+            "freshness_treatment": (
+                arm if search_mode == SEARCH_MODE_HARNESS else None),
+            # --- legacy field names, kept so older experiments still join ---
+            "provider": (
+                provider if search_mode == SEARCH_MODE_HARNESS else "none"
+                if search_mode == SEARCH_MODE_NONE else f"{model_vendor}_native"),
             "arm": arm, "agent_model": agent_model,
             "study_id": study_id,
             "condition_id": condition_id,
@@ -703,22 +931,70 @@ def run(provider: str, arm: str, dataset_name: str, dataset_version: str | None,
             "dataset_version": resolved_version,
             "dataset_version_pinned": bool(dataset_version),
             "budget": {"searches": MAX_SEARCHES, "clicks": MAX_CLICKS},
-            "snippet_chars": SNIPPET_CHARS, "n_results": N_RESULTS,
+            # --- what the agent was actually configured with ---
+            # No frontier vendor permits temperature/seed: gpt-5-family models
+            # reject `temperature` with a 400 and support no `seed`, and Opus 5
+            # rejects temperature/top_p/top_k. Only the OSS arm pins sampling, so
+            # sampling_pinned is False on both frontier vendors by necessity.
+            "sampling_params": sampling,
+            "sampling_pinned": bool(sampling),
+            "reasoning_effort": spec.reasoning_effort,
+            "reasoning_effort_pinned": spec.reasoning_effort is not None,
+            "agent_base_url": spec.base_url,
+            # Whether the 5-search budget is API-enforced or only observed.
+            # OpenAI's hosted web_search exposes no max_uses, so its native arm
+            # can exceed the cap every other arm is held to — a real limit on the
+            # native-vs-harness contrast within that vendor.
+            "search_budget_enforced": (
+                agents.NATIVE_BUDGET_ENFORCED.get(model_vendor, False)
+                if search_mode == SEARCH_MODE_NATIVE
+                else search_mode == SEARCH_MODE_HARNESS),
+            # Publication date vs last-modified: two different constructs. Any
+            # freshness claim must not pool arms with different semantics here.
+            "date_field_semantics": agents.DATE_FIELD_SEMANTICS.get(
+                provider if search_mode == SEARCH_MODE_HARNESS
+                else f"{model_vendor}_native" if search_mode == SEARCH_MODE_NATIVE
+                else None),
+            "snippet_chars": (
+                SNIPPET_CHARS if search_mode == SEARCH_MODE_HARNESS else None),
+            "n_results": (
+                N_RESULTS if search_mode == SEARCH_MODE_HARNESS else None),
             "exa_search_type": EXA_SEARCH_TYPE,
             "parallel_mode": PARALLEL_MODE,
             # The freshness treatment each provider actually received, so a run
-            # is interpretable without reading the adapter source.
+            # is interpretable without reading the adapter source. Harness-only.
             "exa_max_age_hours": (
-                EXA_MAX_AGE_HOURS if (provider, arm) == ("exa", "native_fresh")
-                else None),
+                EXA_MAX_AGE_HOURS
+                if (search_mode, provider, arm) == (
+                    SEARCH_MODE_HARNESS, "exa", "native_fresh") else None),
             "parallel_max_age_seconds": (
                 PARALLEL_MAX_AGE_SECONDS
-                if (provider, arm) == ("parallel", "native_fresh") else None),
+                if (search_mode, provider, arm) == (
+                    SEARCH_MODE_HARNESS, "parallel", "native_fresh") else None),
             "youdotcom_freshness": (
-                "day" if (provider, arm) == ("youdotcom", "native_fresh")
+                "day" if (search_mode, provider, arm) == (
+                    SEARCH_MODE_HARNESS, "youdotcom", "native_fresh") else None),
+            # --- native-arm configuration, declared so the arm is reproducible ---
+            "native_search_tool": (
+                agents.ANTHROPIC_WEB_SEARCH_TOOL_TYPE if (
+                    search_mode == SEARCH_MODE_NATIVE
+                    and model_vendor == "anthropic")
+                else agents.OPENAI_WEB_SEARCH_TOOL_TYPE if (
+                    search_mode == SEARCH_MODE_NATIVE
+                    and model_vendor == "openai")
                 else None),
+            "native_search_usd_per_call": (
+                native_rate if search_mode == SEARCH_MODE_NATIVE else None),
+            "native_search_rate_confirmed": (
+                rate_confirmed if search_mode == SEARCH_MODE_NATIVE else None),
+            "openai_search_context_size": (
+                agents.OPENAI_SEARCH_CONTEXT_SIZE if (
+                    search_mode == SEARCH_MODE_NATIVE
+                    and model_vendor == "openai") else None),
+            "anthropic_thinking": (
+                agents.ANTHROPIC_THINKING if model_vendor == "anthropic" else None),
             "git_commit": _git_commit(),
-            "prompt_version": "frozen-v2-generic-factual",
+            "prompt_version": PROMPT_VERSIONS[search_mode],
         },
     )
 
@@ -728,10 +1004,26 @@ def main():
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     r = sub.add_parser("run")
+    r.add_argument("--search-mode", choices=list(SEARCH_MODES),
+                   default=SEARCH_MODE_HARNESS,
+                   help="none = no tools (parametric control); harness = our "
+                        "search_web tool over a search API; native = the model "
+                        "vendor's own server-side search. NOTE: this is a "
+                        "different axis from --arm native_fresh, which is a "
+                        "search API's freshness parameter.")
+    r.add_argument("--model-vendor", choices=sorted(VENDORS),
+                   default=DEFAULT_MODEL_VENDOR,
+                   help="baseten = OSS models (OpenAI-compatible); openai and "
+                        "anthropic = frontier, both of which support "
+                        "--search-mode native.")
     r.add_argument("--provider", choices=list(PROVIDERS), default="exa",
-                   help="Ignored when --arm no_search.")
-    r.add_argument("--arm", required=True,
-                   choices=["normalized", "native_fresh", NO_SEARCH_ARM])
+                   help="Search API for --search-mode harness. Ignored "
+                        "otherwise.")
+    r.add_argument("--arm", default="normalized",
+                   choices=["normalized", "native_fresh", NO_SEARCH_ARM],
+                   help="Freshness treatment for --search-mode harness. "
+                        "no_search is a deprecated alias for "
+                        "--search-mode none.")
     r.add_argument("--dataset-name", default=DATASET_NAME)
     r.add_argument("--dataset-version", default=None,
                    help="Pin a dataset version so every provider/arm sees the "
@@ -742,9 +1034,12 @@ def main():
     r.add_argument("--study-id", default="freshness-v1",
                    help="Shared identifier for every condition in one experiment "
                         "matrix. Reuse it across providers, arms, and models.")
-    r.add_argument("--agent-model", default=AGENT_MODEL,
-                   help="Provider rankings can be model-dependent; re-run the "
-                        "matrix under a second agent model to check that yours "
+    r.add_argument("--agent-model", default=None,
+                   help="Defaults to the chosen vendor's pinned model "
+                        + ", ".join(f"{v}={s.default_model}"
+                                    for v, s in sorted(VENDORS.items()))
+                        + ". Provider rankings can be model-dependent; re-run "
+                        "the matrix under a second model to check that yours "
                         "generalizes.")
     r.add_argument("--judge", action="append", dest="judges", metavar="MODEL[@BASE_URL]",
                    help="Repeatable. One judge keeps SimpleQA parity; three or "
@@ -758,10 +1053,28 @@ def main():
                  "--allow-latest only for exploratory runs")
     if args.trials < 1:
         ap.error("--trials must be at least 1")
+
+    search_mode = args.search_mode
+    # `--arm no_search` predates the search_mode axis. Honor it so existing
+    # scripts keep working, but map it onto the axis rather than carrying two
+    # ways to express the same condition.
+    if args.arm == NO_SEARCH_ARM:
+        if search_mode not in (SEARCH_MODE_HARNESS, SEARCH_MODE_NONE):
+            ap.error(f"--arm no_search conflicts with --search-mode "
+                     f"{search_mode}; drop one")
+        search_mode = SEARCH_MODE_NONE
+    if search_mode == SEARCH_MODE_NATIVE and args.arm != "normalized":
+        # native_fresh is a search-API parameter; there is no such knob on a
+        # model vendor's server-side search, so accepting it would imply a
+        # treatment that was never applied.
+        ap.error("--arm applies only to --search-mode harness; the model "
+                 "vendor's native search exposes no freshness parameter")
+
+    agent_model = args.agent_model or VENDORS[args.model_vendor].default_model
     # gpt-4.1 default keeps parity with LiveNewsBench's published grading.
     run(args.provider, args.arm, args.dataset_name, args.dataset_version,
-        args.trials, args.judges or ["gpt-4.1"], args.agent_model,
-        args.study_id, args.env_file)
+        args.trials, args.judges or ["gpt-4.1"], agent_model,
+        args.study_id, args.env_file, search_mode, args.model_vendor)
 
 
 if __name__ == "__main__":

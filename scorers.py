@@ -19,15 +19,28 @@ output (a plain answer string or the structured agent payload below):
         {"type": "fetch", "url": str, "tokens": int},
         ...
       ],
+      "decision_surface": "full" | "no_snippet" | "urls_only" | "none",
       "used_searches": int,
       "used_clicks": int,
     }
 
+`decision_surface` declares which trajectory fields are actually populated, and
+it is load-bearing. Server-side ("native") search arms normalize onto the same
+trajectory schema but cannot fill every field: Anthropic returns no snippets,
+OpenAI returns neither snippets nor dates. Every trajectory-reading scorer gates
+on the tier and returns None rather than a score it cannot support — see the
+"Decision-surface observability" section below for why a passing score on an
+unobservable surface is the dangerous failure mode here.
+
 metadata:
     The complete benchmark source fields plus importer provenance. Evaluation
-    metadata such as provider, arm, and as_of may be merged in at run time.
+    metadata merged in at run time: model_class, model_vendor, search_mode,
+    search_provider, freshness_treatment, exclusion_enforced, search_budget,
+    zero_search_row, as_of.
 
 All scorers return braintrust-style dicts: {"name", "score" (0-1 or None), "metadata"}.
+A None score means "not measurable on this arm" and is excluded from averages;
+0.0 means measured and failed. Never substitute one for the other.
 Deterministic scorers are pure functions; the SimpleQA judge is the only LLM call.
 """
 
@@ -112,6 +125,67 @@ def _expected_answers(expected) -> list[str]:
 def _metadata(metadata, kwargs) -> dict[str, Any]:
     value = metadata if isinstance(metadata, dict) else kwargs.get("metadata")
     return value if isinstance(value, dict) else {}
+
+
+# ---------------------------------------------------------------------------
+# Decision-surface observability
+#
+# Not every arm exposes the same view of what the agent saw. Server-side
+# ("native") search returns citations or bare URLs, not the rank/title/snippet/
+# date rows the harness tool produces. Without gating, every scorer that reads
+# `trajectory` returns a PASSING score on those arms for the wrong reason:
+# leakage_guard sees no leaked URLs because it sees no URLs, budget_economy
+# sees zero searches, snippet_sufficiency sees no gold and scores 0.0 as though
+# the provider failed to surface it.
+#
+# A score of None means "not measurable on this arm" and is excluded from
+# averages. A score of 1.0 or 0.0 means "measured". Never conflate the two: an
+# unobservable surface must never produce a number that reads as evidence.
+#
+# Tiers (set by run_eval from agents.SURFACE_*):
+#   full        rank/url/title/snippet/published_date  — harness arms
+#   no_snippet  rank/url/title/published_date          — Anthropic native
+#   urls_only   rank/url + titles from citations        — OpenAI native
+#   none        no retrieval at all                    — no_search arms
+# ---------------------------------------------------------------------------
+
+SURFACE_FULL = "full"
+SURFACE_NO_SNIPPET = "no_snippet"
+SURFACE_URLS_ONLY = "urls_only"
+SURFACE_NONE = "none"
+_KNOWN_SURFACES = (SURFACE_FULL, SURFACE_NO_SNIPPET, SURFACE_URLS_ONLY,
+                   SURFACE_NONE)
+
+# Which tiers populate which fields.
+_URL_SURFACES = {SURFACE_FULL, SURFACE_NO_SNIPPET, SURFACE_URLS_ONLY}
+_DATE_SURFACES = {SURFACE_FULL, SURFACE_NO_SNIPPET}
+_SNIPPET_SURFACES = {SURFACE_FULL}
+
+
+def _surface(output) -> str:
+    """The decision-surface tier for this row.
+
+    Rows written before the tier existed carried full harness results whenever
+    they had a trajectory, so infer that rather than dropping historical rows
+    out of every trajectory-based metric.
+    """
+    payload = _output_payload(output)
+    declared = payload.get("decision_surface")
+    if declared in _KNOWN_SURFACES:
+        return declared
+    return SURFACE_FULL if payload.get("trajectory") else SURFACE_NONE
+
+
+def _not_measurable(name: str, surface: str, needs: str) -> dict[str, Any]:
+    return {
+        "name": name,
+        "score": None,
+        "metadata": {
+            "applicable": False,
+            "decision_surface": surface,
+            "reason": f"{surface} surface exposes no {needs}",
+        },
+    }
 
 
 def iter_source_urls(metadata, expected=None):
@@ -408,11 +482,36 @@ def leakage_guard(input, output, expected, metadata=None, **kwargs):
             },
         }
 
+    surface = _surface(output)
+    if surface not in _URL_SURFACES:
+        # The no_search arm surfaces nothing, so there is nothing that could
+        # leak. Scoring 1.0 here would hand the control arm a free pass on a
+        # rule it was never subject to, inflating any gated headline number.
+        return _not_measurable("leakage_guard", surface, "result URLs")
+
+    payload = _output_payload(output)
+    results = list(_all_results(output))
+    used_searches = payload.get("used_searches", 0)
+    used_searches = used_searches if isinstance(used_searches, (int, float)) else 0
+    if not results and used_searches:
+        # Searches ran but no URLs came back to inspect — a dropped or filtered
+        # response, not a clean SERP. Unmeasurable, not compliant.
+        return {
+            "name": "leakage_guard",
+            "score": None,
+            "metadata": {
+                "applicable": False,
+                "decision_surface": surface,
+                "reason": (f"{used_searches} search(es) ran but surfaced no "
+                           "inspectable URLs"),
+            },
+        }
+
     source_domains = sorted(
         {_host(url) for url in iter_source_urls(metadata, None) if _host(url)}
     )
     bad = []
-    for r in _all_results(output):
+    for r in results:
         h = _host(r.get("url", ""))
         if not h:
             continue
@@ -425,9 +524,16 @@ def leakage_guard(input, output, expected, metadata=None, **kwargs):
         "score": 1.0 if not bad else 0.0,
         "metadata": {
             "applicable": True,
+            "decision_surface": surface,
             "leaked_urls": bad[:10],
             "source_domains": source_domains,
             "source_domain_available": bool(source_domains),
+            # Whether the exclusion list was actually sent to the search layer.
+            # Every current arm can enforce it (harness excludeDomains, Anthropic
+            # blocked_domains, OpenAI filters.blocked_domains) — but a future arm
+            # that cannot must not be silently pooled with those that can.
+            "exclusion_enforced": metadata.get("exclusion_enforced"),
+            "n_results_inspected": len(results),
         },
     }
 
@@ -436,18 +542,31 @@ def leakage_guard(input, output, expected, metadata=None, **kwargs):
 # 3. Economy — budget compliance and spend
 # ---------------------------------------------------------------------------
 
-def budget_economy(input, output, expected, **kwargs):
-    """Compliance with the 5-search / 5-click default budget, with raw spend
-    in metadata. Score = 1 if within budget, else 0. Searches, clicks, and
-    tokens land in metadata for the cost/quality quadrant and for fitting the
-    provider-specific patience/fetch-rate curves offline.
+def budget_economy(input, output, expected, metadata=None, **kwargs):
+    """Compliance with the search/click budget, with raw spend in metadata.
+    Score = 1 if within budget, else 0. Searches, clicks, and tokens land in
+    metadata for the cost/quality quadrant and for fitting the provider-specific
+    patience/fetch-rate curves offline.
+
+    Not applicable to the no-tool control arm: an arm with no tools is
+    trivially within budget, and scoring it 1.0 would credit compliance with a
+    rule it could not violate.
     """
+    surface = _surface(output)
+    if surface == SURFACE_NONE:
+        return _not_measurable("budget_economy", surface, "tool calls to budget")
+
     payload = _output_payload(output)
+    row_metadata = _metadata(metadata, kwargs)
     trajectory = payload.get("trajectory", [])
     trajectory = trajectory if isinstance(trajectory, list) else []
     s, c = payload.get("used_searches", 0), payload.get("used_clicks", 0)
     s = s if isinstance(s, (int, float)) else 0
     c = c if isinstance(c, (int, float)) else 0
+    # Read the cap from the run rather than hardcoding 5, so changing
+    # MAX_SEARCHES cannot silently decouple the protocol from the scorer.
+    cap = row_metadata.get("search_budget")
+    cap = cap if isinstance(cap, (int, float)) else 5
     tokens = sum(
         step.get("tokens", 0)
         for step in trajectory
@@ -455,8 +574,13 @@ def budget_economy(input, output, expected, **kwargs):
     )
     return {
         "name": "budget_economy",
-        "score": 1.0 if (s <= 5 and c <= 5) else 0.0,
+        "score": 1.0 if (s <= cap and c <= 5) else 0.0,
         "metadata": {"used_searches": s, "used_clicks": c,
+                     "search_budget": cap,
+                     "decision_surface": surface,
+                     # Native arms bill search tokens on the model spans, so a 0
+                     # here is an accounting boundary, not a free search.
+                     "trajectory_tokens_measured": surface in _SNIPPET_SURFACES,
                      "trajectory_tokens": tokens},
     }
 
@@ -476,16 +600,34 @@ def dealbreaker_gate(input, output, expected, metadata=None, **kwargs):
     """
     gates = {"leakage_guard": leakage_guard(input, output, expected,
                                             metadata=metadata, **kwargs),
-             "budget_economy": budget_economy(input, output, expected, **kwargs)}
+             "budget_economy": budget_economy(input, output, expected,
+                                              metadata=metadata, **kwargs)}
     violated = [name for name, res in gates.items() if res.get("score") == 0.0]
     skipped = [name for name, res in gates.items() if res.get("score") is None]
+    checked = [n for n in gates if n not in skipped]
+    if not checked:
+        # Every constituent rule was inapplicable, so there is no gate to pass.
+        # Returning 1.0 here is the specific bug that let a native or no-search
+        # arm show a clean gated headline number without a single rule evaluated.
+        return {
+            "name": "dealbreaker_gate",
+            "score": None,
+            "metadata": {
+                "applicable": False,
+                "not_applicable": skipped,
+                "gates_checked": [],
+                "decision_surface": _surface(output),
+                "reason": "no hard-constraint rule was measurable on this row",
+            },
+        }
     return {
         "name": "dealbreaker_gate",
         "score": 0.0 if violated else 1.0,
         "metadata": {
+            "applicable": True,
             "violated": violated,
             "not_applicable": skipped,
-            "gates_checked": [n for n in gates if n not in skipped],
+            "gates_checked": checked,
         },
     }
 
@@ -510,6 +652,14 @@ def temporal_grounding(input, output, expected, metadata=None, **kwargs):
     (1 - pre_event_rate). None if no results carried dates.
     """
     metadata = _metadata(metadata, kwargs)
+    surface = _surface(output)
+    if surface not in _DATE_SURFACES:
+        # OpenAI's native search returns URLs with no publication dates, so
+        # freshness of its decision surface is genuinely unmeasurable — not 1.0,
+        # and not 0.0 either. This is the arm asymmetry to disclose in any
+        # writeup that compares native search across vendors.
+        return _not_measurable(
+            "temporal_grounding", surface, "per-result publication dates")
     event = _parse_date(metadata.get("event_date") or metadata.get("date"))
     if event is None:
         return {
@@ -568,6 +718,15 @@ def snippet_sufficiency(input, output, expected, **kwargs):
     per-URL LLM oracle pass later, write its labels into result dicts as
     `oracle_snippet_gold` and this scorer will prefer them.
     """
+    surface = _surface(output)
+    if surface not in _SNIPPET_SURFACES:
+        # Without a snippet layer this scorer would report 0.0 — reading as "the
+        # provider never surfaced gold" when in fact we cannot see what was
+        # surfaced. Anthropic's citations carry cited_text, but that text is
+        # selected because it supports the answer, so scoring it would guarantee
+        # a near-perfect result. Both failure directions are avoided by None.
+        return _not_measurable(
+            "snippet_sufficiency", surface, "result snippets")
     aliases = _answer_aliases(expected)
     best_rank, first_round, hits = None, None, 0
     for round_idx, s in enumerate(_searches(output)):
@@ -584,6 +743,8 @@ def snippet_sufficiency(input, output, expected, **kwargs):
         "name": "snippet_sufficiency",
         "score": 1.0 if hits else 0.0,
         "metadata": {
+            "applicable": True,
+            "decision_surface": surface,
             "gold_snippet_hits": hits,
             "gold_best_rank": best_rank,
             "gold_rr": (1.0 / best_rank) if best_rank else 0.0,
@@ -611,6 +772,9 @@ def evidence_precision(input, output, expected, **kwargs):
     quality bar. Uses the same conservative string containment as
     snippet_sufficiency, and prefers `oracle_snippet_gold` labels when present.
     """
+    surface = _surface(output)
+    if surface not in _SNIPPET_SURFACES:
+        return _not_measurable("evidence_precision", surface, "result snippets")
     aliases = _answer_aliases(expected)
     per_search, total, hits = [], 0, 0
     for s in _searches(output):
@@ -656,6 +820,14 @@ def token_discounted_gain(input, output, expected, tau: float = 4000.0, **kwargs
     Distinguishes 'gold at rank 1 of search 1' from 'gold after two searches
     and 9k tokens of excerpts' — invisible to accuracy, central to cost.
     """
+    surface = _surface(output)
+    if surface not in _SNIPPET_SURFACES:
+        # Needs both a snippet layer (to detect gold) and per-search token
+        # accounting (the clock). Native arms have neither: their search-result
+        # tokens are billed on the model spans, not attributable per search.
+        return _not_measurable(
+            "token_discounted_gain", surface,
+            "snippets or per-search token accounting")
     aliases = _answer_aliases(expected)
     cum = 0.0
     trajectory = _output_payload(output).get("trajectory", [])
@@ -693,6 +865,13 @@ def compression_redundancy(input, output, expected, **kwargs):
     against a floor (pure-duplicate text compresses to ~0.05 of raw at these
     lengths), so higher = more marginal information per result.
     """
+    surface = _surface(output)
+    if surface not in _SNIPPET_SURFACES:
+        # Titles alone would compress very differently from title+snippet, so
+        # running this on a no-snippet arm produces a number that is not
+        # comparable to the harness arms even though it looks like one.
+        return _not_measurable(
+            "compression_redundancy", surface, "result snippets")
     texts = [f"{r.get('title','')} {r.get('snippet','')}" for r in _all_results(output)]
     blob = "\n".join(t for t in texts if t.strip()).encode("utf-8")
     if len(blob) < 200:
@@ -710,17 +889,22 @@ def domain_entropy(input, output, expected, **kwargs):
     Read alongside compression_redundancy: distinct hosts syndicating one
     story score high here and low there — that gap IS the syndication effect.
     """
+    surface = _surface(output)
+    if surface not in _URL_SURFACES:
+        return _not_measurable("domain_entropy", surface, "result URLs")
     hosts = [_host(r.get("url", "")) for r in _all_results(output)]
     hosts = [h for h in hosts if h]
     if len(hosts) < 2:
         return {"name": "domain_entropy", "score": None,
-                "metadata": {"n_results": len(hosts)}}
+                "metadata": {"applicable": False, "decision_surface": surface,
+                             "n_results": len(hosts)}}
     counts = Counter(hosts)
     n = len(hosts)
     H = -sum((c / n) * math.log(c / n) for c in counts.values())
     return {"name": "domain_entropy",
             "score": H / math.log(n),
-            "metadata": {"unique_hosts": len(counts), "n_results": n,
+            "metadata": {"applicable": True, "decision_surface": surface,
+                         "unique_hosts": len(counts), "n_results": n,
                          "top_host": counts.most_common(1)[0]}}
 
 
