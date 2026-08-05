@@ -31,7 +31,13 @@ dist/
 # Legacy locations used before Corvus runtime state was consolidated.
 .corvus-rate-limits/
 .corvus-collector.lock
-data/corvus_live/
+# Collected data stays local. Data cards are documentation, not data: they
+# record collection scope and yield with no source text, and the README links
+# to them. Git will not descend into an ignored directory, so the directories
+# themselves must be un-ignored before the card can be excepted.
+data/corvus_live/**
+!data/corvus_live/**/
+!data/corvus_live/*/README.md
 
 # Editor and operating-system files
 .DS_Store
