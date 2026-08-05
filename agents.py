@@ -1,25 +1,37 @@
 """Agent instrumentation across model vendors and search modalities.
 
-This module exists so one frozen benchmark protocol can be run under four
-materially different agent configurations:
+This module exists so one frozen benchmark protocol can run under configurations
+that differ in two ways at once — the model's class and where the search happens:
 
     model_class  x  search_mode
     -----------------------------------------------------------------
-    oss          x  harness   (Baseten model, our search_web tool)
+    oss          x  harness   (Baseten model, our search_web tool -> You.com)
     oss          x  none      (Baseten model, parametric memory only)
-    frontier     x  harness   (OpenAI/Anthropic model, our search_web tool)
+    frontier     x  harness   (OpenAI/Anthropic model, our tool -> You.com)
     frontier     x  native    (the model provider's own server-side search)
     frontier     x  none      (parametric baseline for the frontier arms)
+
+Baseten runs no search of its own, so `oss x native` does not exist. Its harness
+arms work because the harness owns the search: our code calls You.com and the
+model only has to emit a tool call.
 
 `native` is only attributable *within* a vendor: if GPT gets native search and
 Claude gets the harness tool, model identity is confounded with search mode. So
 each frontier vendor runs all three modes and `native` is compared to that same
 vendor's `harness` and `none` arms.
 
+Vendors vs model rows
+---------------------
+VENDORS says HOW to reach an endpoint (auth, base URL, which parameters that API
+accepts). MATRIX_MODELS says WHAT the study runs. They are separate because the
+OSS side needs several models from one vendor — a single open model cannot
+distinguish "retrieval substitutes for capability" from "this one model happens
+to be good at tool calling."
+
 The hard instrumentation problem this module solves
 ---------------------------------------------------
 Native (server-side) search does not produce `search_web` tool calls, so the
-harness sees no trajectory. Six of the ten deterministic scorers read
+harness sees no trajectory. Most deterministic scorers read
 `output["trajectory"][*]["results"]`, and with an empty trajectory they return
 *passing* scores: leakage_guard 1.0 (nothing leaked because nothing was
 observed), budget_economy 1.0 (zero searches is within budget), and
@@ -110,14 +122,16 @@ ANTHROPIC_MAX_PAUSE_TURNS = 4
 # Vendor registry
 #
 # Every field here is an experiment condition, not a convenience. In particular
-# `sampling` and `seed_supported` differ by vendor and CANNOT be equalized.
-# Neither frontier vendor accepts sampling parameters at all: Claude Opus 5
-# rejects temperature/top_p/top_k with a 400, and gpt-5-family models reject
-# `temperature` ("only the default (1) is supported") and offer no `seed`. Only
-# the OSS arm can pin them. So "temperature 0, seed 42" is not a property the
-# frozen agent can hold across vendors — it is unavailable, not declined. The run
-# records what each arm actually received (`sampling_pinned`) rather than
-# implying parity, and `seed_supported` stays False everywhere as a result.
+# `sampling` differs by vendor and CANNOT be equalized. Neither frontier vendor
+# accepts sampling parameters at all: Claude rejects temperature/top_p/top_k with
+# a 400, and gpt-5-family models reject `temperature` ("only the default (1) is
+# supported"). Only the OSS arm can pin them.
+#
+# There is no `seed` field here because no vendor in this study supports one:
+# gpt-5-family reasoning models dropped it, Anthropic never had it, and Baseten
+# does not document it. So "temperature 0, seed 42" is unavailable, not declined.
+# The run records what each arm actually received (`sampling_pinned`) rather than
+# implying parity. Add the field back only alongside a vendor that honors it.
 # ---------------------------------------------------------------------------
 
 
@@ -131,7 +145,6 @@ class VendorSpec:
     supports_native_search: bool = False
     # Sampling params safe to send to this vendor's chat/messages endpoint.
     sampling: dict = field(default_factory=dict)
-    seed_supported: bool = False
     # Reasoning depth, where the vendor lets us pin it. None = vendor default,
     # left unpinned. Recorded either way so a run is never ambiguous about it.
     reasoning_effort: str | None = None
@@ -141,19 +154,22 @@ class VendorSpec:
 VENDORS: dict[str, VendorSpec] = {
     # Baseten Model APIs are OpenAI-Chat-Completions-compatible at
     # https://inference.baseten.co/v1 (docs.baseten.co/inference/model-apis/overview,
-    # checked 2026-08-05). All catalog models support tool calling. gpt-oss-120b
-    # is the open-weights default because the OSS+harness cell depends entirely
-    # on reliable function calling — a model that never emits a tool call
-    # silently collapses that cell into the OSS+none cell.
+    # checked 2026-08-05). All catalog models support tool calling, which is what
+    # the OSS harness arm needs — Baseten runs no search of its own, so the
+    # harness calls You.com directly and the model only has to emit the tool call.
+    # A model that does not do that reliably collapses the OSS harness cell into
+    # the OSS none cell, which is what zero_search_row detects.
+    #
+    # Default is the current-generation mid-price model; see MATRIX_MODELS for the
+    # OSS rows the study actually runs.
     "baseten": VendorSpec(
         name="baseten",
         model_class="oss",
         api_key_env="BASETEN_API_KEY",
-        default_model="openai/gpt-oss-120b",
+        default_model="zai-org/GLM-5.2",
         base_url="https://inference.baseten.co/v1",
         supports_native_search=False,
         sampling={"temperature": 0},
-        seed_supported=False,
         notes="Server-side search is structurally unavailable; native arm N/A.",
     ),
     # gpt-5.6-sol is pinned rather than the bare `gpt-5.6` alias, which points at
@@ -190,7 +206,6 @@ VENDORS: dict[str, VendorSpec] = {
         default_model="gpt-5.6-sol",
         supports_native_search=True,
         sampling={},
-        seed_supported=False,
         reasoning_effort=None,
         notes="Native search via the Responses API hosted web_search tool.",
     ),
@@ -220,7 +235,6 @@ VENDORS: dict[str, VendorSpec] = {
         supports_native_search=True,
         # Opus 5 removed temperature/top_p/top_k — sending any of them is a 400.
         sampling={},
-        seed_supported=False,
         # Pinnable here because effort and tools coexist fine on the Messages
         # API, so both this vendor's arms get the same declared depth.
         reasoning_effort=ANTHROPIC_EFFORT,
@@ -238,17 +252,68 @@ VENDORS: dict[str, VendorSpec] = {
 NATIVE_BUDGET_ENFORCED = {"anthropic": True, "openai": False}
 
 # What each search layer's date field actually MEANS. temporal_grounding treats
-# `published_date` as a publication timestamp, but two of these surfaces report
-# last-modified instead, which is a different construct: a re-rendered page can
-# look fresh without carrying new information. Rows record which semantic they
-# got so a freshness claim is not pooled across the two.
+# `published_date` as a publication timestamp, but NO layer here reports one:
+# You.com's page_age and Anthropic native's page_age are both last-modified, and
+# OpenAI native has no date field. A re-rendered page therefore looks fresh
+# without carrying new information.
+#
+# Uniform semantics remove the pooling hazard but leave the construct weak, so
+# freshness conclusions should rest on Corvus-QA's recency_rung — dataset ground
+# truth about when the fact actually changed — rather than on vendor metadata.
+# Rows still record the semantic so this stays visible.
 DATE_FIELD_SEMANTICS = {
-    "exa": "publication",             # publishedDate
-    "parallel": "publication",        # publish_date
-    "youdotcom": "last_modified",     # page_age
+    "youdotcom": "last_modified",         # page_age
     "anthropic_native": "last_modified",  # page_age
-    "openai_native": None,            # no date field at all
+    "openai_native": None,                # no date field at all
 }
+
+
+# ---------------------------------------------------------------------------
+# Model rows the study runs.
+#
+# A vendor says HOW to talk to an endpoint; a model row says WHAT to run. They are
+# separate because the OSS side needs several models from one vendor: a
+# single-model OSS arm cannot distinguish "retrieval substitutes for capability"
+# from "this one open model happens to be good at tool calling."
+#
+# Both OSS rows are current-generation and chosen to span the cost range, so the
+# substitution question gets two points on the frontier instead of one. Their
+# order here is cheapest-first, which is also the order to smoke-test them in:
+# the cheap row is where a tool-calling failure costs least to discover.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ModelRow:
+    vendor: str
+    model: str
+    note: str
+
+    @property
+    def spec(self) -> "VendorSpec":
+        return VENDORS[self.vendor]
+
+
+MATRIX_MODELS: tuple[ModelRow, ...] = (
+    ModelRow("baseten", "deepseek-ai/DeepSeek-V4-Flash-0731",
+             "OSS, cheapest row ($0.13/$0.26) — the extreme end of the "
+             "cost-substitution frontier"),
+    ModelRow("baseten", "zai-org/GLM-5.2",
+             "OSS, mid-price row ($1.40/$4.40) — current-generation, stronger "
+             "reasoning than the Flash row"),
+    ModelRow("openai", "gpt-5.6-sol",
+             "frontier, also runs a native-search arm"),
+    ModelRow("anthropic", "claude-fable-5",
+             "frontier, also runs a native-search arm"),
+)
+
+
+def oss_models() -> tuple[ModelRow, ...]:
+    return tuple(r for r in MATRIX_MODELS if r.spec.model_class == "oss")
+
+
+def frontier_models() -> tuple[ModelRow, ...]:
+    return tuple(r for r in MATRIX_MODELS if r.spec.model_class == "frontier")
 
 
 def vendor_of(name: str) -> VendorSpec:
@@ -732,17 +797,6 @@ class HarnessSession:
     def add_tool_results(self, results: list) -> None:  # pragma: no cover
         raise NotImplementedError
 
-    @property
-    def sampling_used(self) -> dict:
-        """Sampling parameters actually sent, for run metadata."""
-        params = dict(self.spec.sampling)
-        if self.spec.seed_supported:
-            params["seed"] = AGENT_SEED
-        return params
-
-
-AGENT_SEED = 42
-
 
 class OpenAIHarnessSession(HarnessSession):
     """Chat Completions tool calling — OpenAI and Baseten (OpenAI-compatible)."""
@@ -766,8 +820,6 @@ class OpenAIHarnessSession(HarnessSession):
 
     def step(self, tools_enabled: bool) -> Turn:
         kwargs = dict(self.spec.sampling)
-        if self.spec.seed_supported:
-            kwargs["seed"] = AGENT_SEED
         if tools_enabled:
             kwargs["tools"] = self.tools
         response = self.client.chat.completions.create(

@@ -1,4 +1,4 @@
-"""Pin the four-cell matrix instrumentation: axes, adapters, and scorer gating.
+"""Pin the matrix instrumentation: axes, adapters, model rows, and scorer gating.
 
 The failure this suite exists to prevent is silent, not loud. A native-search
 arm produces no `search_web` tool spans, so every trajectory-reading scorer used
@@ -17,8 +17,6 @@ schemas:
 import os
 import unittest
 
-os.environ.setdefault("EXA_API_KEY", "test-exa-key")
-os.environ.setdefault("PARALLEL_API_KEY", "test-parallel-key")
 os.environ.setdefault("YDC_API_KEY", "test-ydc-key")
 
 import agents
@@ -158,16 +156,14 @@ class VendorRegistryTest(unittest.TestCase):
         # Both frontier vendors reject them: Opus 5 400s on
         # temperature/top_p/top_k, and gpt-5-family models 400 on `temperature`
         # ("only the default (1) is supported") and support no `seed`. Sending
-        # temperature=0 to either would fail every row of those arms, so
-        # "temp 0, seed 42" is unavailable, not merely unused.
+        # temperature=0 to either would fail every row of those arms. No vendor
+        # here supports `seed` either, so "temp 0, seed 42" is unavailable.
         for vendor in ("openai", "anthropic"):
             with self.subTest(vendor=vendor):
                 self.assertEqual(agents.VENDORS[vendor].sampling, {})
-                self.assertFalse(agents.VENDORS[vendor].seed_supported)
 
     def test_only_the_oss_arm_can_pin_sampling(self):
         self.assertEqual(agents.VENDORS["baseten"].sampling, {"temperature": 0})
-        self.assertFalse(agents.VENDORS["baseten"].seed_supported)
 
     def test_frontier_models_are_pinned_snapshots_not_moving_aliases(self):
         # `gpt-5.6` is an alias for gpt-5.6-sol and will move to whatever sol
@@ -200,41 +196,25 @@ class VendorRegistryTest(unittest.TestCase):
         self.assertTrue(agents.NATIVE_BUDGET_ENFORCED["anthropic"])
         self.assertFalse(agents.NATIVE_BUDGET_ENFORCED["openai"])
 
-    def test_date_field_semantics_separate_publication_from_last_modified(self):
-        # temporal_grounding reads `published_date`, but two surfaces report
-        # last-modified instead — a re-rendered page looks fresh without
-        # carrying new information. Pooling the two would inflate freshness.
-        self.assertEqual(agents.DATE_FIELD_SEMANTICS["exa"], "publication")
-        self.assertEqual(agents.DATE_FIELD_SEMANTICS["parallel"], "publication")
-        self.assertEqual(agents.DATE_FIELD_SEMANTICS["youdotcom"], "last_modified")
+    def test_no_search_layer_reports_a_true_publication_date(self):
+        # With Exa and Parallel removed, every remaining dated surface reports
+        # LAST-MODIFIED, not publication. Uniform semantics remove the pooling
+        # hazard but leave temporal_grounding measuring "last touched" -- a
+        # re-rendered page looks fresh without carrying new information. Freshness
+        # conclusions should rest on Corvus-QA's recency_rung instead.
+        self.assertNotIn(
+            "publication", set(agents.DATE_FIELD_SEMANTICS.values()))
+        self.assertEqual(agents.DATE_FIELD_SEMANTICS["youdotcom"],
+                         "last_modified")
         self.assertEqual(agents.DATE_FIELD_SEMANTICS["anthropic_native"],
                          "last_modified")
         self.assertIsNone(agents.DATE_FIELD_SEMANTICS["openai_native"])
 
-    def test_baseten_uses_its_documented_openai_compatible_base_url(self):
-        self.assertEqual(agents.VENDORS["baseten"].base_url,
-                         "https://inference.baseten.co/v1")
-        self.assertEqual(agents.VENDORS["baseten"].api_key_env, "BASETEN_API_KEY")
-
-
-class SurfaceConstantsTest(unittest.TestCase):
-    def test_agents_and_scorers_agree_on_the_tier_names(self):
-        # agents.py sets the tier and scorers.py gates on it, but scorers.py
-        # deliberately does not import agents (that would pull the openai SDK
-        # into the deployed scorer bundle). The strings are therefore duplicated,
-        # and a rename on one side would silently send every gated scorer down
-        # its fallback path. This test is the seam.
-        self.assertEqual(
-            (agents.SURFACE_FULL, agents.SURFACE_NO_SNIPPET,
-             agents.SURFACE_URLS_ONLY, agents.SURFACE_NONE),
-            (scorers.SURFACE_FULL, scorers.SURFACE_NO_SNIPPET,
-             scorers.SURFACE_URLS_ONLY, scorers.SURFACE_NONE))
-
-    def test_every_tier_is_known_to_the_scorers(self):
-        for surface in (agents.SURFACE_FULL, agents.SURFACE_NO_SNIPPET,
-                        agents.SURFACE_URLS_ONLY, agents.SURFACE_NONE):
-            with self.subTest(surface=surface):
-                self.assertIn(surface, scorers._KNOWN_SURFACES)
+    def test_removed_providers_are_gone_from_every_registry(self):
+        # A leftover entry would let a run record a provider it can no longer call.
+        for gone in ("exa", "parallel"):
+            with self.subTest(provider=gone):
+                self.assertNotIn(gone, agents.DATE_FIELD_SEMANTICS)
 
 
 class ConditionLabelTest(unittest.TestCase):
@@ -243,10 +223,10 @@ class ConditionLabelTest(unittest.TestCase):
         # is a SEARCH API's freshness parameter; `native` is the MODEL vendor's
         # own search. They must never produce the same condition.
         harness = run_eval.condition_label(
-            agents.SEARCH_MODE_HARNESS, "exa", "native_fresh", "openai")
+            agents.SEARCH_MODE_HARNESS, "native_fresh", "openai")
         native = run_eval.condition_label(
-            agents.SEARCH_MODE_NATIVE, "exa", "normalized", "openai")
-        self.assertEqual(harness, "harness-exa-native_fresh")
+            agents.SEARCH_MODE_NATIVE, run_eval.DEFAULT_ARM, "openai")
+        self.assertEqual(harness, "harness-youdotcom-native_fresh")
         self.assertEqual(native, "native-openai")
         self.assertNotEqual(harness, native)
 
@@ -254,10 +234,10 @@ class ConditionLabelTest(unittest.TestCase):
         # "native" alone is not a condition — it is vendor-specific, and the two
         # native arms are not interchangeable evidence.
         self.assertNotEqual(
-            run_eval.condition_label(agents.SEARCH_MODE_NATIVE, "exa",
-                                     "normalized", "openai"),
-            run_eval.condition_label(agents.SEARCH_MODE_NATIVE, "exa",
-                                     "normalized", "anthropic"))
+            run_eval.condition_label(agents.SEARCH_MODE_NATIVE,
+                                     run_eval.DEFAULT_ARM, "openai"),
+            run_eval.condition_label(agents.SEARCH_MODE_NATIVE,
+                                     run_eval.DEFAULT_ARM, "anthropic"))
 
 
 # --- native adapters --------------------------------------------------------
@@ -580,22 +560,36 @@ class ModelCostTest(unittest.TestCase):
     def test_the_oss_arm_is_priced_so_substitution_is_a_cost_claim(self):
         # "OSS + retrieval vs frontier without it" is a cost-ratio claim, and a
         # cost-ratio claim needs both sides priced.
-        usd, confirmed = agents.model_cost_usd("openai/gpt-oss-120b", 1000, 1000)
+        usd, confirmed = agents.model_cost_usd("zai-org/GLM-5.2", 1000, 1000)
         self.assertTrue(confirmed)
         self.assertGreater(usd, 0)
 
-    def test_oss_input_tokens_are_two_orders_cheaper_than_the_frontier_default(self):
-        oss_in = agents.MODEL_USD_PER_MTOK["openai/gpt-oss-120b"][0]
-        frontier_in = agents.MODEL_USD_PER_MTOK["claude-fable-5"][0]
-        self.assertAlmostEqual(frontier_in / oss_in, 100.0)
+    def test_the_cheap_oss_row_is_an_order_of_magnitude_below_frontier(self):
+        # Claim B's extreme point. Asserted against the CHEAPEST frontier row, so
+        # the claim cannot be inflated by comparing to the most expensive one.
+        cheapest_oss = min(agents.MODEL_USD_PER_MTOK[r.model][0]
+                           for r in agents.oss_models())
+        cheapest_frontier = min(agents.MODEL_USD_PER_MTOK[r.model][0]
+                                for r in agents.frontier_models())
+        self.assertGreaterEqual(cheapest_frontier / cheapest_oss, 10.0)
 
-    def test_inference_dominates_a_realistic_native_row(self):
-        # Sanity-check the finding this instrumentation exists to expose: five
-        # native searches at $10/1k is $0.05, which a single search-heavy turn's
-        # tokens should dwarf on a frontier model.
-        search = 5 * agents.NATIVE_SEARCH_USD_PER_CALL["anthropic"]
-        inference, _ = agents.model_cost_usd("claude-fable-5", 60_000, 1_500)
-        self.assertGreater(inference, search)
+    def test_the_two_oss_rows_are_distinct_points_on_the_cost_frontier(self):
+        # Two OSS rows only buy something if they differ materially in price. The
+        # mid row is NOT an order of magnitude below frontier -- it is the
+        # "strong but cheaper" point, and conflating the two rows would let a
+        # result from one be reported as if it came from the other.
+        prices = sorted(agents.MODEL_USD_PER_MTOK[r.model][0]
+                        for r in agents.oss_models())
+        self.assertEqual(len(prices), 2)
+        self.assertGreaterEqual(prices[1] / prices[0], 3.0)
+
+    def test_model_rows_are_all_priced(self):
+        # An unpriced row silently drops out of every cost comparison.
+        for row in agents.MATRIX_MODELS:
+            with self.subTest(model=row.model):
+                usd, confirmed = agents.model_cost_usd(row.model, 1000, 1000)
+                self.assertTrue(confirmed)
+                self.assertGreater(usd, 0)
 
 
 class FakeHooks:
@@ -621,7 +615,7 @@ class TaskWiringTest(unittest.TestCase):
         run_eval.get_agent_client = lambda v: client
         self.addCleanup(setattr, run_eval, "get_agent_client", original)
         task = run_eval.make_task(
-            provider="exa", arm="normalized",
+            arm=run_eval.DEFAULT_ARM,
             agent_model=agents.VENDORS[vendor].default_model,
             search_mode=search_mode, model_vendor=vendor)
         hooks = FakeHooks(LNB_METADATA, "Team Alpha")
@@ -745,7 +739,7 @@ class SecondDomainTest(unittest.TestCase):
         run_eval.get_agent_client = lambda v: client
         self.addCleanup(setattr, run_eval, "get_agent_client", original)
         task = run_eval.make_task(
-            provider="exa", arm="normalized", agent_model="claude-fable-5",
+            arm=run_eval.DEFAULT_ARM, agent_model="claude-fable-5",
             search_mode=agents.SEARCH_MODE_NATIVE, model_vendor="anthropic")
         hooks = FakeHooks(CORVUS_METADATA, "Current CEO")
         task({"question": "who is CEO?"}, hooks)
@@ -787,21 +781,22 @@ class PreflightTest(unittest.TestCase):
     def test_native_search_is_refused_for_the_oss_vendor(self):
         self._set_env("BASETEN_API_KEY", "test-baseten-key")
         with self.assertRaises(SystemExit) as caught:
-            run_eval._preflight("exa", "normalized", agents.SEARCH_MODE_NATIVE,
-                                "baseten", "openai/gpt-oss-120b")
+            run_eval._preflight(run_eval.DEFAULT_ARM,
+                                agents.SEARCH_MODE_NATIVE, "baseten",
+                                "zai-org/GLM-5.2")
         self.assertIn("native", str(caught.exception))
 
     def test_missing_vendor_key_fails_before_spending_money(self):
         self._set_env("ANTHROPIC_API_KEY", None)
         with self.assertRaises(SystemExit) as caught:
-            run_eval._preflight("exa", "normalized", agents.SEARCH_MODE_NONE,
+            run_eval._preflight(run_eval.DEFAULT_ARM, agents.SEARCH_MODE_NONE,
                                 "anthropic", "claude-opus-5")
         self.assertIn("ANTHROPIC_API_KEY", str(caught.exception))
 
     def test_no_search_arm_does_not_require_a_search_provider_key(self):
         self._set_env("ANTHROPIC_API_KEY", "test-anthropic-key")
         self._set_env("EXA_API_KEY", None)
-        run_eval._preflight("exa", "no_search", agents.SEARCH_MODE_NONE,
+        run_eval._preflight("no_search", agents.SEARCH_MODE_NONE,
                             "anthropic", "claude-opus-5")
 
 

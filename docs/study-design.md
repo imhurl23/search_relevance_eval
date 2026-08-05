@@ -1,6 +1,6 @@
 # Study design
 
-Written before the runs. The point of committing this first is that the 23
+Written before the runs. The point of committing this first is that the 22
 conditions then execute against stated hypotheses, instead of producing a table
 that gets interpreted afterwards — which is where a leaderboard comes from.
 
@@ -87,11 +87,11 @@ mediators, not decoration:
 alongside it, and check whether the mediator gap has the sign and magnitude to
 account for the accuracy gap.
 
-**Scope limit, stated up front.** Mediation is **complete across the three
-independent APIs** (all six mediators computable on the `full` surface) and
-**partial for native-vs-harness**: Anthropic native kills the four
-snippet-derived mediators, OpenAI native kills those plus `temporal_grounding`.
-So lead with mechanism across APIs; carry native as a bounded comparison.
+**Scope limit, stated up front.** Mediation is **complete across the four You.com
+setups** (all six mediators computable on the `full` surface) and **partial for
+native-vs-harness**: Anthropic native kills the four snippet-derived mediators,
+OpenAI native kills those plus `temporal_grounding`. So lead with mechanism across
+setups; carry native as a bounded comparison.
 
 ---
 
@@ -110,7 +110,7 @@ publishes this, and it falls out of instrumentation already built.
 
 ## Design
 
-Two treatment axes, 23 conditions, per README "The test matrix". Two domains,
+Two treatment axes, 22 conditions, per README "The test matrix". Two domains,
 because a retrieval effect measured in one domain is a single-domain result — it
 can be substantial in one and absent in another:
 
@@ -131,14 +131,20 @@ family-wise error and a reviewer stops there.
 
 **Primary (4).** Holm-corrected across this family:
 
-1. `harness` − `none`, within each model *(Claim A)*
-2. `oss × harness` − `frontier × none` *(Claim B)*
-3. `native` − `harness(exa)`, within each frontier vendor *(the native question)*
-4. `harness(exa)` − `harness(parallel|youdotcom)`, pooled *(does "independent API
-   beats native" depend on which API)*
+1. `harness(normalized)` − `none`, within each model *(Claim A)*
+2. `oss × harness(best setup)` − `frontier × none` *(Claim B)*
+3. `native` − `harness(normalized)`, within each frontier vendor *(the native
+   question)*
+4. `harness(native_fresh)` − `harness(normalized)`, pooled across models *(does
+   the freshness filter help at all)*
 
-**Exploratory, reported without inference.** Everything else: freshness treatment
-(`normalized` vs `native_fresh`), the six mediators, per-category and
+Contrast 4 replaces what was a cross-API robustness check. With one search API
+there is no such check available, which is exactly why the claim narrows — see
+below.
+
+**Exploratory, reported without inference.** Everything else: the remaining setup
+contrasts (`fresh_week` vs `native_fresh` for window width, `wide` vs
+`normalized` for surface size), the six mediators, per-category and
 per-`recency_rung` breakdowns, cross-vendor comparisons.
 
 **Never reported as a contrast:** `native-openai` vs `native-anthropic` — two
@@ -150,8 +156,12 @@ variables (model and search implementation).
   `dataset_version`. Unpaired rows are dropped, and the drop count is reported.
 - **No pooling across `benchmark_category`.** The pooled mean is a summary of the
   breakdown, never the result.
-- **No pooling across `date_field_semantics`.** Exa/Parallel report publication
-  dates; You.com and Anthropic native report last-modified. Different constructs.
+- **Freshness rests on `recency_rung`, not on provider dates.** No search layer
+  reports a true publication date — You.com and Anthropic native both report
+  last-modified, OpenAI native reports nothing. `temporal_grounding` is retained
+  as a last-modified metric and labelled as such; the freshness claim uses
+  Corvus-QA's `recency_rung`, which is dataset ground truth about when the fact
+  changed.
 - **Exclusions**, reported as counts and rates per arm, never silently:
   - `zero_search_row` — tool available, never used. Excluded from search-arm
     accuracy; reported separately, because an OSS tool-calling failure and a
@@ -173,10 +183,16 @@ variables (model and search implementation).
 Carried from README "Remaining gaps" — these are the ones that bound the claims
 above, not the full list:
 
-1. The native-vs-harness contrast varies the prompt by one sentence. Bounded, not
+1. **One search API means one narrower claim.** Nothing here separates "You.com
+   beats native search" from "independent APIs beat native search." The finding
+   is about You.com specifically, and no contrast in this design can widen it.
+2. The native-vs-harness contrast varies the prompt by one sentence. Bounded, not
    eliminated; no prompt-only control arm is built.
-2. The OpenAI native arm is not held to the 5-search budget (no `max_uses`).
-3. `--trials 3` has no power analysis behind it. The variance envelope above is
+3. The OpenAI native arm is not held to the 5-search budget (no `max_uses`).
+4. No search layer reports a true publication date, so `temporal_grounding`
+   measures last-modified throughout.
+5. `--trials 3` has no power analysis behind it. The variance envelope above is
    the mitigation, and it may show 3 is insufficient.
-4. No adapter has run against a live API. Nothing in this document is validated
-   until a smoke run resolves that.
+6. No adapter has run against a live API. Nothing in this document is validated
+   until a smoke run resolves that. The Baseten OSS rows are also unverified for
+   `temperature` acceptance and tool-calling reliability.

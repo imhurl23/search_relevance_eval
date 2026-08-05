@@ -1,51 +1,63 @@
-"""Starter Braintrust harness for web-search API x LLM freshness experiments.
+"""Braintrust harness for a You.com-vs-native-search freshness study.
 
-Two treatment axes, defined in agents.py and selected on the command line:
+Two treatment axes, selected on the command line:
 
     --model-vendor   baseten (OSS) | openai (frontier) | anthropic (frontier)
-    --search-mode    none (parametric) | harness (our tool) | native (vendor's own)
+    --agent-model    which model within that vendor; see agents.MATRIX_MODELS
+    --search-mode    none (parametric) | harness (You.com) | native (vendor's own)
+    --arm            the You.com setup, for --search-mode harness
 
-Within one condition block everything else is frozen (model snapshot, prompt,
-tool contract, and budget). Sampling is the one thing that cannot be frozen
-across vendors — Claude Opus 5 rejects temperature/top_p/top_k, and Baseten does
-not document seed support — so each run records what it actually sent rather than
-implying parity.
+You.com is the only search API, which makes the SETUP the harness treatment
+rather than the provider. One consequence to carry into any writeup: nothing in
+this design separates "You.com beats native search" from "independent APIs beat
+native search."
+
+Within a condition the prompt, tool contract, snippet budget, and search budget
+are frozen. Sampling is NOT frozen and cannot be: both frontier vendors reject
+sampling parameters outright and no vendor here supports `seed`, so only the OSS
+arm pins temperature. Each run records what it actually sent (`sampling_params`,
+`sampling_pinned`) rather than implying parity.
 
 Braintrust-native throughout:
 
-  * reads a versioned LiveNewsBench or RetrievalQA dataset from the project
-    named by BRAINTRUST_PROJECT_ID; real comparisons require a pinned version
-  * agent LLM calls auto-traced via wrap_openai
+  * reads a versioned dataset from the project named by BRAINTRUST_PROJECT_ID;
+    real comparisons require a pinned version
+  * agent LLM calls auto-traced via wrap_openai / wrap_anthropic
   * every approved search is a `tool` span with native metrics; raw provider
     payloads are never retained
-  * trial_count for retrieval nondeterminism (temp 0 doesn't freeze the web)
+  * per-row search_cost_usd, model_cost_usd, total_cost_usd, and latency_s,
+    because search fees are the small half of the bill
+  * trial_count for retrieval nondeterminism (the web is not frozen by anything
+    we control)
 
 Dataset contract (set by the importers, consumed by scorers.py):
     input    = {"question": str}
     expected = answer string or list of acceptable answer strings
     metadata = upstream row fields (link, articles, event_date, ...) plus
-               livenewsbench_release / livenewsbench_split / source_commit
+               importer provenance; Corvus-QA adds recency_rung / coverage_tier
 Leakage excludes and temporal grounding both read from metadata, not expected.
 
 Usage:
-    # .env supplies BRAINTRUST_API_KEY + BRAINTRUST_PROJECT_ID and always wins
-    # All credentials must be in .env; ambient credentials are ignored.
+    # .env supplies BRAINTRUST_API_KEY + BRAINTRUST_PROJECT_ID and always wins.
+    # All credentials come from .env; ambient credentials are ignored.
 
-    # dataset push lives in import_livenewsbench.py, not here:
+    # dataset push lives in the importers, not here:
     python import_livenewsbench.py <datasets_root> --source-commit <sha>
 
     # one command per matrix cell; interleave them in time, don't run days apart
     python run_eval.py run --model-vendor openai --search-mode harness \
-      --provider exa --arm native_fresh \
+      --arm native_fresh \
       --dataset-version <xact-id> --study-id matrix-v1 --trials 3
     python run_eval.py run --model-vendor openai --search-mode native \
       --dataset-version <xact-id> --study-id matrix-v1 --trials 3
-    python run_eval.py run --model-vendor baseten --search-mode none \
+    python run_eval.py run --model-vendor baseten \
+      --agent-model deepseek-ai/DeepSeek-V4-Flash-0731 --search-mode none \
       --dataset-version <xact-id> --study-id matrix-v1 --trials 3
 
 Native search is only attributable WITHIN a vendor: run each frontier vendor's
-none/harness/native arms together, and compare its native arm to its own harness
-arm — not to the other vendor's. See README "The test matrix".
+none/harness/native arms together and compare its native arm to its own harness
+arm, never to the other vendor's. Full matrix and the contrasts it supports:
+README "The test matrix" and docs/study-design.md.
 """
 
 from __future__ import annotations
@@ -84,8 +96,6 @@ RUNTIME_ENV_NAMES = (
     "OPENAI_API_KEY",
     "ANTHROPIC_API_KEY",
     "BASETEN_API_KEY",
-    "EXA_API_KEY",
-    "PARALLEL_API_KEY",
     "YDC_API_KEY",
     "JUDGE_API_KEY",
 )
@@ -118,31 +128,50 @@ def load_runtime_env(env_path: Path) -> tuple[str, str]:
 DEFAULT_MODEL_VENDOR = "openai"
 AGENT_MODEL = VENDORS[DEFAULT_MODEL_VENDOR].default_model
 MAX_SEARCHES, MAX_CLICKS = 5, 0
-SNIPPET_CHARS = 400                    # normalized-arm snippet truncation
-N_RESULTS = 8
+SNIPPET_CHARS = 400                    # snippet truncation, constant across setups
+N_RESULTS = 8                          # default result count; `wide` overrides it
 
-# Exa search tier. Their default is "auto", which routes per query — pinning it
-# keeps the retrieval tier a declared experiment condition. Documented values:
-# instant | fast | auto | deep-lite | deep | deep-reasoning.
-EXA_SEARCH_TYPE = "auto"
-# Exa content freshness. maxAgeHours REPLACED the livecrawl string parameter
-# (Feb 2026): positive N serves cache younger than N hours and livecrawls
-# otherwise, 0 always livecrawls, -1 is cache-only, omitted livecrawls only when
-# no cache exists. Accepts -1..720. 24 = the declared "fresh within a day" arm.
-EXA_MAX_AGE_HOURS = 24
-# Exa's documented default is 10000 ms, max 90000. Pinned so a livecrawl stall
-# is a declared condition, and kept under the 30 s client timeout in _http.
-EXA_LIVECRAWL_TIMEOUT_MS = 10_000
-# Exa caps includeDomains + excludeDomains at 1200 items each.
-EXA_MAX_DOMAINS = 1200
-# Parallel's GA Search API modes are turbo | basic | advanced. Pin one mode for
-# both arms so freshness is the only treatment that changes.
-PARALLEL_MODE = "basic"
-# Match Exa's one-day cache-age treatment. This controls content fetch age, not
-# publication date, so it is closer to Exa's maxAgeHours than after_date is.
-PARALLEL_MAX_AGE_SECONDS = 24 * 60 * 60
-# Combined include_domains + exclude_domains ceiling in a Parallel source_policy.
-PARALLEL_MAX_DOMAINS = 200
+# ---------------------------------------------------------------------------
+# You.com setups — the harness treatment axis.
+#
+# You.com is the only search API here. That makes the SETUP the treatment: each
+# entry below is one declared retrieval configuration, and `--arm` selects it.
+# Everything not named in a setup is held constant (snippet budget, exclusion
+# list, search budget), so a difference between two setups is attributable to the
+# parameters that differ.
+#
+# Because there is one API, no result here can distinguish "You.com beats native"
+# from "independent APIs beat native" — see docs/study-design.md.
+#
+# Documented parameters (you.com/docs/api-reference/search, checked 2026-07-30):
+#   count      results per call, does NOT affect price
+#   freshness  day | week | month | year | YYYY-MM-DDtoYYYY-MM-DD
+# `freshness` is never derived from a row's event_date — that would leak the
+# label into retrieval.
+# ---------------------------------------------------------------------------
+
+YDC_SETUPS: dict[str, dict] = {
+    # Baseline: no freshness filter, so the index decides recency on its own.
+    "normalized": {"count": N_RESULTS, "freshness": None},
+    # The declared one-day freshness treatment.
+    "native_fresh": {"count": N_RESULTS, "freshness": "day"},
+    # Does the WIDTH of the freshness window matter, or just its presence? A
+    # one-day filter can starve a query whose coverage lags by 48 hours.
+    "fresh_week": {"count": N_RESULTS, "freshness": "week"},
+    # A bigger decision surface at identical cost: You.com bills per call
+    # independent of `count`, so if 20 results beat 8 that is a free win. Tests
+    # whether the 8-result default was leaving recall on the table.
+    "wide": {"count": 20, "freshness": None},
+}
+DEFAULT_ARM = "normalized"
+
+
+def ydc_setup(arm: str) -> dict:
+    try:
+        return YDC_SETUPS[arm]
+    except KeyError:
+        raise SystemExit(
+            f"unknown --arm {arm!r}; expected one of {sorted(YDC_SETUPS)}") from None
 
 FROZEN_SYSTEM_PROMPT = """\
 You are a web research agent answering a time-sensitive factual question. You have one tool:
@@ -186,48 +215,31 @@ PROMPT_VERSIONS = {
 # translated per wire protocol, so the OpenAI and Anthropic harness arms cannot
 # drift into offering subtly different tools.
 
-# Search pricing (USD) for native cost metrics. A flat per-call constant is
-# wrong for any vendor that bills content per page, so each entry carries three
-# documented terms and search_cost_usd() applies them to the results actually
-# returned.
+# You.com search pricing (https://you.com/docs/api-reference/search, checked
+# 2026-07-30): $5.00 per 1,000 calls, independent of `count`.
 #
-# Exa (https://exa.ai/docs/reference/pricing, checked 2026-07-30):
-#   $7/1k requests for instant|fast|auto covering the first 10 results,
-#   +$1/1k results beyond 10, +$1/1k pages PER CONTENT TYPE. We request one
-#   content type (highlights), so 8 results add $0.008 — the old flat $0.005
-#   understated an Exa call by roughly 3x. Livecrawling via maxAgeHours is not
-#   billed separately from the content charge.
-# You.com (https://you.com/docs/api-reference/search, checked 2026-07-30):
-#   $5.00/1k calls, independent of `count`. livecrawl would add $1/1k pages,
-#   and we leave it off in both arms.
-# Parallel (https://docs.parallel.ai/getting-started/pricing, checked 2026-08-05):
-#   basic/advanced are $5/1k requests for the first 10 results, plus $1/1k for
-#   each additional result and excerpt. This harness requests only 8 results.
-SEARCH_PRICING = {
-    ("exa", "normalized"):         {"per_call": 0.007, "per_result_content": 0.001, "per_result_over_10": 0.001},
-    ("exa", "native_fresh"):       {"per_call": 0.007, "per_result_content": 0.001, "per_result_over_10": 0.001},
-    ("parallel", "normalized"):    {"per_call": 0.005, "per_result_content": 0.0,   "per_result_over_10": 0.001},
-    ("parallel", "native_fresh"):  {"per_call": 0.005, "per_result_content": 0.0,   "per_result_over_10": 0.001},
-    ("youdotcom", "normalized"):   {"per_call": 0.005, "per_result_content": 0.0,   "per_result_over_10": 0.0},
-    ("youdotcom", "native_fresh"): {"per_call": 0.005, "per_result_content": 0.0,   "per_result_over_10": 0.0},
-}
+# That independence is a load-bearing fact, not trivia: it means the `wide` setup
+# returns 20 results for the price of 8, so a recall gain there is free. It also
+# means search spend across the harness setups is identical, which isolates the
+# cost comparison to the native arms and the model tokens.
+#
+# livecrawl would add $1/1k pages and is left off in every setup: it populates
+# `result.contents`, not the `snippets` field the decision surface is built from,
+# so enabling it would add latency and cost without changing what is measured.
+YDC_USD_PER_CALL = 0.005
+
+SEARCH_PROVIDER = "youdotcom"
+SEARCH_PROVIDER_KEY = "YDC_API_KEY"
 
 
-def search_cost_usd(provider: str, arm: str, n_results: int) -> float:
-    """Documented per-call price plus per-page content charges."""
-    rate = SEARCH_PRICING.get((provider, arm))
-    if rate is None:
-        return 0.0
-    return (rate["per_call"]
-            + n_results * rate["per_result_content"]
-            + max(0, n_results - 10) * rate["per_result_over_10"])
+def search_cost_usd(arm: str, n_results: int) -> float:
+    """You.com bills per call, so the result count does not enter the price."""
+    del arm, n_results  # documented to be price-irrelevant; kept for call-site clarity
+    return YDC_USD_PER_CALL
+
 
 ARCHIVE_EXCLUDES = ["web.archive.org", "archive.org", "archive.is",
                     "archive.ph", "archive.today"]
-
-# Env var each provider adapter reads, for preflight validation.
-PROVIDER_KEYS = {"exa": "EXA_API_KEY", "parallel": "PARALLEL_API_KEY",
-                 "youdotcom": "YDC_API_KEY"}
 
 
 def _tok(text: str) -> int:
@@ -280,7 +292,7 @@ _provider_limiters: dict[str, SharedHostLimiter] = {}
 def _provider_json(method: str, url: str, **kwargs):
     """Conservative serial provider request with bounded retry/backoff."""
     host = (urlparse(url).hostname or "").lower()
-    approved_hosts = {"api.exa.ai", "api.parallel.ai", "ydc-index.io"}
+    approved_hosts = {"ydc-index.io"}
     if host not in approved_hosts:
         raise ValueError(f"unapproved provider API host: {host!r}")
     limiter = _provider_limiters.setdefault(
@@ -307,89 +319,6 @@ def _provider_json(method: str, url: str, **kwargs):
     raise AssertionError("unreachable")
 
 
-def exa_search(query: str, arm: str, exclude_domains: list[str]):
-    body = {
-        # `type` defaults to "auto", which routes per query and is therefore NOT
-        # frozen across runs. Pinned here so the search tier is a declared
-        # condition; "fast"/"deep" are the other reproducible choices.
-        "type": EXA_SEARCH_TYPE,
-        "query": query,
-        "numResults": N_RESULTS,
-        "category": "news",
-        "excludeDomains": exclude_domains[:EXA_MAX_DOMAINS],
-        # numSentences/highlightsPerUrl are deprecated; maxCharacters is current
-        # and matches the SNIPPET_CHARS budget enforced below.
-        "contents": {"highlights": {"maxCharacters": SNIPPET_CHARS}},
-    }
-    if arm == "native_fresh":
-        # The whole `livecrawl` string parameter is deprecated in favor of
-        # maxAgeHours, not just its "preferred" value. Sending both was also
-        # self-contradictory: livecrawl="always" says never use cache while
-        # maxAgeHours=24 accepts cache up to a day old. maxAgeHours alone is the
-        # documented way to express this arm's treatment.
-        body["contents"]["maxAgeHours"] = EXA_MAX_AGE_HOURS
-        body["contents"]["livecrawlTimeout"] = EXA_LIVECRAWL_TIMEOUT_MS
-    raw = _provider_json(
-        "POST",
-        "https://api.exa.ai/search",
-        json=body,
-        headers={"x-api-key": os.environ["EXA_API_KEY"]},
-    )
-    results = []
-    for i, res in enumerate(raw.get("results", []), start=1):
-        highlights = res.get("highlights") or []
-        results.append({
-            "rank": i,
-            "url": res.get("url", ""),
-            "title": res.get("title") or "",
-            "snippet": (highlights[0] if highlights else res.get("text", "") or "")[:SNIPPET_CHARS],
-            "published_date": res.get("publishedDate"),
-        })
-    return results, raw
-
-
-def parallel_search(query: str, arm: str, exclude_domains: list[str]):
-    advanced_settings = {
-        # Keep the decision surface and result count identical across vendors.
-        "excerpt_settings": {"max_chars_per_result": SNIPPET_CHARS},
-        "max_results": N_RESULTS,
-        # Ceiling is 200 combined include+exclude domains. exclude_domains is
-        # source-first, so any truncation drops archive mirrors, not gold sources.
-        "source_policy": {
-            "exclude_domains": exclude_domains[:PARALLEL_MAX_DOMAINS]},
-    }
-    if arm == "native_fresh":
-        advanced_settings["fetch_policy"] = {
-            "max_age_seconds": PARALLEL_MAX_AGE_SECONDS}
-    body = {
-        "objective": query,
-        "search_queries": [query[:200]],
-        "mode": PARALLEL_MODE,
-        "advanced_settings": advanced_settings,
-    }
-    raw = _provider_json(
-        "POST",
-        "https://api.parallel.ai/v1/search",
-        json=body,
-        headers={
-            "x-api-key": os.environ["PARALLEL_API_KEY"],
-            "content-type": "application/json",
-        },
-    )
-    results = []
-    for i, res in enumerate(raw.get("results", []), start=1):
-        excerpts = res.get("excerpts") or []
-        snippet = " ".join(excerpts)[:SNIPPET_CHARS]
-        results.append({
-            "rank": i,
-            "url": res.get("url", ""),
-            "title": res.get("title") or "",
-            "snippet": snippet,
-            "published_date": res.get("publish_date"),
-        })
-    return results, raw
-
-
 def youdotcom_search(query: str, arm: str, exclude_domains: list[str]):
     # GET https://ydc-index.io/v1/search — the documented base host is
     # ydc-index.io (no api. prefix), and GET is the only shape You.com publishes
@@ -399,17 +328,15 @@ def youdotcom_search(query: str, arm: str, exclude_domains: list[str]):
     # is a handful of domains, so GET stays well inside the documented path.
     # exclude_domains is one comma-separated string and is mutually exclusive
     # with include_domains (sending both returns 422).
-    params = {"query": query, "count": N_RESULTS}
+    setup = ydc_setup(arm)
+    params = {"query": query, "count": setup["count"]}
     if exclude_domains:
         # Omit rather than send an empty string, which is not a documented value.
         params["exclude_domains"] = ",".join(exclude_domains)
-    if arm == "native_fresh":
-        # day|week|month|year or YYYY-MM-DDtoYYYY-MM-DD. Use one day to match
-        # the declared 24-hour treatment; never derive this from event_date.
-        params["freshness"] = "day"
-        # NB: You.com also exposes a `livecrawl` param, but it only populates
-        # result.contents — it would not change the snippet decision surface we
-        # measure, so enabling it would add latency and $1/1k pages for no signal.
+    if setup["freshness"] is not None:
+        # day|week|month|year or YYYY-MM-DDtoYYYY-MM-DD. Never derived from a
+        # row's event_date, which would leak the label into retrieval.
+        params["freshness"] = setup["freshness"]
     raw = _provider_json(
         "GET",
         "https://ydc-index.io/v1/search",
@@ -424,7 +351,7 @@ def youdotcom_search(query: str, arm: str, exclude_domains: list[str]):
         },
     )
     # results.web[] carries `snippets`; results.news[] does not, so web is the
-    # only shape comparable to the other providers' snippets.
+    # only shape that yields a snippet layer at all.
     hits = (raw.get("results") or {}).get("web") or []
     results = []
     for i, res in enumerate(hits, start=1):
@@ -441,19 +368,9 @@ def youdotcom_search(query: str, arm: str, exclude_domains: list[str]):
     return results, raw
 
 
-PROVIDERS = {"exa": exa_search, "parallel": parallel_search,
-             "youdotcom": youdotcom_search}
-
-
-def _provider_request_id(provider: str, raw: dict) -> str | None:
-    """Return each vendor's safe correlation ID without retaining raw payloads."""
-    if provider == "exa":
-        return raw.get("requestId")
-    if provider == "parallel":
-        return raw.get("search_id")
-    if provider == "youdotcom":
-        return (raw.get("metadata") or {}).get("search_uuid")
-    return None
+def _provider_request_id(raw: dict) -> str | None:
+    """You.com's safe correlation ID, without retaining the raw payload."""
+    return (raw.get("metadata") or {}).get("search_uuid")
 
 
 # ---------------------------------------------------------------------------
@@ -463,25 +380,33 @@ def _provider_request_id(provider: str, raw: dict) -> str | None:
 # ---------------------------------------------------------------------------
 
 @traced(type="tool", name="search_web", notrace_io=True)
-def run_search(provider: str, arm: str, query: str, exclude_domains: list[str]):
+def run_search(arm: str, query: str, exclude_domains: list[str]):
+    setup = ydc_setup(arm)
     t0 = time.perf_counter()
-    results, raw = PROVIDERS[provider](query, arm, exclude_domains)
+    results, raw = youdotcom_search(query, arm, exclude_domains)
     latency = time.perf_counter() - t0
     rendered = "\n".join(
         f"[{r['rank']}] {r['title']}\n    {r['url']}\n    "
         f"published: {r['published_date'] or 'unknown'}\n    {r['snippet']}"
         for r in results) or "No results."
     current_span().log(
-        input={"query": query, "provider": provider, "arm": arm,
+        input={"query": query, "provider": SEARCH_PROVIDER, "arm": arm,
                "exclude_domains": exclude_domains},
         output=results,
-        metadata={"provider": provider, "arm": arm,
-                  "provider_request_id": _provider_request_id(provider, raw),
+        metadata={"provider": SEARCH_PROVIDER, "arm": arm,
+                  # The setup's resolved parameters, so a span is interpretable
+                  # without cross-referencing YDC_SETUPS at the run's commit.
+                  "ydc_count": setup["count"],
+                  "ydc_freshness": setup["freshness"],
+                  "provider_request_id": _provider_request_id(raw),
                   "raw_payload_retained": False},
         metrics={"tokens": _tok(rendered),
                  "latency_s": latency,
-                 "search_cost_usd": search_cost_usd(provider, arm, len(results)),
-                 "n_results": len(results)},
+                 "search_cost_usd": search_cost_usd(arm, len(results)),
+                 "n_results": len(results),
+                 # Requested vs returned: You.com can return fewer than `count`,
+                 # and on the `wide` setup a shortfall is the finding, not noise.
+                 "n_results_requested": setup["count"]},
     )
     return results, rendered, _tok(rendered)
 
@@ -511,8 +436,7 @@ def _system_prompt_for(search_mode: str) -> str:
     return FROZEN_SYSTEM_PROMPT
 
 
-def condition_label(search_mode: str, provider: str, arm: str,
-                    model_vendor: str) -> str:
+def condition_label(search_mode: str, arm: str, model_vendor: str) -> str:
     """One slug per matrix cell. Distinguishes the two collision-prone names:
     `arm=native_fresh` is a SEARCH VENDOR's freshness parameter, while
     `search_mode=native` is the MODEL vendor's own server-side search."""
@@ -520,11 +444,10 @@ def condition_label(search_mode: str, provider: str, arm: str,
         return "no_search"
     if search_mode == SEARCH_MODE_NATIVE:
         return f"native-{model_vendor}"
-    return f"harness-{provider}-{arm}"
+    return f"harness-{SEARCH_PROVIDER}-{arm}"
 
 
 def make_task(
-    provider: str,
     arm: str,
     agent_model: str = AGENT_MODEL,
     study_id: str = "freshness-v1",
@@ -535,7 +458,7 @@ def make_task(
 ):
     spec = vendor_of(model_vendor)
     system_prompt = _system_prompt_for(search_mode)
-    condition = condition_label(search_mode, provider, arm, model_vendor)
+    condition = condition_label(search_mode, arm, model_vendor)
     condition_id = f"{model_vendor}:{agent_model}::{condition}"
 
     def task(input: dict, hooks) -> dict:
@@ -574,8 +497,7 @@ def make_task(
                                   question, excludes)
         else:
             outcome = _run_harness(client, spec, agent_model, system_prompt,
-                                   question, excludes, provider, arm,
-                                   search_mode)
+                                   question, excludes, arm, search_mode)
         wall_clock_s = time.perf_counter() - t0
 
         surfaced = agents.surfaced_domains(outcome["trajectory"])
@@ -593,7 +515,7 @@ def make_task(
             "model_vendor": model_vendor,
             "search_mode": search_mode,
             "search_provider": (
-                provider if search_mode == SEARCH_MODE_HARNESS
+                SEARCH_PROVIDER if search_mode == SEARCH_MODE_HARNESS
                 else f"{model_vendor}_native" if search_mode == SEARCH_MODE_NATIVE
                 else "none"
             ),
@@ -603,9 +525,14 @@ def make_task(
                 arm if search_mode == SEARCH_MODE_HARNESS else None),
             # --- kept for continuity with runs made before the axes existed ---
             "provider": (
-                provider if search_mode == SEARCH_MODE_HARNESS else "none"
+                SEARCH_PROVIDER if search_mode == SEARCH_MODE_HARNESS else "none"
                 if search_mode == SEARCH_MODE_NONE else f"{model_vendor}_native"),
             "arm": arm,
+            # The resolved You.com setup, so a row is interpretable without
+            # reading YDC_SETUPS at the run's commit.
+            "ydc_setup": (
+                dict(ydc_setup(arm)) if search_mode == SEARCH_MODE_HARNESS
+                else None),
             "agent_model": agent_model,
             "study_id": study_id,
             "condition_id": condition_id,
@@ -714,7 +641,7 @@ def _blank_outcome(decision_surface: str) -> dict:
 
 
 def _run_harness(client, spec, agent_model, system_prompt, question, excludes,
-                 provider, arm, search_mode) -> dict:
+                 arm, search_mode) -> dict:
     """Tool-calling loop for the harness arm and the no-tool control arm.
 
     Identical driver for both: the control arm is this loop with the tool never
@@ -759,12 +686,12 @@ def _run_harness(client, spec, agent_model, system_prompt, question, excludes,
                     out["used_searches"] += 1
                     query = call["arguments"].get("query", "")
                     results, content, tok = run_search(
-                        provider, arm, query, excludes)
+                        arm, query, excludes)
                     # Accumulated per call, not searches x flat rate: Exa bills
                     # content per page returned, so two calls returning
                     # different result counts do not cost the same.
                     out["search_cost"] += search_cost_usd(
-                        provider, arm, len(results))
+                        arm, len(results))
                     out["trajectory"].append({
                         "type": "search", "query": query,
                         "tokens": tok, "results": results})
@@ -831,7 +758,7 @@ def _git_commit() -> str:
         return "unknown"
 
 
-def _preflight(provider: str, arm: str, search_mode: str, model_vendor: str,
+def _preflight(arm: str, search_mode: str, model_vendor: str,
                agent_model: str) -> None:
     """Fail before spending money, not on row 1 of N."""
     spec = vendor_of(model_vendor)
@@ -846,14 +773,13 @@ def _preflight(provider: str, arm: str, search_mode: str, model_vendor: str,
 
     needed = [spec.api_key_env]
     if search_mode == SEARCH_MODE_HARNESS:
-        needed.append(PROVIDER_KEYS[provider])
+        needed.append(SEARCH_PROVIDER_KEY)
     missing = [k for k in needed if not os.environ.get(k)]
     if missing:
         raise SystemExit(f"Missing env var(s): {', '.join(missing)}")
 
-    if search_mode == SEARCH_MODE_HARNESS and (provider, arm) not in SEARCH_PRICING:
-        raise SystemExit(f"No SEARCH_PRICING entry for ({provider}, {arm}); "
-                         "cost metrics would silently be $0.")
+    if search_mode == SEARCH_MODE_HARNESS:
+        ydc_setup(arm)  # raises, naming the valid setups, if the arm is unknown
 
     if search_mode == SEARCH_MODE_NATIVE:
         rate, confirmed = native_search_rate_usd(model_vendor, agent_model)
@@ -895,12 +821,12 @@ def build_judges(specs: list[str]):
     return judges
 
 
-def run(provider: str, arm: str, dataset_name: str, dataset_version: str | None,
+def run(arm: str, dataset_name: str, dataset_version: str | None,
         trials: int, judge_specs: list[str], agent_model: str, study_id: str,
         env_path: Path, search_mode: str = SEARCH_MODE_HARNESS,
         model_vendor: str = DEFAULT_MODEL_VENDOR):
     api_key, project_id = load_runtime_env(env_path)
-    _preflight(provider, arm, search_mode, model_vendor, agent_model)
+    _preflight(arm, search_mode, model_vendor, agent_model)
     spec = vendor_of(model_vendor)
 
     dataset = init_dataset(project_id=project_id, name=dataset_name,
@@ -925,24 +851,21 @@ def run(provider: str, arm: str, dataset_name: str, dataset_version: str | None,
               "decision_surface in the row metadata; compare only against this "
               "vendor's own harness and no_search arms.")
 
-    condition = condition_label(search_mode, provider, arm, model_vendor)
+    condition = condition_label(search_mode, arm, model_vendor)
     condition_id = f"{model_vendor}:{agent_model}::{condition}"
     model_slug = re.sub(r"[^a-zA-Z0-9_.-]+", "-", agent_model)
     experiment_name = f"{study_id}-{dataset.name}-{model_slug}-{condition}"
     native_rate, rate_confirmed = native_search_rate_usd(model_vendor, agent_model)
-    # Sampling parity is NOT achievable across vendors: Claude Opus 5 rejects
-    # temperature/top_p/top_k, and Baseten does not document seed support. Record
-    # what each arm received instead of implying a frozen sampling config.
+    # Sampling parity is NOT achievable across vendors: both frontier vendors
+    # reject sampling parameters outright and no vendor here supports `seed`.
+    # Record what each arm received instead of implying a frozen config.
     sampling = dict(spec.sampling)
-    if spec.seed_supported:
-        sampling["seed"] = agents.AGENT_SEED
 
     Eval(
         project_name,
         experiment_name=experiment_name,
         data=dataset,
         task=make_task(
-            provider,
             arm,
             agent_model,
             study_id,
@@ -960,16 +883,19 @@ def run(provider: str, arm: str, dataset_name: str, dataset_version: str | None,
             "model_vendor": model_vendor,
             "search_mode": search_mode,
             "search_provider": (
-                provider if search_mode == SEARCH_MODE_HARNESS
+                SEARCH_PROVIDER if search_mode == SEARCH_MODE_HARNESS
                 else f"{model_vendor}_native" if search_mode == SEARCH_MODE_NATIVE
                 else "none"),
             "freshness_treatment": (
                 arm if search_mode == SEARCH_MODE_HARNESS else None),
             # --- legacy field names, kept so older experiments still join ---
             "provider": (
-                provider if search_mode == SEARCH_MODE_HARNESS else "none"
+                SEARCH_PROVIDER if search_mode == SEARCH_MODE_HARNESS else "none"
                 if search_mode == SEARCH_MODE_NONE else f"{model_vendor}_native"),
             "arm": arm, "agent_model": agent_model,
+            "ydc_setup": (
+                dict(ydc_setup(arm)) if search_mode == SEARCH_MODE_HARNESS
+                else None),
             "study_id": study_id,
             "condition_id": condition_id,
             "judge_models": [m for _, m in judges],
@@ -996,31 +922,33 @@ def run(provider: str, arm: str, dataset_name: str, dataset_version: str | None,
                 agents.NATIVE_BUDGET_ENFORCED.get(model_vendor, False)
                 if search_mode == SEARCH_MODE_NATIVE
                 else search_mode == SEARCH_MODE_HARNESS),
-            # Publication date vs last-modified: two different constructs. Any
-            # freshness claim must not pool arms with different semantics here.
+            # Publication date vs last-modified: two different constructs. With
+            # Exa and Parallel removed, NO arm reports a true publication date —
+            # You.com's page_age and Anthropic native's page_age are both
+            # last-modified, and OpenAI native has no date field. The semantics
+            # are now uniform, which removes the pooling hazard but leaves
+            # temporal_grounding measuring "last touched" everywhere. Prefer
+            # Corvus-QA's recency_rung as the freshness variable; it is dataset
+            # ground truth about when the fact changed rather than vendor
+            # metadata. See docs/study-design.md.
             "date_field_semantics": agents.DATE_FIELD_SEMANTICS.get(
-                provider if search_mode == SEARCH_MODE_HARNESS
+                SEARCH_PROVIDER if search_mode == SEARCH_MODE_HARNESS
                 else f"{model_vendor}_native" if search_mode == SEARCH_MODE_NATIVE
                 else None),
             "snippet_chars": (
                 SNIPPET_CHARS if search_mode == SEARCH_MODE_HARNESS else None),
+            # Requested result count for this setup. Not a global constant any
+            # more: the `wide` setup varies it, which is the point of that arm.
             "n_results": (
-                N_RESULTS if search_mode == SEARCH_MODE_HARNESS else None),
-            "exa_search_type": EXA_SEARCH_TYPE,
-            "parallel_mode": PARALLEL_MODE,
-            # The freshness treatment each provider actually received, so a run
-            # is interpretable without reading the adapter source. Harness-only.
-            "exa_max_age_hours": (
-                EXA_MAX_AGE_HOURS
-                if (search_mode, provider, arm) == (
-                    SEARCH_MODE_HARNESS, "exa", "native_fresh") else None),
-            "parallel_max_age_seconds": (
-                PARALLEL_MAX_AGE_SECONDS
-                if (search_mode, provider, arm) == (
-                    SEARCH_MODE_HARNESS, "parallel", "native_fresh") else None),
+                ydc_setup(arm)["count"] if search_mode == SEARCH_MODE_HARNESS
+                else None),
             "youdotcom_freshness": (
-                "day" if (search_mode, provider, arm) == (
-                    SEARCH_MODE_HARNESS, "youdotcom", "native_fresh") else None),
+                ydc_setup(arm)["freshness"] if search_mode == SEARCH_MODE_HARNESS
+                else None),
+            "ydc_setup_name": (
+                arm if search_mode == SEARCH_MODE_HARNESS else None),
+            "ydc_usd_per_call": (
+                YDC_USD_PER_CALL if search_mode == SEARCH_MODE_HARNESS else None),
             # --- native-arm configuration, declared so the arm is reproducible ---
             "native_search_tool": (
                 agents.ANTHROPIC_WEB_SEARCH_TOOL_TYPE if (
@@ -1063,13 +991,14 @@ def main():
                    help="baseten = OSS models (OpenAI-compatible); openai and "
                         "anthropic = frontier, both of which support "
                         "--search-mode native.")
-    r.add_argument("--provider", choices=list(PROVIDERS), default="exa",
-                   help="Search API for --search-mode harness. Ignored "
-                        "otherwise.")
-    r.add_argument("--arm", default="normalized",
-                   choices=["normalized", "native_fresh", NO_SEARCH_ARM],
-                   help="Freshness treatment for --search-mode harness. "
-                        "no_search is a deprecated alias for "
+    r.add_argument("--arm", default=DEFAULT_ARM,
+                   choices=[*YDC_SETUPS, NO_SEARCH_ARM],
+                   help="You.com setup for --search-mode harness: "
+                        + "; ".join(
+                            f"{name} (count={cfg['count']}, "
+                            f"freshness={cfg['freshness'] or 'none'})"
+                            for name, cfg in YDC_SETUPS.items())
+                        + ". no_search is a deprecated alias for "
                         "--search-mode none.")
     r.add_argument("--dataset-name", default=DATASET_NAME)
     r.add_argument("--dataset-version", default=None,
@@ -1110,7 +1039,7 @@ def main():
             ap.error(f"--arm no_search conflicts with --search-mode "
                      f"{search_mode}; drop one")
         search_mode = SEARCH_MODE_NONE
-    if search_mode == SEARCH_MODE_NATIVE and args.arm != "normalized":
+    if search_mode == SEARCH_MODE_NATIVE and args.arm != DEFAULT_ARM:
         # native_fresh is a search-API parameter; there is no such knob on a
         # model vendor's server-side search, so accepting it would imply a
         # treatment that was never applied.
@@ -1119,7 +1048,7 @@ def main():
 
     agent_model = args.agent_model or VENDORS[args.model_vendor].default_model
     # gpt-4.1 default keeps parity with LiveNewsBench's published grading.
-    run(args.provider, args.arm, args.dataset_name, args.dataset_version,
+    run(args.arm, args.dataset_name, args.dataset_version,
         args.trials, args.judges or ["gpt-4.1"], agent_model,
         args.study_id, args.env_file, search_mode, args.model_vendor)
 

@@ -11,8 +11,8 @@ agent answers news questions across two treatment axes — the **model class**
 search tool over a search API, or the model vendor's own server-side search). The
 prompt, tool contract, search budget, and result normalization are held constant
 within a condition so differences can be attributed as closely as possible to the
-axis under test. See [The test matrix](#the-test-matrix) for the eight cells and
-for which comparisons the instrumentation actually supports.
+axis under test. See [The test matrix](#the-test-matrix) for the 22 runs and for which
+comparisons the instrumentation actually supports.
 
 Use the framework to define and test your own experiment:
 
@@ -28,9 +28,8 @@ Use the framework to define and test your own experiment:
 6. Compare answer quality alongside leakage, temporal grounding, retrieval
    diversity, latency, and cost—not accuracy alone.
 
-The current example compares LiveNewsBench and RetrievalQA across Exa,
-Parallel, and You.com. A first implementation of the event-sourced Corvus-QA
-pipeline is also included. The **Remaining gaps** and **Open decisions**
+The current example runs LiveNewsBench and Corvus-QA against four You.com
+setups, two frontier native-search arms, and a no-search parametric floor. The **Remaining gaps** and **Open decisions**
 sections below identify choices that must be resolved before treating results
 as publication-quality.
 
@@ -48,9 +47,9 @@ as publication-quality.
 
 - Agent: per-vendor pinned model (override with `--agent-model`), 5 searches and
   no arbitrary webpage fetching
-- Search APIs (`--search-mode harness`): `exa`, `parallel`, `youdotcom`
-- Freshness treatments (`--arm`, harness only): `normalized` (uniform snippet
-  budget), `native_fresh` (each vendor's own freshness knobs)
+- Search API (`--search-mode harness`): `youdotcom` only
+- You.com setups (`--arm`, harness only): `normalized`, `native_fresh` (day),
+  `fresh_week`, `wide` (20 results)
 - Datasets: `LiveNewsBench`, `RetrievalQA` — Braintrust, versioned with named
   snapshots; `Corvus-QA-dev` and `Corvus-QA-test` can be built and imported
   separately
@@ -111,13 +110,72 @@ rather than taken on faith.
 
 ## The test matrix
 
-Two independent axes, set by `--model-vendor` and `--search-mode`:
+Two axes: the **model** and the **search config**. You.com is the only search
+API, which makes the *setup* the treatment rather than the provider.
 
-| `model_class` | vendor | `none` | `harness` | `native` |
+**Models** (`--model-vendor`, `--agent-model`)
+
+| class | vendor | model | $/MTok in-out | native search |
 |---|---|---|---|---|
-| oss | `baseten` (`openai/gpt-oss-120b`) | ✅ | ✅ | ⛔ structurally unavailable |
-| frontier | `openai` (`gpt-5.6-sol`) | ✅ | ✅ | ✅ Responses `web_search` |
-| frontier | `anthropic` (`claude-fable-5`) | ✅ | ✅ | ✅ `web_search_20250305` |
+| oss | `baseten` | `deepseek-ai/DeepSeek-V4-Flash-0731` | $0.13 / $0.26 | ⛔ |
+| oss | `baseten` | `zai-org/GLM-5.2` | $1.40 / $4.40 | ⛔ |
+| frontier | `openai` | `gpt-5.6-sol` | $5 / $30 | ✅ Responses `web_search` |
+| frontier | `anthropic` | `claude-fable-5` | $10 / $50 | ✅ `web_search_20250305` |
+
+Two OSS rows, not one: a single open model cannot distinguish "retrieval
+substitutes for capability" from "this one model happens to be good at tool
+calling." They span the cost range on purpose — the Flash row is the extreme
+substitution point (38× below the cheapest frontier row), GLM-5.2 is the
+strong-but-cheaper point (3.6×). Baseten runs no search of its own, so its
+harness arms call You.com directly; the model only has to emit the tool call.
+
+**Search configs** (`--search-mode`, `--arm`)
+
+| # | mode | arm | You.com params | $/call |
+|---|---|---|---|---|
+| 1 | `none` | — | no tools, parametric memory | $0 |
+| 2 | `harness` | `normalized` | count=8, no freshness filter | $0.005 |
+| 3 | `harness` | `native_fresh` | count=8, `freshness=day` | $0.005 |
+| 4 | `harness` | `fresh_week` | count=8, `freshness=week` | $0.005 |
+| 5 | `harness` | `wide` | count=20, no freshness filter | $0.005 |
+| 6 | `native` | — | the model vendor's own server-side search | $0.010 |
+
+Snippet budget (400 chars), search budget (5), and the gold-source exclusion list
+are held constant across every setup, so a difference between setups is
+attributable to the parameters that differ.
+
+`wide` is free: You.com bills per call **independent of `count`**, so 20 results
+cost the same as 8. If it wins, that is recall the 8-result default was leaving
+on the table at no extra cost. All four harness setups cost identically, which
+isolates the cost comparison to the native arms and the model tokens.
+
+**22 runs**
+
+| | 1 none | 2 normalized | 3 fresh_day | 4 fresh_week | 5 wide | 6 native |
+|---|---|---|---|---|---|---|
+| DeepSeek-V4-Flash | ✅ | ✅ | ✅ | ✅ | ✅ | ⛔ |
+| GLM-5.2 | ✅ | ✅ | ✅ | ✅ | ✅ | ⛔ |
+| gpt-5.6-sol | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| claude-fable-5 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+
+```bash
+V=<xact-id>; S=matrix-v1; T=3
+run() { python run_eval.py run --dataset-version $V --study-id $S --trials $T "$@"; }
+
+for M in deepseek-ai/DeepSeek-V4-Flash-0731 zai-org/GLM-5.2; do
+  run --model-vendor baseten --agent-model $M --search-mode none
+  for ARM in normalized native_fresh fresh_week wide; do
+    run --model-vendor baseten --agent-model $M --search-mode harness --arm $ARM
+  done
+done
+for MV in openai anthropic; do
+  run --model-vendor $MV --search-mode none
+  for ARM in normalized native_fresh fresh_week wide; do
+    run --model-vendor $MV --search-mode harness --arm $ARM
+  done
+  run --model-vendor $MV --search-mode native
+done
+```
 
 Model IDs are pinned snapshots, not aliases: `gpt-5.6` is an alias for
 `gpt-5.6-sol` and will move.
@@ -126,54 +184,23 @@ Model IDs are pinned snapshots, not aliases: `gpt-5.6` is an alias for
 vendor-neutral capability tier. Matching on price pairs `gpt-5.6-sol` with
 `claude-opus-5` ($5/$30 vs $5/$25); matching on within-lineup position pairs sol
 with `claude-fable-5`, Anthropic's flagship ($10/$50). The two framings disagree,
-so the pairing is a declared choice, not a measurement.
+so the pairing is a declared choice, not a measurement. `claude-fable-5` is the
+default because flagship-vs-flagship is at least a definition both vendors
+publish, whereas a price match is an artifact of their margin decisions. It
+requires the org not be on zero data retention (every request 400s otherwise) and
+declines more often, which `model_refused` records.
 
-`claude-fable-5` is the default because flagship-vs-flagship is at least a
-definition both vendors publish, whereas a price match is an artifact of their
-margin decisions. It requires the org not be on zero data retention (every request
-400s otherwise) and declines more often, which `model_refused` records.
-`--agent-model claude-opus-5` is the cheaper alternative at about half the token
-cost.
+No primary contrast depends on that pairing — `native` vs `harness` and search vs
+`none` both hold the model fixed within a vendor, and cross-vendor native
+comparisons are ruled out. What it bounds is how far an oss-vs-frontier result
+generalizes: read that contrast as "vs *these* frontier models", not "vs frontier
+models".
 
-The pairing is tolerable because no primary contrast depends on it — `native` vs
-`harness` and search vs `none` both hold the model fixed within a vendor, and
-cross-vendor native comparisons are already ruled out. What it does bound is how
-far an oss-vs-frontier result generalizes: read that contrast as "vs *this*
-frontier model", not "vs frontier models".
+### One API means one narrower claim
 
-Eight cells. Three properties of this shape are load-bearing:
-
-**`native` is only attributable within a vendor.** If GPT gets native search and
-Claude gets the harness tool, model identity is confounded with search mode. So
-each frontier vendor runs all three modes, and its native arm is compared to its
-own harness and `none` arms — never across vendors.
-
-**Every model needs a `none` arm.** Without a parametric floor, a high
-native-search score cannot be separated from what the model already knew, and
-LiveNewsBench rows predating a model's cutoff are answerable with no search.
-
-**`--search-mode native` and `--arm native_fresh` are different things.**
-`native_fresh` is a *search API's* freshness parameter (Exa `maxAgeHours`, You.com
-`freshness=day`). `native` is the *model vendor's* own server-side search. The
-runner rejects combining them, and `condition_id` keeps them distinct.
-
-```bash
-# frontier, native search (per vendor)
-python run_eval.py run --model-vendor anthropic --search-mode native \
-  --dataset-version <xact-id> --study-id matrix-v1 --trials 3
-python run_eval.py run --model-vendor openai --search-mode native \
-  --dataset-version <xact-id> --study-id matrix-v1 --trials 3
-
-# frontier, harness search — same vendors, so native-vs-harness is attributable
-python run_eval.py run --model-vendor anthropic --search-mode harness \
-  --provider exa --arm native_fresh --dataset-version <xact-id> --study-id matrix-v1
-
-# OSS with and without search
-python run_eval.py run --model-vendor baseten --search-mode harness \
-  --provider exa --arm native_fresh --dataset-version <xact-id> --study-id matrix-v1
-python run_eval.py run --model-vendor baseten --search-mode none \
-  --dataset-version <xact-id> --study-id matrix-v1
-```
+With Exa and Parallel removed, nothing here can separate **"You.com beats native
+search"** from **"independent APIs beat native search."** The finding is about
+You.com specifically. Do not let it be written up as the general claim.
 
 ### What is not comparable across arms, and why
 
@@ -231,11 +258,12 @@ search-call spend plus separately-reported token spend, never as one number.
   `budget_economy` scores the observed count, which is what surfaces a violation,
   but the arm is not actually constrained. This is a live limitation on the
   native-vs-harness contrast within OpenAI.
-- **`date_field_semantics`** — `temporal_grounding` reads `published_date`, but
-  Exa/Parallel report true publication dates while You.com and Anthropic native
-  report *last-modified* (`page_age`). Those are different constructs: a
-  re-rendered page looks fresh without carrying new information. Freshness results
-  must not be pooled across the two semantics.
+- **`date_field_semantics`** — `temporal_grounding` reads `published_date`, but no
+  search layer here reports a true publication date: You.com's `page_age` and
+  Anthropic native's `page_age` are both last-modified, and OpenAI native has no
+  date field. Semantics are uniform, so nothing gets pooled wrongly — but the
+  construct measures "last touched," so prefer Corvus-QA's `recency_rung` for any
+  freshness claim.
 - **`prompt_version`** — the native arm's system prompt cannot describe a tool
   schema it does not own. Budget and answer format are held identical; the tool
   sentence differs, and that difference is declared.
@@ -604,11 +632,11 @@ Use one `study-id`, pinned dataset version, and agent model across every
 condition in a comparison. Interleave conditions in time—running them days
 apart makes the web itself a variable:
 
-Search-provider arms require the matching API key from `.env`. Generic webpage
-fetching remains disabled.
+Harness arms require `YDC_API_KEY` in `.env`; native arms require the model
+vendor's key. Generic webpage fetching remains disabled.
 
 ```bash
-python run_eval.py run --provider exa --arm native_fresh \
+python run_eval.py run --search-mode harness --arm native_fresh \
     --study-id july-freshness --dataset-version <snapshot-xact-id> --trials 3
 ```
 
@@ -630,7 +658,7 @@ To convene a cross-vendor judge jury instead of a single judge, repeat
 `--judge`. Use `model@base_url` with `JUDGE_API_KEY` for non-OpenAI routes:
 
 ```bash
-python run_eval.py run --provider exa --arm native_fresh \
+python run_eval.py run --search-mode harness --arm native_fresh \
     --judge gpt-4.1 --judge claude-sonnet-5@https://... --judge gemini-3-pro@https://...
 ```
 
@@ -662,15 +690,18 @@ metadata = upstream row fields (link, articles[], event_date, ...)
    per-result dates, so `temporal_grounding` — the repository's headline
    construct — is `None` for that entire arm. Freshness conclusions cover the
    harness arms and Anthropic native only.
-4. **Two date fields mean two different things.** Exa and Parallel report
-   publication dates; You.com and Anthropic native report last-modified. Rows
-   carry `date_field_semantics`; results must not be pooled across the two.
+4. **No search layer reports a true publication date.** You.com's `page_age`
+   and Anthropic native's `page_age` are both last-modified; OpenAI native has no
+   date field. Semantics are uniform, so there is no pooling hazard — but
+   `temporal_grounding` measures "last touched" everywhere, and a re-rendered page
+   looks fresh without carrying new information. Prefer Corvus-QA's
+   `recency_rung` as the freshness variable.
 5. **Judge and agent share a vendor on the OpenAI arms.** The default `gpt-4.1`
    judge cannot rule out self-preference when grading a `gpt-5.6-sol` agent, and
    that bias is confounded with the native-search treatment. Use a cross-vendor
    jury (`--judge` is repeatable, and `ANTHROPIC_API_KEY` is now configured) for
    any reported frontier comparison.
-6. **No multiplicity control across 23 conditions.** The analysis computes
+6. **No multiplicity control across 22 conditions.** The analysis computes
    paired effects per condition against one baseline; 22 contrasts inflate
    family-wise error. Pre-specify a small number of primary contrasts and label
    the rest exploratory.
@@ -716,97 +747,69 @@ conclusions. Settle them before publishing.
 
 ### Blocking
 
-**1. `native_fresh` uses aligned windows but different vendor semantics.**
+**1. One search API means one narrower claim.** Nothing here separates "You.com
+beats native search" from "independent APIs beat native search." Accept the
+narrower claim, or add a second API back and restore the cross-API contrast.
 
-| Provider | What `native_fresh` changes | Freshness? |
-|---|---|---|
-| Exa | `contents.maxAgeHours: 24` | Content cache age |
-| You.com | `freshness: "day"` | Publication recency |
-| Parallel | `advanced_settings.fetch_policy.max_age_seconds: 86400` | Content cache age |
+**2. No search layer reports a true publication date.** You.com's `page_age` and
+Anthropic native's `page_age` are both *last-modified*; OpenAI native has no date
+field. `temporal_grounding` therefore measures "last touched" everywhere, and a
+re-rendered page looks fresh without carrying new information. The recommended
+resolution is to make Corvus-QA's `recency_rung` the freshness variable — it is
+dataset ground truth about when the fact changed rather than vendor metadata.
+Decide which one the freshness claim rests on before running.
 
-All three now use a 24-hour setting, and Parallel stays on pinned `basic` mode in
-both arms. The treatment still is not identical: Exa and Parallel bound the age
-of fetched/indexed content, while You.com's `freshness` filters which results
-are eligible by publication recency. Exa or Parallel can therefore return an
-old article fetched recently; You.com cannot. Report this semantic limitation.
+**3. The OpenAI native arm is not held to the search budget.** Its hosted
+`web_search` publishes no `max_uses`, so `search_budget_enforced` is False there
+and only there. Violations are visible via `budget_economy`, but that one arm is
+genuinely less constrained than the other five.
 
-**2. The providers search different corpora.** Exa filters to
-`category: "news"`. Parallel has no category filter, so it searches the general
-web. You.com reads `results.web[]` because `results.news[]` returns no snippets
-at all. A provider can win or lose on corpus scope rather than retrieval quality.
-There is no clean fix, so choose which asymmetry to accept: drop Exa's news
-filter, keep it and document it, or limit the eval to what all three do the same
-way.
+**4. The native arms' prompt differs by one sentence.** A native prompt cannot
+describe a tool schema it does not own. Budget and answer format are held
+identical and `prompt_version` records which text ran, but the native-vs-harness
+contrast varies search mode *and* that sentence. A prompt-only control arm would
+bound it; it is not built.
 
 ### Important
 
-**3. Excerpt normalization removes a native Parallel advantage.**
-`SNIPPET_CHARS = 400` now applies to every provider in both arms, including
-Parallel's server-side excerpt setting and a client-side safety cap. This makes
-the agent decision surface equivalent, but it intentionally does not measure
-the value of Parallel's longer native excerpts.
+**5. The judge and the agent can share a vendor.** The default `gpt-4.1` judge
+cannot rule out self-preference when grading `gpt-5.6-sol`, and that bias is
+confounded with the native-search treatment. `--judge` is repeatable and
+`ANTHROPIC_API_KEY` is configured, so use a cross-vendor jury for any reported
+frontier comparison.
 
-**4. Exa's search tier is not frozen.** `type` defaults to `"auto"`, which routes
-per query. Now pinned as `EXA_SEARCH_TYPE = "auto"` — same behavior, but visible.
-Any of `instant`, `fast`, `deep-lite`, `deep`, or `deep-reasoning` would actually
-freeze it, at the cost of changing retrieval quality and — for the `deep` tiers —
-per-call price and latency.
+**6. Search pricing must be rechecked before publication.** `YDC_USD_PER_CALL`
+and `agents.NATIVE_SEARCH_USD_PER_CALL` were checked on 2026-08-05: You.com is
+$5/1k calls independent of `count`, and both native tools are $10/1k searches.
+`agents.MODEL_USD_PER_MTOK` uses list prices and deliberately ignores promotional
+rates. The OpenAI native rate assumes a reasoning model; a non-reasoning model
+routes through `web_search_preview` at $25/1k, which
+`native_search_rate_confirmed` flags.
 
-**5. The judge and the agent share a vendor.** The agent is `gpt-4o` and
-`--judge` defaults to `gpt-4.1`, which cannot rule out self-preference. Passing
-`--judge` several times convenes a majority-vote jury across vendors instead;
-every ballot and a `unanimous` flag land in row metadata. The default is still a
-single judge, because that is what keeps parity with LiveNewsBench's published
-numbers. Decide which one is authoritative for your headline — and note the
-deployed QA Answer Correctness scorer uses `openai/gpt-oss-120b`, a third answer
-to the same question. `qa_answer_match` needs no model at all, so its
-disagreement with the judge is worth reporting rather than smoothing over.
+**7. Some rows have no leakage ground truth.** `leakage_guard` is applicable only
+where a row carries gold source domains. LiveNewsBench rows that omit them and
+all RetrievalQA rows return `None` rather than a passing score. Report the
+applicable-row count alongside any leakage rate.
 
-**6. Search pricing must be rechecked before publication.** `SEARCH_PRICING` in
-[run_eval.py](run_eval.py) now carries three documented terms per
-`(provider, arm)` — per-call, per-result content, and per-result beyond 10 — and
-`search_cost_usd()` applies them to the results a call actually returned. Exa and
-You.com were checked against their pricing pages on 2026-07-30: Exa is $7/1k
-requests plus $1/1k pages *per content type*, so an 8-result call with highlights
-costs about $0.015, not the $0.005 previously recorded; You.com is $5/1k calls,
-not $0.004. Parallel was checked on 2026-08-05: pinned `basic` mode is $5/1k
-requests for the first 10 results plus $1/1k additional results, so both arms
-cost $0.005 at this harness's eight-result limit.
-`_tok()` estimates tokens as `chars / 4`; use tiktoken before publishing
-token-normalized numbers, including `token_discounted_gain`.
-
-**7. Domain exclusion works differently per vendor.** Exa takes an
-`excludeDomains` array, capped at 1200 items. Parallel's
-`source_policy.exclude_domains` covers subdomains automatically and caps at 200
-combined. You.com takes a comma-separated string, mutually exclusive with
-`include_domains` (sending both returns `422`); on `GET` it is bounded by URL
-length, and their docs point to `POST` for lists past a handful, up to 500. This
-eval sends well under that, so it stays on the fully documented `GET`. Apex-to-
-subdomain coverage is not uniform, so `leakage_guard` can fire for API reasons
-rather than retrieval behavior. Test it directly: one row per provider with the
-gold domain excluded, confirm zero leaks. The exclude list is ordered source
-domains first, so truncation drops archive mirrors rather than gold sources.
-
-**8. Some rows have no leakage ground truth.** Newer LiveNewsBench rows omit
-source URLs upstream. `leakage_guard` then checks archive domains only and
-reports `source_domain_available: false`. Either restrict to rows that have
-source URLs, or report the two subsets separately.
-
-**9. Item pairing needs a pinned dataset.** The runner now requires
-`--dataset-version` unless `--allow-latest` is explicitly supplied. Use the same
-snapshot and `--study-id` for every condition in a comparison.
+**8. Item pairing needs a pinned dataset.** The runner requires
+`--dataset-version` unless `--allow-latest` is passed. Keep it pinned: unpaired
+rows are dropped from every contrast, and the drop count is part of the result.
 
 ### Minor
 
-**10. `trial_count = 3` is thin.** Enough to show retrieval is nondeterministic,
-not enough for a good variance estimate. If run-to-run spread is part of the
-argument, raise it. Uncertainty itself is computed in the analysis layer, not by
-a scorer — see below.
+**9. `trial_count = 3` is thin.** Enough to show retrieval is nondeterministic,
+not enough to bound run-to-run variance. Compute the variance envelope before
+interpreting any effect — see [docs/study-design.md](docs/study-design.md).
+
+**10. Baseten sampling is unverified.** The OSS arm sends `temperature: 0`, which
+OpenAI-compatible serving stacks normally accept, but Baseten does not document
+per-model sampling support and both OSS rows are reasoning models. If a row 400s
+on `temperature`, that is the first thing to check.
 
 **11. RetrievalQA measures a different construct.** It runs through the same
-generic factual-question prompt and its list-valued answers are supported. It
-lacks LiveNewsBench event dates and leakage rules, so do not pool its rows into
-one "freshness" headline score. Report it as a separate domain.
+harness but its questions are not time-sensitive, so freshness treatments should
+not be expected to move it. Useful as a negative control, not as a freshness
+result.
 
 ## Scoring and analysis are separate layers
 
@@ -861,20 +864,18 @@ Not open questions. Listed so they do not get changed by accident.
 - Generic webpage fetching is disabled. Restoring it requires an explicit
   domain allowlist plus source-specific terms, robots, pacing, redirect, and
   retention controls.
-- You.com `livecrawl` stays off in `native_fresh`. It only fills
+- You.com `livecrawl` stays off in every setup. It only fills
   `result.contents`, which the agent never sees, so it would add latency and
   $1/1k pages without changing what is measured.
 - You.com requests send `Cache-Control: no-cache`. Their docs note `GET`
   responses are cacheable at CDN and proxy layers while `POST` responses are not,
   and freshness is the quantity under measurement.
-- Exa's freshness arm sends `contents.maxAgeHours` only. The `livecrawl` string
-  parameter is deprecated in favor of it as of February 2026, and sending both
-  was self-contradictory — `livecrawl: "always"` refuses cache while
-  `maxAgeHours: 24` accepts day-old cache.
-- Exa's `contents.livecrawlTimeout` is pinned at the documented 10 s default so a
-  crawl stall is a declared condition rather than an accident, and stays under
-  the 30 s client timeout.
-- No adapter derives dates from `event_date`, and queries avoid temporal words.
+- You.com setups vary only `count` and `freshness`. Every other parameter —
+  snippet budget, exclusion list, search budget — is held constant, so a setup
+  difference is attributable to the parameters that differ.
+- `count` does not affect You.com's price, so the `wide` setup's larger decision
+  surface is free. All four harness setups cost the same per call.
+- No setup derives dates from `event_date`, and queries avoid temporal words.
   You.com uses the broader of query-implied and parameter freshness, so a dated
   query would un-blind the arms.
 - Raw pre-normalization provider payloads are not retained in traces.
