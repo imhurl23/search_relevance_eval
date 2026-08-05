@@ -7,10 +7,16 @@ import argparse
 import fcntl
 import json
 import sys
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
-from corvus.compliance import REPOSITORY_ROOT
+from corvus.compliance import REPOSITORY_ROOT, sha256_file
+from corvus.section16 import (
+    OwnershipFilingRef,
+    Section16Adapter,
+    iter_submissions,
+    pair_item_502_with_ownership,
+)
 from corvus.sources import (
     SEC_BULK_SUBMISSIONS,
     EdgarFilingCandidate,
@@ -89,11 +95,59 @@ def main() -> int:
         default=5.0,
         help="Hard compressed-download ceiling; default 5 GiB.",
     )
+    bulk_parser.add_argument(
+        "--use-existing-archive",
+        action="store_true",
+        help=(
+            "Rescan the archive already at --archive instead of downloading. "
+            "Valid only for a window that ends on or before the archive's "
+            "collection date; later filings are not in it."
+        ),
+    )
 
     fetch_parser = subparsers.add_parser("edgar-fetch-filings")
     fetch_parser.add_argument("--candidates", type=Path, required=True)
     fetch_parser.add_argument("--output-dir", type=Path, required=True)
     fetch_parser.add_argument("--ledger", type=Path, required=True)
+
+    pair_parser = subparsers.add_parser(
+        "section16-pair",
+        help="Offline: locate Form 3/4 filings near each Item 5.02 candidate.",
+    )
+    pair_parser.add_argument("--candidates", type=Path, required=True)
+    pair_parser.add_argument("--archive", type=Path, required=True)
+    pair_parser.add_argument("--output", type=Path, required=True)
+    pair_parser.add_argument(
+        "--window-before-days",
+        type=int,
+        default=14,
+        help="Ownership filings this many days before the earliest 8-K. Default 14.",
+    )
+    pair_parser.add_argument(
+        "--window-after-days",
+        type=int,
+        default=45,
+        help="Ownership filings this many days after the earliest 8-K. Default 45.",
+    )
+    pair_parser.add_argument(
+        "--form",
+        action="append",
+        choices=("3", "4"),
+        help=(
+            "Restrict to these ownership forms. Form 3 covers external hires; "
+            "Form 4 is needed for internal promotions but yields far more "
+            "documents per confirmed transition. Default: both."
+        ),
+    )
+
+    ownership_parser = subparsers.add_parser(
+        "section16-fetch",
+        help="Download and parse the paired ownership XML documents.",
+    )
+    ownership_parser.add_argument("--refs", type=Path, required=True)
+    ownership_parser.add_argument("--output-dir", type=Path, required=True)
+    ownership_parser.add_argument("--output", type=Path, required=True)
+    ownership_parser.add_argument("--failures", type=Path, required=True)
 
     wikidata_parser = subparsers.add_parser("wikidata-latest")
     wikidata_parser.add_argument("--qid", required=True)
@@ -175,7 +229,75 @@ def main() -> int:
         collector_lock.close()
         return 0
 
+    if args.command == "section16-pair":
+        # Runs entirely against the archive already on disk, so it needs no
+        # network client and spends no SEC request budget.
+        candidates = load_candidates(args.candidates)
+        if not candidates:
+            raise ValueError("candidate file is empty")
+        if args.window_before_days < 0 or args.window_after_days < 0:
+            parser.error("pairing window bounds must not be negative")
+        submissions = dict(
+            iter_submissions(args.archive, {c.cik for c in candidates})
+        )
+        refs = pair_item_502_with_ownership(
+            candidates,
+            submissions,
+            window=(
+                timedelta(days=args.window_before_days),
+                timedelta(days=args.window_after_days),
+            ),
+        )
+        if args.form:
+            wanted = set(args.form)
+            dropped = sum(1 for ref in refs if ref.form_type not in wanted)
+            refs = [ref for ref in refs if ref.form_type in wanted]
+            print(
+                f"Restricted to Form {'/'.join(sorted(wanted))}: dropped "
+                f"{dropped:,} references"
+            )
+        write_jsonl(args.output, refs)
+        issuers = len({ref.issuer_cik for ref in refs})
+        print(
+            f"Read {len(submissions):,} filer records from {args.archive} with no "
+            f"network requests"
+        )
+        print(
+            f"Wrote {len(refs):,} Form 3/4 references across {issuers:,} of "
+            f"{len({c.cik for c in candidates}):,} candidate issuers to {args.output}"
+        )
+        collector_lock.close()
+        return 0
+
     edgar, wikidata = make_official_source_adapters(args.env_file)
+
+    if args.command == "section16-fetch":
+        refs = []
+        with args.refs.open() as source:
+            for line_number, line in enumerate(source, start=1):
+                if not line.strip():
+                    continue
+                try:
+                    refs.append(OwnershipFilingRef.model_validate_json(line))
+                except Exception as exc:
+                    raise ValueError(
+                        f"{args.refs}:{line_number}: invalid reference: {exc}"
+                    ) from exc
+        if not refs:
+            raise ValueError("reference file is empty")
+        filings, failures = Section16Adapter(edgar.client).fetch_ownership_documents(
+            refs, output_dir=args.output_dir
+        )
+        write_jsonl(args.output, filings)
+        write_dict_jsonl(args.failures, failures)
+        mapped = sum(1 for filing in filings if filing.role_attribute)
+        print(
+            f"Parsed {len(filings):,} ownership documents to {args.output} "
+            f"({mapped:,} carry a CEO or chair title); {len(failures):,} failures "
+            f"recorded in {args.failures}"
+        )
+        collector_lock.close()
+        return 0
 
     if args.command in {"edgar-candidates", "edgar-bulk-candidates"}:
         if args.until < args.since:
@@ -197,19 +319,28 @@ def main() -> int:
     if args.command == "edgar-bulk-candidates":
         if args.max_download_gb <= 0:
             parser.error("--max-download-gb must be positive")
-        size, digest = edgar.client.download(
-            SEC_BULK_SUBMISSIONS,
-            args.archive,
-            max_bytes=int(args.max_download_gb * 1024 ** 3),
-        )
+        if args.use_existing_archive:
+            if not args.archive.is_file():
+                parser.error(f"{args.archive} does not exist")
+            size, digest = args.archive.stat().st_size, sha256_file(args.archive)
+            print(
+                f"Rescanning existing archive: {size:,} bytes, sha256={digest}; "
+                "no SEC request was made"
+            )
+        else:
+            size, digest = edgar.client.download(
+                SEC_BULK_SUBMISSIONS,
+                args.archive,
+                max_bytes=int(args.max_download_gb * 1024 ** 3),
+            )
+            print(
+                f"Downloaded official SEC submissions archive: {size:,} bytes, "
+                f"sha256={digest}"
+            )
         candidates, filer_count = edgar.collect_bulk_item_502(
             args.archive, since=args.since, until=args.until
         )
         write_jsonl(args.output, candidates)
-        print(
-            f"Downloaded official SEC submissions archive: {size:,} bytes, "
-            f"sha256={digest}"
-        )
         print(
             f"Scanned {filer_count:,} filer records; wrote {len(candidates):,} "
             f"Item 5.02 candidates to {args.output}"

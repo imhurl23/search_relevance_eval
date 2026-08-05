@@ -76,6 +76,18 @@ class EvidenceReference(BaseModel):
     source_role: Literal["candidate", "context", "independent_verification"]
     compliance_source_id: str = Field(min_length=1)
     authority_family: str = Field(min_length=1)
+    attester_id: str | None = Field(
+        default=None,
+        description="Legal person accountable for this document, when known.",
+    )
+    attester_role: str | None = Field(
+        default=None,
+        description=(
+            "How that party relates to the subject, e.g. issuer or "
+            "reporting_owner. Shown to reviewers so two links published through "
+            "one channel are not mistaken for one account of the event."
+        ),
+    )
     license: str | None = None
     attribution: str | None = None
 

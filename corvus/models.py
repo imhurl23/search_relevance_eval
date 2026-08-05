@@ -1,9 +1,25 @@
 """Core schemas and deterministic row builder for the Corvus-QA dataset.
 
 Source adapters emit one ``FactEvent`` per observation.  The builder only turns
-an event into a benchmark row after independent resolvers and authority
-families agree on the new value.  Keeping collection separate from question
-generation makes the eligibility rules testable without calling source APIs.
+an event into a benchmark row after independent attesters agree on the new
+value.  Keeping collection separate from question generation makes the
+eligibility rules testable without calling source APIs.
+
+Independence is measured on three separate axes, because conflating them either
+admits correlated errors or rejects genuinely independent evidence:
+
+``resolver_id``
+    The detector that produced the observation.  Two resolvers reading the same
+    document are not independent evidence.
+``attester_id``
+    The legal person who asserted the fact and is accountable for it.  This is
+    the gate.  An issuer's Form 8-K and the incoming officer's Section 16
+    Form 3 are separately prepared and separately liable, so a transcription
+    error in one does not propagate to the other.
+``authority_family``
+    The publisher that disseminated the observation.  Recorded for provenance
+    and available as an optional gate, but publisher diversity is not what
+    protects against a wrong name or a wrong date.
 """
 
 from __future__ import annotations
@@ -49,9 +65,24 @@ class FactEvent(BaseModel):
     authority_family: str = Field(
         min_length=1,
         description=(
-            "Underlying authority, not the detector. For example, a Wikidata "
-            "claim citing an SEC filing should use the SEC authority family."
+            "Publisher that disseminated the observation, not the detector. A "
+            "Wikidata claim citing an SEC filing should use the SEC authority "
+            "family."
         ),
+    )
+    attester_id: str | None = Field(
+        default=None,
+        description=(
+            "Stable identifier for the legal person accountable for the "
+            "assertion — an issuer CIK for a company filing, a reporting-owner "
+            "CIK for a Section 16 filing. Defaults to authority_family, which "
+            "keeps adapters that do not distinguish attesters exactly as strict "
+            "as publisher-level agreement."
+        ),
+    )
+    attester_role: str | None = Field(
+        default=None,
+        description="How the attester relates to the entity, e.g. issuer or reporting_owner.",
     )
     compliance_source_id: str = Field(min_length=1)
     distribution_rights_confirmed: bool
@@ -75,7 +106,7 @@ class FactEvent(BaseModel):
             raise ValueError("must not be blank")
         return value
 
-    @field_validator("old_value")
+    @field_validator("old_value", "attester_id", "attester_role")
     @classmethod
     def normalize_old_value(cls, value: str | None) -> str | None:
         if value is None:
@@ -105,6 +136,16 @@ class FactEvent(BaseModel):
             if self.old_value is not None
             else AnswerClass.POST_CUTOFF_NOVEL
         )
+
+    @property
+    def accountable_attester(self) -> str:
+        """The attesting party, falling back to the publisher when unset.
+
+        The fallback is the conservative direction: an adapter that does not
+        name its attester can never manufacture independence, because every one
+        of its observations collapses onto the same publisher identity.
+        """
+        return self.attester_id or self.authority_family
 
 
 class CorvusRow(BaseModel):
@@ -169,8 +210,14 @@ class TrapObservation(BaseModel):
     source_type: str = Field(min_length=1)
     resolver_id: str = Field(min_length=1)
     authority_family: str = Field(min_length=1)
+    attester_id: str | None = None
+    attester_role: str | None = None
     compliance_source_id: str = Field(min_length=1)
     distribution_rights_confirmed: bool
+
+    @property
+    def accountable_attester(self) -> str:
+        return self.attester_id or self.authority_family
 
     @field_validator("scheduled_resolution_ts", "observed_ts")
     @classmethod
@@ -264,16 +311,23 @@ def build_rows(
     split: DatasetSplit,
     freeze_id: str,
     min_resolvers: int = 2,
-    min_authorities: int = 2,
+    min_attesters: int = 2,
+    min_authorities: int = 1,
     templates: dict[str, str] | None = None,
     as_of_ts: datetime | None = None,
     coverage: dict[tuple[str, str, str], CoverageAssessment] | None = None,
 ) -> tuple[list[CorvusRow], list[dict[str, Any]]]:
-    """Resolve observations and return (eligible rows, rejection records)."""
+    """Resolve observations and return (eligible rows, rejection records).
+
+    ``min_attesters`` is the independence gate: two separately accountable
+    parties must assert the same transition.  ``min_authorities`` defaults to 1
+    because publisher diversity is provenance, not corroboration — raise it when
+    a specific study needs distribution-channel independence as well.
+    """
 
     if not freeze_id.strip():
         raise ValueError("freeze_id must not be blank")
-    if min_resolvers < 1 or min_authorities < 1:
+    if min_resolvers < 1 or min_attesters < 1 or min_authorities < 1:
         raise ValueError("minimum agreement counts must be positive")
     if as_of_ts is not None:
         if as_of_ts.tzinfo is None or as_of_ts.utcoffset() is None:
@@ -291,10 +345,13 @@ def build_rows(
     for key, observations in sorted(grouped.items()):
         exemplar = min(observations, key=lambda item: item.observed_ts)
         resolvers = sorted({item.resolver_id for item in observations})
+        attesters = sorted({item.accountable_attester for item in observations})
         authorities = sorted({item.authority_family for item in observations})
         reasons = []
         if len(resolvers) < min_resolvers:
             reasons.append("insufficient_resolvers")
+        if len(attesters) < min_attesters:
+            reasons.append("insufficient_attesters")
         if len(authorities) < min_authorities:
             reasons.append("insufficient_authorities")
         if exemplar.attribute not in template_map:
@@ -320,6 +377,7 @@ def build_rows(
                     "agreement_key": list(key),
                     "reasons": reasons,
                     "resolver_ids": resolvers,
+                    "attester_ids": attesters,
                     "authority_families": authorities,
                     "observation_count": len(observations),
                 }
@@ -372,6 +430,10 @@ def build_rows(
                 assessment.model_dump(mode="json") if assessment is not None else None
             ),
             "resolver_ids": resolvers,
+            "attester_ids": attesters,
+            "attester_roles": sorted(
+                {item.attester_role for item in observations if item.attester_role}
+            ),
             "authority_families": authorities,
             "compliance_source_ids": sorted(
                 {item.compliance_source_id for item in observations}
@@ -413,7 +475,8 @@ def build_trap_rows(
     run_end: datetime,
     safety_buffer: timedelta = timedelta(days=7),
     min_resolvers: int = 2,
-    min_authorities: int = 2,
+    min_attesters: int = 2,
+    min_authorities: int = 1,
 ) -> tuple[list[CorvusRow], list[dict[str, Any]]]:
     """Build traps whose scheduled resolution is safely after the run window."""
 
@@ -428,12 +491,15 @@ def build_trap_rows(
     for trap_id, group in sorted(grouped.items()):
         exemplar = min(group, key=lambda item: item.observed_ts)
         resolvers = sorted({item.resolver_id for item in group})
+        attesters = sorted({item.accountable_attester for item in group})
         authorities = sorted({item.authority_family for item in group})
         questions = {item.question for item in group}
         resolution_times = {item.scheduled_resolution_ts for item in group}
         reasons = []
         if len(resolvers) < min_resolvers:
             reasons.append("insufficient_resolvers")
+        if len(attesters) < min_attesters:
+            reasons.append("insufficient_attesters")
         if len(authorities) < min_authorities:
             reasons.append("insufficient_authorities")
         if len(questions) != 1:
@@ -466,6 +532,7 @@ def build_trap_rows(
             "run_end": run_end.isoformat(),
             "safety_buffer_seconds": int(safety_buffer.total_seconds()),
             "resolver_ids": resolvers,
+            "attester_ids": attesters,
             "authority_families": authorities,
             "compliance_source_ids": sorted(
                 {item.compliance_source_id for item in group}

@@ -22,7 +22,9 @@
         "confirm no other machine or service shares the aggregate SEC request budget",
         "honor Retry-After and exponentially back off on 429 and transient 5xx responses",
         "download only required filings",
-        "do not redistribute filing bodies in the dataset"
+        "do not redistribute filing bodies in the dataset",
+        "parse Section 16 ownership documents for issuer, reporting owner name, relationship flags, officerTitle, and periodOfReport only; never read or retain reportingOwnerAddress or the signature block",
+        "treat the reporting owner's name as the answer to the question and every other personal field as out of scope"
       ],
       "terms_url": "https://www.sec.gov/about/webmaster-frequently-asked-questions",
       "aggregate_limit_url": "https://www.sec.gov/filergroup/announcements-old/new-rate-control-limits",

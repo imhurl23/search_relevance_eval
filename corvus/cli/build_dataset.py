@@ -83,7 +83,25 @@ def main() -> int:
         help="Pre-registered source-window/freeze identifier, included in every row ID.",
     )
     parser.add_argument("--min-resolvers", type=int, default=2)
-    parser.add_argument("--min-authorities", type=int, default=2)
+    parser.add_argument(
+        "--min-attesters",
+        type=int,
+        default=2,
+        help=(
+            "Independently accountable parties that must agree. This is the "
+            "corroboration gate; default 2."
+        ),
+    )
+    parser.add_argument(
+        "--min-authorities",
+        type=int,
+        default=1,
+        help=(
+            "Distinct publishers required. Defaults to 1 because publisher "
+            "diversity is provenance, not corroboration; raise it for a study "
+            "that needs distribution-channel independence too."
+        ),
+    )
     parser.add_argument(
         "--as-of",
         required=True,
@@ -132,6 +150,7 @@ def main() -> int:
         split=DatasetSplit(args.split),
         freeze_id=args.freeze_id,
         min_resolvers=args.min_resolvers,
+        min_attesters=args.min_attesters,
         min_authorities=args.min_authorities,
         as_of_ts=args.as_of,
         coverage=coverage,
@@ -149,6 +168,7 @@ def main() -> int:
             freeze_id=args.freeze_id,
             run_end=args.run_end,
             min_resolvers=args.min_resolvers,
+            min_attesters=args.min_attesters,
             min_authorities=args.min_authorities,
         )
         rows.extend(trap_rows)
@@ -176,6 +196,7 @@ def main() -> int:
         "row_count": len(rows),
         "rejection_count": len(rejected),
         "min_resolvers": args.min_resolvers,
+        "min_attesters": args.min_attesters,
         "min_authorities": args.min_authorities,
         "as_of": args.as_of.isoformat(),
         "run_end": args.run_end.isoformat() if args.run_end else None,

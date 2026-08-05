@@ -20,6 +20,8 @@ def event(
     *,
     old_value: str | None = "Jane Old",
     new_value: str = "Jane New",
+    attester_id: str | None = None,
+    attester_role: str | None = None,
 ) -> FactEvent:
     return FactEvent(
         entity_id="CIK0000123456",
@@ -34,6 +36,8 @@ def event(
         source_type="filing",
         resolver_id=resolver_id,
         authority_family=authority_family,
+        attester_id=attester_id,
+        attester_role=attester_role,
         compliance_source_id="test_fixture",
         distribution_rights_confirmed=True,
         aliases=["J. New"],
@@ -58,7 +62,9 @@ class CorvusBuilderTests(unittest.TestCase):
         self.assertEqual(row.metadata["corvus_split"], "dev")
         self.assertEqual(len(row.metadata["articles"]), 2)
 
-    def test_rejects_two_resolvers_backed_by_one_authority(self):
+    def test_rejects_two_resolvers_backed_by_one_attester(self):
+        # Two detectors reading the same issuer's disclosure are one account of
+        # the event, however many ways it is republished.
         rows, rejected = build_rows(
             [event("wikidata", "sec"), event("edgar", "sec")],
             split=DatasetSplit.TEST,
@@ -66,7 +72,66 @@ class CorvusBuilderTests(unittest.TestCase):
         )
 
         self.assertEqual(rows, [])
+        self.assertIn("insufficient_attesters", rejected[0]["reasons"])
+
+    def test_accepts_two_attesters_publishing_through_one_authority(self):
+        # The issuer's Item 5.02 filing and the incoming officer's Section 16
+        # filing are separately prepared and separately liable. Both reach the
+        # public through EDGAR, which is provenance, not correlation.
+        rows, rejected = build_rows(
+            [
+                event(
+                    "edgar-8k",
+                    "sec",
+                    attester_id="CIK0000123456",
+                    attester_role="issuer",
+                ),
+                event(
+                    "edgar-section16",
+                    "sec",
+                    attester_id="CIK0000999999",
+                    attester_role="reporting_owner",
+                ),
+            ],
+            split=DatasetSplit.TEST,
+            freeze_id="test-2026-08",
+        )
+
+        self.assertEqual(rejected, [])
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(
+            rows[0].metadata["attester_ids"], ["CIK0000123456", "CIK0000999999"]
+        )
+        self.assertEqual(
+            rows[0].metadata["attester_roles"], ["issuer", "reporting_owner"]
+        )
+        self.assertEqual(rows[0].metadata["authority_families"], ["sec"])
+
+    def test_publisher_independence_remains_available_as_an_opt_in(self):
+        rows, rejected = build_rows(
+            [
+                event("edgar-8k", "sec", attester_id="CIK0000123456"),
+                event("edgar-section16", "sec", attester_id="CIK0000999999"),
+            ],
+            split=DatasetSplit.TEST,
+            freeze_id="test-2026-08",
+            min_authorities=2,
+        )
+
+        self.assertEqual(rows, [])
         self.assertIn("insufficient_authorities", rejected[0]["reasons"])
+
+    def test_unset_attester_cannot_manufacture_independence(self):
+        # An adapter that never names its attester must stay exactly as strict
+        # as publisher-level agreement was before the split.
+        rows, _ = build_rows(
+            [event("edgar", "sec"), event("company-ir", "company")],
+            split=DatasetSplit.DEV,
+            freeze_id="dev-2026-07",
+        )
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].metadata["attester_ids"], ["company", "sec"])
 
     def test_rejects_disagreement_on_previous_answer(self):
         rows, rejected = build_rows(

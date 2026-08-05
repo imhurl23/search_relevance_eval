@@ -15,6 +15,7 @@ from corvus.review_schema import (
     FactVerificationInput,
     assert_metadata_only,
     braintrust_schemas,
+    validate_review_row,
 )
 
 
@@ -130,6 +131,36 @@ class ReviewSchemaTests(unittest.TestCase):
             row["input"]["claim"]["statement"],
             "The final score of Alpha vs Beta was 2–1.",
         )
+
+    def test_evidence_without_attester_fields_still_validates(self):
+        # attester_id/attester_role were added for Section 16 corroboration.
+        # Sports and news evidence predates them and must keep validating, so
+        # the fields stay optional and absent rather than defaulted to a value.
+        row = sports_verification_row(
+            {
+                "source_event_id": "event-1",
+                "sport": "Soccer",
+                "competition": "Example League",
+                "season": "2026",
+                "event_start_ts": "2026-07-30T19:00:00Z",
+                "observed_ts": "2026-07-30T22:00:00Z",
+                "home_team": "Alpha",
+                "away_team": "Beta",
+                "home_score": 2,
+                "away_score": 1,
+                "source_url": "https://example.com/event/1",
+                "source_type": "fixture_completed_match",
+                "resolver_id": "fixture",
+                "authority_family": "fixture",
+                "compliance_source_id": "fixture",
+                "license": None,
+                "attribution": "Fixture data.",
+            }
+        )
+        evidence = row["input"]["evidence"][0]
+        self.assertIsNone(evidence["attester_id"])
+        self.assertIsNone(evidence["attester_role"])
+        validate_review_row(row, stage="fact_verification")
 
 
 if __name__ == "__main__":

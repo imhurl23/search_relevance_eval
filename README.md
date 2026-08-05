@@ -62,6 +62,13 @@ cp .env.example .env
 Fill `.env`; every supported credential is loaded from that file and overrides
 or clears the corresponding ambient credential.
 
+The suite is stdlib `unittest` and needs no test runner beyond the
+dependencies above. It makes no network requests:
+
+```bash
+.venv/bin/python -m unittest discover -s tests -t .
+```
+
 ## Running
 
 The importers push datasets, not the eval:
@@ -90,6 +97,8 @@ adapter should emit one JSONL `FactEvent` observation with this shape:
   "source_type": "filing",
   "resolver_id": "edgar-8k",
   "authority_family": "sec",
+  "attester_id": "CIK0000123456",
+  "attester_role": "issuer",
   "compliance_source_id": "sec_edgar",
   "distribution_rights_confirmed": true,
   "aliases": ["C. CEO"],
@@ -97,11 +106,32 @@ adapter should emit one JSONL `FactEvent` observation with this shape:
 }
 ```
 
-`authority_family` names the underlying authority, not merely the detector. A
-Wikidata observation citing an SEC filing therefore remains in the `sec`
-family. By default, a row is eligible only when two resolvers backed by two
-authority families agree on the entity, attribute, new value, effective time,
-and previous answer.
+#### Three axes of independence
+
+Corroboration is only meaningful against a specific failure mode, so the three
+things that "independent source" can mean are recorded separately:
+
+| Field | Answers | Role |
+|---|---|---|
+| `resolver_id` | which detector produced this? | two detectors reading one document are not two observations |
+| `attester_id` | who asserted it and is accountable? | **the eligibility gate** |
+| `authority_family` | who published it? | provenance; an optional extra gate |
+
+A row is eligible by default when **two resolvers and two attesters** agree on
+the entity, attribute, new value, effective time, and previous answer.
+
+The gate is attester, not publisher, because the errors that corrupt a
+benchmark row — a wrong name, a wrong effective date — are caught by two
+parties who prepared their accounts separately and are separately liable for
+them. An issuer's Form 8-K and the incoming officer's Section 16 Form 3 are
+exactly that, and both reach the public through EDGAR. Requiring two publishers
+would reject them while admitting any pair of aggregators that both scraped the
+same press release.
+
+`attester_id` defaults to `authority_family` when an adapter does not set it,
+so an adapter that cannot distinguish attesters stays exactly as strict as
+publisher-level agreement. Publisher independence is still available as
+`--min-authorities 2` for a study that needs it.
 
 Build the dry-run dev set and publication test set as separate freezes:
 
@@ -166,6 +196,105 @@ python -m corvus.cli.collect_sources wikidata-latest \
 EDGAR collection deliberately emits candidates rather than guessing officer
 names or effective dates from prose. A reviewed `OfficerTransition` must be
 created from the filing before `EdgarAdapter.emit_fact` produces a `FactEvent`.
+
+### Section 16 corroboration
+
+The issuer's Item 5.02 filing is one account of an officer change. The incoming
+officer's own Section 16 filing is a second, separately liable account — and
+unlike the 8-K it is structured, so the corroborating value and date are read
+rather than parsed out of prose:
+
+- `periodOfReport` is the "Date of Event Requiring Statement", the date the
+  person actually became an officer. Precision is one day; a Section 16-backed
+  row must not be read at a finer recency rung than that.
+- `reportingOwnerRelationship` carries `isOfficer`/`isDirector` and
+  `officerTitle`, which the SEC makes mandatory whenever `isOfficer` is set.
+
+Form 3 is the initial statement, due within ten days, and covers external
+hires. An internal promotion files no new Form 3 — the person is already a
+reporting owner — so `detect_promotion` looks for a changed `officerTitle` on
+their next Form 4 instead.
+
+Pairing runs entirely against the bulk submissions archive already on disk and
+spends no request budget; only the paired documents are then fetched:
+
+```bash
+python -m corvus.cli.collect_sources section16-pair \
+    --candidates edgar-item-502-candidates.jsonl \
+    --archive sec_submissions.zip \
+    --form 3 \
+    --output ownership-refs.jsonl
+python -m corvus.cli.collect_sources section16-fetch \
+    --refs ownership-refs.jsonl \
+    --output-dir section16/documents \
+    --output ownership-filings.jsonl \
+    --failures ownership-failures.jsonl
+```
+
+Titles map conservatively. `officer_role_attribute` refuses deputy, vice,
+interim, acting, and co- variants, and refuses any office scoped below the
+issuer, so "CEO of Acme Europe" and "President & CEO, Retail Division" never
+corroborate a top-office transition. It also refuses "Chief Executive Officer
+of Acme Bank" even when Acme Bank *is* the filer's operating subsidiary — a
+false negative accepted so that a divisional title can never become a false
+positive.
+
+`rptOwnerName` is stored surname-first with no delimiter, which is lossy for
+compound surnames: "Garcia Lopez Maria" could be either name. Agreement between
+attesters therefore uses `person_names_agree`, which compares unordered token
+sets and ignores middle initials, so "Amanda M. Cole" matches "Cole Amanda
+Marie" and a wrong surname guess cannot cause a false reject.
+
+`reportingOwnerAddress` and the signature block are never read. The reporting
+owner's name is the answer to the question; every other personal field in the
+filing is out of scope under the source policy.
+
+Section 16 corroborates the **new value and the effective date only**. A Form 3
+is an initial statement and says nothing about a predecessor, so
+`previous_answer` stays single-attested from the reviewed 8-K, and every
+Section 16 observation records `old_value_attested: false` in provenance.
+
+Measured yield on the July 2026 development window: 490 Form 3 filings paired
+against 798 Item 5.02 candidates, 30 carrying a top-office title — of which 11
+are blank-check shells with no realistic search footprint. See
+[the window's data card](data/corvus_live/2026-07-dev/README.md). A one-month
+window is not enough for a publication test set; widen the window or add Form 4
+before treating this as the test split.
+
+#### Section 16 review queue
+
+Corroborated candidates skip claim preparation. A Form 3 states the office and
+the event date as structured fields, so the claim is already atomic and the
+reviewer confirms rather than extracts:
+
+```bash
+python -m corvus.cli.prepare_section16_review \
+    --section16-filings section16/form3_filings.jsonl \
+    --section16-refs section16/form3_refs.jsonl \
+    --item-502-candidates edgar-item-502-candidates.jsonl \
+    --review-queue filing-review-queue.jsonl \
+    --output section16/fact_verification_upload.jsonl \
+    --schema-output section16/fact_verification_schema.json
+```
+
+Each row carries both filings as evidence, labelled by `attester_role` so a
+reviewer can see that two links published through one channel are still two
+accounts of the event. Four things the reviewer must decide, in the row's
+instructions:
+
+1. **Does the 8-K describe this appointment?** Pairing is by date over a wide
+   window, so a Form 3 can sit beside an unrelated Item 5.02 at the same issuer.
+2. **Does the effective date match?** A mismatch is `contradicted` with the
+   8-K's date in `correction` — this is the transcription error that dual
+   attestation exists to catch.
+3. **Who was the predecessor?** Section 16 does not attest it.
+4. **Would anyone ask this question?** Rows matching the blank-check name
+   heuristic are tagged `possible-blank-check` rather than dropped, because a
+   name is not a reliable classifier. Pass `--exclude-blank-check` to drop them
+   instead.
+
+Import with `corvus.cli.import_review_dataset` into a **new** dataset, never
+over the source queues, and bind the schema hash in the compliance approval.
 
 ### News and sports sources
 

@@ -13,7 +13,7 @@ import braintrust
 
 from corvus.compliance import SOURCE_POLICY_PATH, require_import_approval, sha256_file
 from corvus.review_io import read_jsonl
-from corvus.review_schema import assert_metadata_only
+from corvus.review_schema import SCHEMA_VERSION, validate_review_row
 from import_livenewsbench import load_env
 
 
@@ -22,6 +22,44 @@ DEFAULT_DESCRIPTION = (
     "Metadata-only SEC Item 5.02 review queue. Filing bodies and excerpts "
     "are not stored in Braintrust."
 )
+
+# The expected-side property that identifies which review stage a schema file
+# describes. Importing fact-verification rows under the claim-preparation schema
+# would put reviewer labels somewhere no scorer reads them.
+STAGE_EXPECTED_MARKER = {
+    "claim_preparation": "preparation_status",
+    "fact_verification": "fact_verification",
+}
+
+
+def validate_rows(rows: list[dict], *, source: Path) -> str:
+    """Enforce schema v2 on every row and return the single stage they share.
+
+    Pre-v2 artifacts carry no ``review_stage`` and were previously accepted,
+    which is how non-adherent rows reached Braintrust. They now fail here with
+    an actionable message rather than becoming unlabelable dataset rows.
+    """
+    stages: set[str] = set()
+    for index, row in enumerate(rows, start=1):
+        stage = (row.get("metadata") or {}).get("review_stage")
+        if not stage:
+            raise ValueError(
+                f"{source}:{index}: row has no metadata.review_stage. This is a "
+                f"pre-{SCHEMA_VERSION} artifact; regenerate it with "
+                "corvus.cli.prepare_claim_review or "
+                "corvus.cli.prepare_section16_review before importing."
+            )
+        try:
+            validate_review_row(row, stage=stage)
+        except (ValueError, KeyError) as exc:
+            raise ValueError(f"{source}:{index}: {exc}") from exc
+        stages.add(stage)
+    if len(stages) > 1:
+        raise ValueError(
+            f"{source} mixes review stages {sorted(stages)}; import each stage "
+            "into its own dataset so a scorer cannot span both."
+        )
+    return stages.pop()
 
 
 def main() -> int:
@@ -48,10 +86,8 @@ def main() -> int:
     rows = read_jsonl(args.source_file)
     if not rows:
         raise ValueError("refusing to upload an empty review queue")
-    if any(row["metadata"].get("contains_source_text") is not False for row in rows):
-        raise ValueError("every review row must explicitly exclude source text")
-    for row in rows:
-        assert_metadata_only(row)
+    # Enforces schema v2, the no-source-text rule, and metadata-only fields.
+    stage = validate_rows(rows, source=args.source_file)
     schemas = None
     if args.schema_file:
         schemas = json.loads(args.schema_file.read_text())
@@ -62,6 +98,12 @@ def main() -> int:
                 raise ValueError(f"--schema-file is missing {field!r}")
             if schemas[field].get("enforce") is not True:
                 raise ValueError(f"--schema-file {field!r} must set enforce=true")
+        marker = STAGE_EXPECTED_MARKER[stage]
+        if marker not in (schemas["expected"].get("properties") or {}):
+            raise ValueError(
+                f"--schema-file describes a different review stage: rows are "
+                f"{stage!r} but the expected schema has no {marker!r} property"
+            )
 
     env = load_env(args.env_file)
     api_key = env.get("BRAINTRUST_API_KEY")
@@ -82,6 +124,8 @@ def main() -> int:
             "approval_scope": approval["scope"],
             "contains_source_text": False,
             "row_count": len(rows),
+            "review_stage": stage,
+            "schema_version": SCHEMA_VERSION,
             **(
                 {"schema_sha256": sha256_file(args.schema_file)}
                 if args.schema_file

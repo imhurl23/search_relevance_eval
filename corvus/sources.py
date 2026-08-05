@@ -454,6 +454,10 @@ class EdgarAdapter:
             source_type="sec_8k_item_5_02",
             resolver_id="edgar-8k",
             authority_family="sec",
+            # The issuer signs and is liable for the Item 5.02 disclosure; the
+            # incoming officer's own Section 16 filing is a separate attester.
+            attester_id=f"CIK{candidate.cik}",
+            attester_role="issuer",
             compliance_source_id="sec_edgar",
             distribution_rights_confirmed=True,
             aliases=transition.aliases,
