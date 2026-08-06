@@ -119,6 +119,40 @@ ANTHROPIC_MAX_PAUSE_TURNS = 4
 
 
 # ---------------------------------------------------------------------------
+# OpenAI request tuning.
+#
+# The harness arm runs on /v1/responses, not /v1/chat/completions. This is not a
+# style preference — chat completions REJECTS the combination this study needs:
+#
+#   400 Function tools with reasoning_effort are not supported for gpt-5.6-sol
+#       in /v1/chat/completions. To use function tools, use /v1/responses or set
+#       reasoning_effort to 'none'.
+#
+# and the model's DEFAULT effort is not 'none', so the rejection stands even when
+# the request omits reasoning_effort entirely. An earlier revision left effort
+# unpinned expecting that to sidestep the incompatibility; it does not.
+#
+# Being forced onto Responses is a net gain: it is also where the native arm
+# already lives, so all three OpenAI arms (none / harness / native) now share one
+# endpoint and one declared effort, which is what makes native-vs-harness within
+# this vendor a one-variable contrast.
+OPENAI_EFFORT = "high"
+# Reasoning tokens count against this ceiling, so it needs more headroom than a
+# non-reasoning answer would. Truncation is recorded, never silently scored.
+OPENAI_MAX_OUTPUT_TOKENS = 16384
+
+# How to hold a tool-calling conversation with a vendor. Declared rather than
+# inferred from the vendor name because two vendors here speak the same protocol
+# for opposite reasons: Baseten is chat-completions-only (no Responses API
+# exists), while OpenAI is Responses-only (chat completions rejects tools plus
+# reasoning). Collapsing that into `if vendor == "anthropic"` is what hid the
+# incompatibility above until it failed live.
+PROTOCOL_CHAT_COMPLETIONS = "chat_completions"
+PROTOCOL_RESPONSES = "responses"
+PROTOCOL_MESSAGES = "messages"
+
+
+# ---------------------------------------------------------------------------
 # Vendor registry
 #
 # Every field here is an experiment condition, not a convenience. In particular
@@ -148,6 +182,10 @@ class VendorSpec:
     # Reasoning depth, where the vendor lets us pin it. None = vendor default,
     # left unpinned. Recorded either way so a run is never ambiguous about it.
     reasoning_effort: str | None = None
+    # Which wire protocol the harness arm speaks to this vendor. See the
+    # PROTOCOL_* constants: this is a hard endpoint capability per vendor, not a
+    # preference.
+    harness_protocol: str = PROTOCOL_CHAT_COMPLETIONS
     notes: str = ""
 
 
@@ -170,6 +208,9 @@ VENDORS: dict[str, VendorSpec] = {
         base_url="https://inference.baseten.co/v1",
         supports_native_search=False,
         sampling={"temperature": 0},
+        # Baseten Model APIs expose Chat Completions only — there is no Responses
+        # endpoint to move to, which is why both protocols have to stay supported.
+        harness_protocol=PROTOCOL_CHAT_COMPLETIONS,
         notes="Server-side search is structurally unavailable; native arm N/A.",
     ),
     # gpt-5.6-sol is pinned rather than the bare `gpt-5.6` alias, which points at
@@ -194,11 +235,13 @@ VENDORS: dict[str, VendorSpec] = {
     # support `seed`. "temperature 0, seed 42" is therefore unavailable on this
     # vendor too — it is not a knob we chose not to use.
     #
-    # reasoning_effort is left unpinned on purpose. Reasoning models reject
-    # `reasoning_effort` alongside function tools on /v1/chat/completions, which
-    # the harness arm uses; pinning it on the native arm alone would make effort
+    # reasoning_effort IS pinned here, which it could not be while the harness arm
+    # ran on chat completions: that endpoint rejects reasoning_effort alongside
+    # function tools, so pinning it on the native arm alone would have made effort
     # differ between this vendor's own native and harness arms — the one contrast
-    # the matrix exists to measure. Both arms therefore run the vendor default.
+    # the matrix exists to measure. Both arms now run on /v1/responses, where
+    # effort and function tools coexist, so all three OpenAI arms declare the same
+    # depth and match Anthropic's ANTHROPIC_EFFORT.
     "openai": VendorSpec(
         name="openai",
         model_class="frontier",
@@ -206,7 +249,8 @@ VENDORS: dict[str, VendorSpec] = {
         default_model="gpt-5.6-sol",
         supports_native_search=True,
         sampling={},
-        reasoning_effort=None,
+        reasoning_effort=OPENAI_EFFORT,
+        harness_protocol=PROTOCOL_RESPONSES,
         notes="Native search via the Responses API hosted web_search tool.",
     ),
     # claude-fable-5 pairs with gpt-5.6-sol on within-lineup position: each is its
@@ -238,6 +282,7 @@ VENDORS: dict[str, VendorSpec] = {
         # Pinnable here because effort and tools coexist fine on the Messages
         # API, so both this vendor's arms get the same declared depth.
         reasoning_effort=ANTHROPIC_EFFORT,
+        harness_protocol=PROTOCOL_MESSAGES,
         notes="Native search via the server-side web_search tool.",
     ),
 }
@@ -650,8 +695,14 @@ def openai_native_search(
     system_prompt: str,
     question: str,
     exclude_domains: list[str],
+    effort: str | None = None,
 ) -> NativeRun:
-    """Run one question through OpenAI's hosted Responses web_search tool."""
+    """Run one question through OpenAI's hosted Responses web_search tool.
+
+    `effort` must be the same value the harness arm sends, or native-vs-harness
+    within this vendor stops being a one-variable contrast. run_eval passes
+    spec.reasoning_effort to both.
+    """
     tool: dict = {
         "type": OPENAI_WEB_SEARCH_TOOL_TYPE,
         "search_context_size": OPENAI_SEARCH_CONTEXT_SIZE,
@@ -659,12 +710,17 @@ def openai_native_search(
     blocked = exclude_domains[:OPENAI_MAX_BLOCKED_DOMAINS]
     if blocked:
         tool["filters"] = {"blocked_domains": blocked}
+    extra: dict = {}
+    if effort:
+        extra["reasoning"] = {"effort": effort}
 
     response = client.responses.create(
         model=model,
         instructions=system_prompt,
         input=question,
         tools=[tool],
+        max_output_tokens=OPENAI_MAX_OUTPUT_TOKENS,
+        **extra,
         # Without this include, the response carries only inline url_citation
         # annotations — the subset the answer happened to cite, not the surface
         # the model actually consulted. Scoring leakage or diversity off
@@ -682,6 +738,11 @@ def openai_native_search(
     usage = _attr(response, "usage")
     run.prompt_tokens = int(_attr(usage, "input_tokens") or 0)
     run.completion_tokens = int(_attr(usage, "output_tokens") or 0)
+    # Now that this arm pins max_output_tokens, a long reasoning trace can hit the
+    # ceiling and return a partial answer. Recorded so answer_truncated explains a
+    # low score instead of it reading as a wrong answer.
+    incomplete = _attr(response, "incomplete_details") or {}
+    run.truncated = _attr(incomplete, "reason") == "max_output_tokens"
 
     titles: dict[str, str] = {}
     texts: list[str] = []
@@ -709,6 +770,10 @@ def openai_native_search(
             })
         elif itype == "message":
             for part in _attr(item, "content") or []:
+                if _attr(part, "type") == "refusal":
+                    # Recorded, never retried and never scored as a wrong answer.
+                    run.refused = True
+                    continue
                 texts.append(_attr(part, "text") or "")
                 for note in _attr(part, "annotations") or []:
                     if _attr(note, "type") != "url_citation":
@@ -939,16 +1004,145 @@ class AnthropicHarnessSession(HarnessSession):
         })
 
 
+class OpenAIResponsesHarnessSession(HarnessSession):
+    """Responses API function calling — the only OpenAI path that takes both.
+
+    Chat completions rejects function tools alongside reasoning effort on
+    gpt-5-family models (see OPENAI_EFFORT), so this is not an alternative to
+    OpenAIHarnessSession for this vendor, it is the only option. It also puts the
+    harness arm on the same endpoint as the native arm.
+    """
+
+    def __init__(self, client, spec, model, system_prompt):
+        super().__init__(client, spec, model, system_prompt)
+        # Responses keeps the system prompt out of the turn list, in
+        # `instructions`. The prompt text is byte-identical to the other
+        # protocols' system message; only its position on the wire differs.
+        self.input: list = []
+        self._used_tools = False
+        # Function tools are FLAT here — name/description/parameters at the top
+        # level — where chat completions nests them under "function". The schema
+        # itself is the shared SEARCH_TOOL_PARAMETERS, unchanged.
+        #
+        # strict stays False so that schema can be reused verbatim. Strict mode
+        # would require additionalProperties:false and every property required,
+        # i.e. a different tool declaration on this arm than on the Baseten and
+        # Anthropic arms — a difference in the agent, not just the transport.
+        self.tools = [{
+            "type": "function",
+            "name": SEARCH_TOOL_NAME,
+            "description": SEARCH_TOOL_DESCRIPTION,
+            "parameters": SEARCH_TOOL_PARAMETERS,
+            "strict": False,
+        }]
+
+    def add_user(self, question: str) -> None:
+        self.input.append({"role": "user", "content": question})
+
+    def step(self, tools_enabled: bool) -> Turn:
+        kwargs: dict = dict(self.spec.sampling)
+        if tools_enabled:
+            kwargs["tools"] = self.tools
+        elif self._used_tools:
+            # Same constraint as the Anthropic path: the input list already holds
+            # function_call items, and a request carrying those without the tool
+            # declared is rejected. Keep the declaration and forbid further calls.
+            kwargs["tools"] = self.tools
+            kwargs["tool_choice"] = "none"
+        if self.spec.reasoning_effort:
+            kwargs["reasoning"] = {"effort": self.spec.reasoning_effort}
+        response = self.client.responses.create(
+            model=self.model,
+            instructions=self.system_prompt,
+            input=self.input,
+            max_output_tokens=OPENAI_MAX_OUTPUT_TOKENS,
+            **kwargs,
+        )
+        usage = _attr(response, "usage")
+        turn = Turn(
+            prompt_tokens=int(_attr(usage, "input_tokens") or 0),
+            completion_tokens=int(_attr(usage, "output_tokens") or 0),
+            stop=_attr(response, "status"),
+        )
+        incomplete = _attr(response, "incomplete_details") or {}
+        turn.truncated = _attr(incomplete, "reason") == "max_output_tokens"
+
+        texts: list[str] = []
+        items = _attr(response, "output") or []
+        for item in items:
+            itype = _attr(item, "type")
+            if itype == "function_call":
+                raw = _attr(item, "arguments") or "{}"
+                try:
+                    args = json.loads(raw)
+                except json.JSONDecodeError:
+                    args, malformed = {}, True
+                else:
+                    malformed = not isinstance(args, dict)
+                    if malformed:
+                        args = {}
+                turn.tool_calls.append({
+                    # call_id, not id: call_id is the token function_call_output
+                    # correlates on. `id` identifies the item, and echoing it
+                    # back in place of call_id is accepted and then never matched.
+                    "id": _attr(item, "call_id") or "",
+                    "name": _attr(item, "name") or "",
+                    "arguments": args,
+                    "malformed": malformed,
+                })
+            elif itype == "message":
+                for part in _attr(item, "content") or []:
+                    if _attr(part, "type") == "refusal":
+                        turn.refused = True
+                        continue
+                    texts.append(_attr(part, "text") or "")
+        turn.text = " ".join(t for t in texts if t).strip()
+        if turn.tool_calls:
+            self._used_tools = True
+            # Echo EVERY output item back, reasoning items included and
+            # unmodified, exactly as the Anthropic path echoes thinking blocks.
+            # Dropping them is accepted by the API but discards the reasoning
+            # context between tool calls, which would make this arm's agent
+            # weaker than the Anthropic harness arm for a reason unrelated to
+            # search — a confound in the one contrast this vendor pair exists to
+            # support.
+            self.input.extend(items)
+        return turn
+
+    def add_tool_results(self, results: list) -> None:
+        for call_id, content in results:
+            self.input.append({
+                "type": "function_call_output",
+                "call_id": call_id,
+                "output": content,
+            })
+
+
+# Protocol -> session class. Keyed on the declared protocol rather than the
+# vendor name so adding a vendor cannot silently inherit the wrong endpoint.
+HARNESS_SESSIONS = {
+    PROTOCOL_CHAT_COMPLETIONS: OpenAIHarnessSession,
+    PROTOCOL_RESPONSES: OpenAIResponsesHarnessSession,
+    PROTOCOL_MESSAGES: AnthropicHarnessSession,
+}
+
+
 def make_harness_session(client, spec: VendorSpec, model: str, system_prompt: str):
     """Session for both the harness arm and the no-tool control arm.
 
     The control arm is the same session driven with tools_enabled=False on every
     step, so the two arms differ ONLY in whether the tool is offered — not in
-    client, history handling, or sampling.
+    client, history handling, endpoint, or sampling.
     """
-    if spec.name == "anthropic":
-        return AnthropicHarnessSession(client, spec, model, system_prompt)
-    return OpenAIHarnessSession(client, spec, model, system_prompt)
+    try:
+        session_class = HARNESS_SESSIONS[spec.harness_protocol]
+    except KeyError:
+        raise SystemExit(
+            f"vendor {spec.name!r} declares harness_protocol "
+            f"{spec.harness_protocol!r}, which has no session class. "
+            f"Known protocols: {sorted(HARNESS_SESSIONS)}."
+        ) from None
+    return session_class(client, spec, model, system_prompt)
 
 
 def surfaced_domains(trajectory) -> set[str]:

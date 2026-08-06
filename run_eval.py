@@ -687,9 +687,12 @@ def _run_harness(client, spec, agent_model, system_prompt, question, excludes,
                     query = call["arguments"].get("query", "")
                     results, content, tok = run_search(
                         arm, query, excludes)
-                    # Accumulated per call, not searches x flat rate: Exa bills
-                    # content per page returned, so two calls returning
-                    # different result counts do not cost the same.
+                    # Accumulated per call rather than computed as
+                    # searches x rate at the end, so a mid-row failure still
+                    # bills what it actually spent. You.com prices per call
+                    # regardless of `count`, so the two agree today; keeping the
+                    # accumulation means a per-result price would not silently
+                    # under-report.
                     out["search_cost"] += search_cost_usd(
                         arm, len(results))
                     out["trajectory"].append({
@@ -715,7 +718,10 @@ def _run_native(client, spec, agent_model, system_prompt, question,
             MAX_SEARCHES)
     elif spec.name == "openai":
         run = agents.openai_native_search(
-            client, agent_model, system_prompt, question, excludes)
+            client, agent_model, system_prompt, question, excludes,
+            # Same effort the harness arm sends, so this vendor's native-vs-
+            # harness contrast varies only where the search happens.
+            spec.reasoning_effort)
     else:
         raise SystemExit(
             f"--search-mode native is unavailable for --model-vendor {spec.name}: "
@@ -964,6 +970,14 @@ def run(arm: str, dataset_name: str, dataset_version: str | None,
             "sampling_pinned": bool(sampling),
             "reasoning_effort": spec.reasoning_effort,
             "reasoning_effort_pinned": spec.reasoning_effort is not None,
+            # Which endpoint served this arm. Recorded because it is a real
+            # difference between arms of the same vendor family — the OSS rows run
+            # chat completions and the OpenAI rows run Responses — and because the
+            # endpoint determines whether reasoning_effort could be pinned at all.
+            "harness_protocol": (
+                spec.harness_protocol if search_mode != SEARCH_MODE_NATIVE
+                else agents.PROTOCOL_RESPONSES if spec.name == "openai"
+                else agents.PROTOCOL_MESSAGES),
             "agent_base_url": spec.base_url,
             # Whether the 5-search budget is API-enforced or only observed.
             # OpenAI's hosted web_search exposes no max_uses, so its native arm

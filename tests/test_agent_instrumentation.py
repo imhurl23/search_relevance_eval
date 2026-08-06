@@ -14,6 +14,7 @@ schemas:
   OpenAI    https://developers.openai.com/api/docs/guides/tools-web-search
 """
 
+import dataclasses
 import os
 import unittest
 
@@ -181,13 +182,21 @@ class VendorRegistryTest(unittest.TestCase):
                          "claude-fable-5")
         self.assertIn("claude-opus-5", agents.MODEL_USD_PER_MTOK)
 
-    def test_effort_is_pinned_only_where_it_coexists_with_tools(self):
-        # Anthropic can pin effort on both its arms. OpenAI cannot: reasoning
-        # models reject reasoning_effort alongside function tools on chat
-        # completions, so pinning it on the native arm alone would make effort
-        # differ between OpenAI's own native and harness arms.
-        self.assertEqual(agents.VENDORS["anthropic"].reasoning_effort, "high")
-        self.assertIsNone(agents.VENDORS["openai"].reasoning_effort)
+    def test_every_frontier_vendor_pins_effort_on_all_of_its_arms(self):
+        # This assertion is inverted from its previous form, which required
+        # OpenAI's effort to be None. That was a workaround for chat completions
+        # rejecting reasoning_effort alongside function tools — and it did not
+        # even work, because the model's default effort is not 'none' and the
+        # endpoint rejected the harness arm anyway. Both vendors now run their
+        # harness arm on an endpoint that accepts effort with tools, so effort is
+        # declared on every arm. See HarnessProtocolRegistryTest.
+        for vendor in ("openai", "anthropic"):
+            with self.subTest(vendor=vendor):
+                self.assertEqual(agents.VENDORS[vendor].reasoning_effort, "high")
+
+    def test_the_oss_arm_leaves_effort_unpinned(self):
+        # Open models expose no comparable knob, so there is nothing to declare.
+        self.assertIsNone(agents.VENDORS["baseten"].reasoning_effort)
 
     def test_openai_native_search_budget_is_not_api_enforced(self):
         # Anthropic takes max_uses; OpenAI's hosted web_search publishes no
@@ -800,10 +809,6 @@ class PreflightTest(unittest.TestCase):
                             "anthropic", "claude-opus-5")
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class SubsetSelectionTest(unittest.TestCase):
     """Every contrast is paired by task_key, so two arms drawn from different
     subsets lose their pairing silently — the drop shows up as missing data
@@ -841,3 +846,318 @@ class SubsetSelectionTest(unittest.TestCase):
     def test_unmatched_split_fails_loudly_rather_than_running_zero_rows(self):
         with self.assertRaises(SystemExit):
             run_eval.select_rows(list(self.ROWS), "human_verified_test", None)
+
+
+# ---------------------------------------------------------------------------
+# Harness protocol per vendor.
+#
+# These are regression tests for a failure that reached production: the OpenAI
+# harness arm ran on /v1/chat/completions, which rejects function tools alongside
+# reasoning effort on gpt-5-family models. Every row of a 40-row pilot errored
+# with a 400. The prior code chose the session class with
+# `if spec.name == "anthropic"`, so "OpenAI and Baseten are the same protocol"
+# was an assumption nothing asserted.
+# ---------------------------------------------------------------------------
+
+
+class RESPONSES:
+    """Fixture responses for the Responses-API harness session."""
+
+    # A reasoning item is included because the session must echo it back
+    # unmodified; a fixture without one would pass even if the code dropped it.
+    TOOL_CALL = {
+        "status": "completed",
+        "usage": {"input_tokens": 120, "output_tokens": 40},
+        "output": [
+            {"type": "reasoning", "id": "rs_1",
+             "summary": [{"type": "summary_text", "text": "need to search"}]},
+            {"type": "function_call", "id": "fc_1", "call_id": "call_abc",
+             "name": "search_web", "arguments": '{"query": "who won"}'},
+        ],
+    }
+    FINAL = {
+        "status": "completed",
+        "usage": {"input_tokens": 300, "output_tokens": 25},
+        "output": [
+            {"type": "message", "content": [
+                {"type": "output_text", "text": "Team Alpha", "annotations": []}]},
+        ],
+    }
+    MALFORMED_CALL = {
+        "status": "completed",
+        "usage": {"input_tokens": 10, "output_tokens": 5},
+        "output": [
+            {"type": "function_call", "id": "fc_2", "call_id": "call_bad",
+             "name": "search_web", "arguments": "not json"},
+        ],
+    }
+    REFUSAL = {
+        "status": "completed",
+        "usage": {"input_tokens": 10, "output_tokens": 5},
+        "output": [
+            {"type": "message", "content": [
+                {"type": "refusal", "refusal": "I can't help with that."}]},
+        ],
+    }
+    TRUNCATED = {
+        "status": "incomplete",
+        "incomplete_details": {"reason": "max_output_tokens"},
+        "usage": {"input_tokens": 10, "output_tokens": 16384},
+        "output": [
+            {"type": "message", "content": [
+                {"type": "output_text", "text": "Team Al", "annotations": []}]},
+        ],
+    }
+
+
+class FakeResponsesSequence:
+    """Returns a scripted response per call, so a multi-turn loop can be driven."""
+
+    def __init__(self, responses):
+        self.queue = list(responses)
+        self.calls = []
+
+    def create(self, **kwargs):
+        self.calls.append(kwargs)
+        if not self.queue:
+            raise AssertionError("session made more requests than scripted")
+        return self.queue.pop(0) if len(self.queue) > 1 else self.queue[0]
+
+
+class FakeSequencedOpenAIClient:
+    def __init__(self, responses):
+        self.responses = FakeResponsesSequence(responses)
+
+
+class HarnessProtocolRegistryTest(unittest.TestCase):
+    def test_openai_harness_does_not_run_on_chat_completions(self):
+        # The exact production failure: chat completions returns 400 for function
+        # tools + reasoning effort on gpt-5-family, and the model's DEFAULT effort
+        # is not 'none', so omitting the parameter does not help.
+        self.assertEqual(agents.VENDORS["openai"].harness_protocol,
+                         agents.PROTOCOL_RESPONSES)
+
+    def test_baseten_stays_on_chat_completions(self):
+        # Baseten Model APIs expose no Responses endpoint, so both session types
+        # must remain supported — this is not a migration.
+        self.assertEqual(agents.VENDORS["baseten"].harness_protocol,
+                         agents.PROTOCOL_CHAT_COMPLETIONS)
+
+    def test_every_vendor_protocol_has_a_session_class(self):
+        for name, spec in agents.VENDORS.items():
+            with self.subTest(vendor=name):
+                self.assertIn(spec.harness_protocol, agents.HARNESS_SESSIONS)
+
+    def test_each_protocol_selects_its_own_session_class(self):
+        expected = {
+            "openai": agents.OpenAIResponsesHarnessSession,
+            "baseten": agents.OpenAIHarnessSession,
+            "anthropic": agents.AnthropicHarnessSession,
+        }
+        for vendor, session_class in expected.items():
+            with self.subTest(vendor=vendor):
+                session = agents.make_harness_session(
+                    object(), agents.VENDORS[vendor], "m", "sys")
+                self.assertIsInstance(session, session_class)
+
+    def test_an_unknown_protocol_fails_loudly_rather_than_defaulting(self):
+        spec = dataclasses.replace(agents.VENDORS["openai"],
+                                   harness_protocol="grpc")
+        with self.assertRaises(SystemExit) as caught:
+            agents.make_harness_session(object(), spec, "m", "sys")
+        self.assertIn("grpc", str(caught.exception))
+
+    def test_openai_effort_is_pinned_now_that_responses_permits_it(self):
+        # Left unpinned previously to dodge the chat-completions rejection. On
+        # Responses it can be pinned, which is what makes this vendor's
+        # native-vs-harness contrast one-variable.
+        self.assertEqual(agents.VENDORS["openai"].reasoning_effort,
+                         agents.OPENAI_EFFORT)
+
+    def test_both_frontier_vendors_declare_the_same_effort(self):
+        # Not required for validity — every primary contrast holds the model
+        # fixed — but an undeclared difference in reasoning depth would be a
+        # confound in any cross-vendor reading of the results.
+        self.assertEqual(agents.VENDORS["openai"].reasoning_effort,
+                         agents.VENDORS["anthropic"].reasoning_effort)
+
+
+class OpenAIResponsesHarnessSessionTest(unittest.TestCase):
+    def _session(self, responses):
+        client = FakeSequencedOpenAIClient(responses)
+        session = agents.make_harness_session(
+            client, agents.VENDORS["openai"], "gpt-5.6-sol", "sys prompt")
+        return client, session
+
+    def test_function_tool_is_flat_not_nested_under_function(self):
+        # Responses puts name/description/parameters at the top level; chat
+        # completions nests them. Sending the nested shape here is a 400.
+        client, session = self._session([RESPONSES.FINAL])
+        session.add_user("who won?")
+        session.step(tools_enabled=True)
+        tool = client.responses.calls[0]["tools"][0]
+        self.assertEqual(tool["type"], "function")
+        self.assertEqual(tool["name"], agents.SEARCH_TOOL_NAME)
+        self.assertNotIn("function", tool)
+
+    def test_tool_schema_is_shared_verbatim_with_the_other_protocols(self):
+        # The agent must be the same across arms. A protocol-specific schema
+        # would make "the tool" a different tool on this arm.
+        client, session = self._session([RESPONSES.FINAL])
+        session.add_user("q")
+        session.step(tools_enabled=True)
+        tool = client.responses.calls[0]["tools"][0]
+        self.assertIs(tool["parameters"], agents.SEARCH_TOOL_PARAMETERS)
+        self.assertFalse(tool["strict"])
+
+    def test_reasoning_effort_and_output_cap_are_sent(self):
+        client, session = self._session([RESPONSES.FINAL])
+        session.add_user("q")
+        session.step(tools_enabled=True)
+        sent = client.responses.calls[0]
+        self.assertEqual(sent["reasoning"], {"effort": agents.OPENAI_EFFORT})
+        self.assertEqual(sent["max_output_tokens"],
+                         agents.OPENAI_MAX_OUTPUT_TOKENS)
+
+    def test_system_prompt_travels_in_instructions_not_the_turn_list(self):
+        client, session = self._session([RESPONSES.FINAL])
+        session.add_user("who won?")
+        session.step(tools_enabled=True)
+        sent = client.responses.calls[0]
+        self.assertEqual(sent["instructions"], "sys prompt")
+        self.assertEqual(sent["input"], [{"role": "user", "content": "who won?"}])
+
+    def test_tool_call_is_parsed_and_keyed_on_call_id(self):
+        # call_id, not id, is what function_call_output correlates on. Echoing
+        # `id` back is accepted by the API and then never matched to the call.
+        _, session = self._session([RESPONSES.TOOL_CALL])
+        session.add_user("who won?")
+        turn = session.step(tools_enabled=True)
+        self.assertEqual(len(turn.tool_calls), 1)
+        call = turn.tool_calls[0]
+        self.assertEqual(call["id"], "call_abc")
+        self.assertEqual(call["name"], agents.SEARCH_TOOL_NAME)
+        self.assertEqual(call["arguments"], {"query": "who won"})
+        self.assertFalse(call["malformed"])
+
+    def test_malformed_arguments_are_flagged_not_raised(self):
+        _, session = self._session([RESPONSES.MALFORMED_CALL])
+        session.add_user("q")
+        turn = session.step(tools_enabled=True)
+        self.assertTrue(turn.tool_calls[0]["malformed"])
+        self.assertEqual(turn.tool_calls[0]["arguments"], {})
+
+    def test_reasoning_items_are_echoed_back_unmodified(self):
+        # Dropping them is legal but discards reasoning context between tool
+        # calls, weakening this arm relative to the Anthropic harness arm for a
+        # reason that has nothing to do with search.
+        client, session = self._session([RESPONSES.TOOL_CALL, RESPONSES.FINAL])
+        session.add_user("who won?")
+        session.step(tools_enabled=True)
+        session.add_tool_results([("call_abc", "results here")])
+        session.step(tools_enabled=True)
+        sent = client.responses.calls[1]["input"]
+        reasoning = [i for i in sent if i.get("type") == "reasoning"]
+        self.assertEqual(len(reasoning), 1)
+        self.assertIs(reasoning[0], RESPONSES.TOOL_CALL["output"][0])
+
+    def test_tool_result_goes_back_as_function_call_output(self):
+        client, session = self._session([RESPONSES.TOOL_CALL, RESPONSES.FINAL])
+        session.add_user("who won?")
+        session.step(tools_enabled=True)
+        session.add_tool_results([("call_abc", "results here")])
+        session.step(tools_enabled=True)
+        sent = client.responses.calls[1]["input"]
+        self.assertEqual(sent[-1], {
+            "type": "function_call_output",
+            "call_id": "call_abc",
+            "output": "results here",
+        })
+
+    def test_out_of_budget_forbids_calls_without_undeclaring_the_tool(self):
+        # The input list already holds function_call items; a request carrying
+        # those without the tool declared is rejected. Same constraint the
+        # Anthropic session documents.
+        client, session = self._session([RESPONSES.TOOL_CALL, RESPONSES.FINAL])
+        session.add_user("who won?")
+        session.step(tools_enabled=True)
+        session.add_tool_results([("call_abc", "results")])
+        session.step(tools_enabled=False)
+        sent = client.responses.calls[1]
+        self.assertEqual(sent["tool_choice"], "none")
+        self.assertIn("tools", sent)
+
+    def test_control_arm_never_declares_the_tool_at_all(self):
+        # The no-search arm must differ from the harness arm ONLY in tool
+        # availability, and it has no tool_use history to keep valid.
+        client, session = self._session([RESPONSES.FINAL])
+        session.add_user("who won?")
+        turn = session.step(tools_enabled=False)
+        sent = client.responses.calls[0]
+        self.assertNotIn("tools", sent)
+        self.assertNotIn("tool_choice", sent)
+        self.assertEqual(turn.text, "Team Alpha")
+
+    def test_usage_is_read_from_the_responses_field_names(self):
+        # input_tokens/output_tokens here, prompt_tokens/completion_tokens on
+        # chat completions. Reading the wrong pair silently reports zero cost.
+        _, session = self._session([RESPONSES.FINAL])
+        session.add_user("q")
+        turn = session.step(tools_enabled=True)
+        self.assertEqual(turn.prompt_tokens, 300)
+        self.assertEqual(turn.completion_tokens, 25)
+
+    def test_refusal_is_recorded_and_yields_no_answer_text(self):
+        _, session = self._session([RESPONSES.REFUSAL])
+        session.add_user("q")
+        turn = session.step(tools_enabled=True)
+        self.assertTrue(turn.refused)
+        self.assertEqual(turn.text, "")
+
+    def test_truncation_is_read_from_incomplete_details(self):
+        _, session = self._session([RESPONSES.TRUNCATED])
+        session.add_user("q")
+        turn = session.step(tools_enabled=True)
+        self.assertTrue(turn.truncated)
+
+
+class OpenAINativeEffortTest(unittest.TestCase):
+    def test_native_arm_sends_the_effort_it_is_given(self):
+        client = FakeOpenAIClient(OPENAI_RESPONSE)
+        agents.openai_native_search(
+            client, "gpt-5.6-sol", "sys", "who won?", [], "high")
+        self.assertEqual(client.responses.calls[0]["reasoning"],
+                         {"effort": "high"})
+
+    def test_native_arm_omits_reasoning_when_effort_is_unpinned(self):
+        client = FakeOpenAIClient(OPENAI_RESPONSE)
+        agents.openai_native_search(
+            client, "gpt-5.6-sol", "sys", "who won?", [], None)
+        self.assertNotIn("reasoning", client.responses.calls[0])
+
+    def test_native_arm_caps_output_like_the_harness_arm(self):
+        client = FakeOpenAIClient(OPENAI_RESPONSE)
+        agents.openai_native_search(
+            client, "gpt-5.6-sol", "sys", "who won?", [], "high")
+        self.assertEqual(client.responses.calls[0]["max_output_tokens"],
+                         agents.OPENAI_MAX_OUTPUT_TOKENS)
+
+    def test_native_truncation_is_recorded(self):
+        response = dict(OPENAI_RESPONSE,
+                        incomplete_details={"reason": "max_output_tokens"})
+        run = agents.openai_native_search(
+            FakeOpenAIClient(response), "gpt-5.6-sol", "sys", "q", [], "high")
+        self.assertTrue(run.truncated)
+
+    def test_native_refusal_is_recorded(self):
+        response = dict(OPENAI_RESPONSE, output=[
+            {"type": "message", "content": [
+                {"type": "refusal", "refusal": "no"}]}])
+        run = agents.openai_native_search(
+            FakeOpenAIClient(response), "gpt-5.6-sol", "sys", "q", [], "high")
+        self.assertTrue(run.refused)
+        self.assertEqual(run.final_answer, "")
+
+
+if __name__ == "__main__":
+    unittest.main()
