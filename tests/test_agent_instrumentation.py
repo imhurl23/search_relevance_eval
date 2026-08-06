@@ -802,3 +802,42 @@ class PreflightTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SubsetSelectionTest(unittest.TestCase):
+    """Every contrast is paired by task_key, so two arms drawn from different
+    subsets lose their pairing silently — the drop shows up as missing data
+    rather than as an error. Determinism here is what makes that impossible."""
+
+    ROWS = [{"id": f"row-{i:02d}",
+             "metadata": {"livenewsbench_split": "test" if i % 2 else "val"}}
+            for i in range(10)]
+
+    def test_no_flags_returns_the_dataset_untouched(self):
+        data, meta = run_eval.select_rows(self.ROWS, None, None)
+        self.assertIs(data, self.ROWS)
+        self.assertFalse(meta["subset_applied"])
+
+    def test_limit_is_deterministic_across_input_orderings(self):
+        # Iteration order of a dataset is not contractually stable, so the slice
+        # must be taken after sorting by id -- otherwise two arms can request
+        # "the first 5 rows" and get different rows.
+        a, ma = run_eval.select_rows(list(self.ROWS), None, 5)
+        b, mb = run_eval.select_rows(list(reversed(self.ROWS)), None, 5)
+        self.assertEqual([r["id"] for r in a], [r["id"] for r in b])
+        self.assertEqual(ma["subset_id"], mb["subset_id"])
+
+    def test_subset_id_changes_when_the_selection_changes(self):
+        _, five = run_eval.select_rows(list(self.ROWS), None, 5)
+        _, six = run_eval.select_rows(list(self.ROWS), None, 6)
+        self.assertNotEqual(five["subset_id"], six["subset_id"])
+
+    def test_split_filters_and_is_recorded(self):
+        rows, meta = run_eval.select_rows(list(self.ROWS), "test", None)
+        self.assertEqual(len(rows), 5)
+        self.assertEqual(meta["split"], "test")
+        self.assertEqual(meta["n_available"], 10)
+
+    def test_unmatched_split_fails_loudly_rather_than_running_zero_rows(self):
+        with self.assertRaises(SystemExit):
+            run_eval.select_rows(list(self.ROWS), "human_verified_test", None)

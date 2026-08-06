@@ -750,6 +750,47 @@ def _run_native(client, spec, agent_model, system_prompt, question,
 # temporal_grounding. Do not reintroduce it.
 # ---------------------------------------------------------------------------
 
+def select_rows(dataset, split: str | None, limit: int | None):
+    """Deterministically subset a dataset, and fingerprint what was selected.
+
+    Pilots and cost-bounded runs need a subset, but a subset is only usable if
+    EVERY arm sees the same rows — all contrasts are paired by task_key, so two
+    arms drawn from different subsets silently lose their pairing and the drop
+    shows up as missing data rather than as an error.
+
+    Determinism therefore comes from sorting by row id before slicing, not from
+    dataset iteration order, which is not contractually stable. `subset_id` is a
+    hash of the selected ids: two runs claiming to be comparable must show the
+    same value, which makes a pairing mistake checkable instead of assumed.
+    """
+    if split is None and limit is None:
+        return dataset, {"subset_applied": False, "split": None,
+                         "limit": None, "n_rows": None, "n_available": None,
+                         "subset_id": None}
+
+    rows = list(dataset)
+    n_available = len(rows)
+    if split is not None:
+        rows = [r for r in rows
+                if ((r.get("metadata") or {}).get("livenewsbench_split") == split
+                    or (r.get("metadata") or {}).get("corvus_split") == split)]
+        if not rows:
+            raise SystemExit(
+                f"--split {split!r} matched no rows out of {n_available}")
+    rows.sort(key=lambda r: str(r.get("id", "")))
+    if limit is not None:
+        rows = rows[:limit]
+    ids = [str(r.get("id", "")) for r in rows]
+    return rows, {
+        "subset_applied": True,
+        "split": split,
+        "limit": limit,
+        "n_rows": len(rows),
+        "n_available": n_available,
+        "subset_id": hashlib.sha256("\n".join(ids).encode()).hexdigest()[:16],
+    }
+
+
 def _git_commit() -> str:
     try:
         return subprocess.check_output(
@@ -824,7 +865,8 @@ def build_judges(specs: list[str]):
 def run(arm: str, dataset_name: str, dataset_version: str | None,
         trials: int, judge_specs: list[str], agent_model: str, study_id: str,
         env_path: Path, search_mode: str = SEARCH_MODE_HARNESS,
-        model_vendor: str = DEFAULT_MODEL_VENDOR):
+        model_vendor: str = DEFAULT_MODEL_VENDOR,
+        split: str | None = None, limit: int | None = None):
     api_key, project_id = load_runtime_env(env_path)
     _preflight(arm, search_mode, model_vendor, agent_model)
     spec = vendor_of(model_vendor)
@@ -836,6 +878,12 @@ def run(arm: str, dataset_name: str, dataset_version: str | None,
     resolved_version = dataset_version or dataset.version
     print(f"Dataset: {project_name}/{dataset.name} @ version {resolved_version}"
           f"{'' if dataset_version else '  (latest; pass --dataset-version to pin)'}")
+
+    data, subset = select_rows(dataset, split, limit)
+    if subset["subset_applied"]:
+        print(f"Rows: {subset['n_rows']} of {subset['n_available']} "
+              f"(split={subset['split'] or 'all'}, limit={limit}) "
+              f"subset_id={subset['subset_id']}")
 
     judges = build_judges(judge_specs)
     # One judge keeps SimpleQA parity with LiveNewsBench's published numbers;
@@ -864,7 +912,7 @@ def run(arm: str, dataset_name: str, dataset_version: str | None,
     Eval(
         project_name,
         experiment_name=experiment_name,
-        data=dataset,
+        data=data,
         task=make_task(
             arm,
             agent_model,
@@ -903,6 +951,9 @@ def run(arm: str, dataset_name: str, dataset_version: str | None,
             "dataset_name": dataset.name,
             "dataset_version": resolved_version,
             "dataset_version_pinned": bool(dataset_version),
+            # Two runs are only comparable if these match: every contrast is
+            # paired by task_key, so differing subsets lose the pairing silently.
+            **{f"row_{k}": v for k, v in subset.items()},
             "budget": {"searches": MAX_SEARCHES, "clicks": MAX_CLICKS},
             # --- what the agent was actually configured with ---
             # No frontier vendor permits temperature/seed: gpt-5-family models
@@ -1021,6 +1072,16 @@ def main():
                    help="Repeatable. One judge keeps SimpleQA parity; three or "
                         "more convene a majority-vote jury. Use model@base_url "
                         "with JUDGE_API_KEY for non-OpenAI routes.")
+    r.add_argument("--split", default=None,
+                   help="Restrict to one dataset split (LiveNewsBench: val, "
+                        "train, test, human_verified_test; Corvus-QA: dev, "
+                        "test). Applied identically to every arm or the pairing "
+                        "breaks.")
+    r.add_argument("--limit", type=int, default=None,
+                   help="Cap rows per run, taken deterministically after "
+                        "sorting by row id. Required for a cost-bounded pilot: "
+                        "the full LiveNewsBench set is 1329 rows, so 22 runs at "
+                        "3 trials is ~88k rows.")
     r.add_argument("--env-file", type=Path, default=Path(".env"))
 
     args = ap.parse_args()
@@ -1048,9 +1109,12 @@ def main():
 
     agent_model = args.agent_model or VENDORS[args.model_vendor].default_model
     # gpt-4.1 default keeps parity with LiveNewsBench's published grading.
+    if args.limit is not None and args.limit < 1:
+        ap.error("--limit must be at least 1")
     run(args.arm, args.dataset_name, args.dataset_version,
         args.trials, args.judges or ["gpt-4.1"], agent_model,
-        args.study_id, args.env_file, search_mode, args.model_vendor)
+        args.study_id, args.env_file, search_mode, args.model_vendor,
+        args.split, args.limit)
 
 
 if __name__ == "__main__":
