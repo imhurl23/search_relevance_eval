@@ -253,7 +253,7 @@ class OfficerTransition(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    role_attribute: str = Field(pattern=r"^(ceo_of|chairperson_of)$")
+    role_attribute: str = Field(pattern=r"^(ceo_of|chairperson_of|cfo_of|coo_of)$")
     old_value: str | None = None
     new_value: str = Field(min_length=1)
     effective_ts: datetime

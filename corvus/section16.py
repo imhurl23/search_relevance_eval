@@ -59,6 +59,34 @@ CHAIR_TITLE = re.compile(
     r"\b(?:chair(?:person|man|woman)?)\b(?:\s+of\s+the\s+board)?",
     re.IGNORECASE,
 )
+# CFO and COO are mapped as well as CEO and chair. This is a yield decision with
+# a measured basis: across one month's paired Form 3s, 28 filings carried a CEO
+# title and 2 a chair title, while 41 carried a CFO title and 11 a COO title. A
+# CEO-and-chair-only mapping discards roughly three quarters of the corroborated
+# transitions in the window, which is what held the dev split below the size a
+# freshness contrast needs.
+#
+# These are issuer-level named offices with the same properties that made CEO
+# usable: a single incumbent, an unambiguous title, and a Section 16 filing by
+# the appointee. The deputy/vice/assistant lookbehinds and the interim/acting/co-
+# refusals in officer_role_attribute apply identically.
+CFO_TITLE = re.compile(
+    r"(?<!\bdeputy\s)(?<!\bvice\s)(?<!\bassistant\s)"
+    r"\b(?:chief\s+financial\s+officer|c\.?f\.?o\.?)\b",
+    re.IGNORECASE,
+)
+COO_TITLE = re.compile(
+    r"(?<!\bdeputy\s)(?<!\bvice\s)(?<!\bassistant\s)"
+    r"\b(?:chief\s+operat(?:ing|ions)\s+officer|c\.?o\.?o\.?)\b",
+    re.IGNORECASE,
+)
+# `President` is deliberately NOT mapped. In the same window it would add only
+# four filings, and its common spellings are ambiguous in a way the other titles
+# are not: "President, CARFAX" and "President, CSE" name business units rather
+# than the issuer, and neither is caught by _is_scoped_below_issuer because
+# neither uses "of X" or a division keyword. The safe variants ("President and
+# Chief Executive Officer") already map through CEO_TITLE, which is checked
+# first, so nothing is lost that matters.
 # "CEO of Acme Europe" and "President & CEO, Retail Division" are subsidiary or
 # divisional offices, not the issuer-level office the question asks about.
 # Phrases that merely restate the issuer are benign and stripped before the
@@ -160,6 +188,10 @@ def officer_role_attribute(title: str | None) -> str | None:
         return None
     if _is_scoped_below_issuer(text):
         return None
+    # Order is significant: a combined title like "President & CEO" or
+    # "EVP, CFO & Treasurer" names more than one office, and the FIRST match wins.
+    # CEO is checked first so a chief executive who is also chair or CFO is
+    # recorded as the chief executive, which is the office the question asks about.
     if CEO_TITLE.search(text):
         return "ceo_of"
     # A board chair is often reported as a director rather than an officer. The
@@ -168,6 +200,10 @@ def officer_role_attribute(title: str | None) -> str | None:
     # what distinguishes the office.
     if CHAIR_TITLE.search(text):
         return "chairperson_of"
+    if CFO_TITLE.search(text):
+        return "cfo_of"
+    if COO_TITLE.search(text):
+        return "coo_of"
     return None
 
 

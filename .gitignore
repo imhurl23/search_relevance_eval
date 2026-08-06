@@ -39,6 +39,14 @@ data/corvus_live/**
 !data/corvus_live/**/
 !data/corvus_live/*/README.md
 
+# Frozen benchmark artifacts are gold answers. The source policy releases only
+# derived facts and source URLs AND requires legal review before publication, so
+# committing a freeze to git would publish it ahead of that review. Same
+# treatment as collected data: the card is documentation, the artifact is not.
+curation/**
+!curation/**/
+!curation/*/README.md
+
 # Editor and operating-system files
 .DS_Store
 .idea/

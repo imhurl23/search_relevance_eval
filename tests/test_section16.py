@@ -160,6 +160,34 @@ class TitleMappingTests(unittest.TestCase):
                       "Board of Directors Chairman"):
             self.assertEqual(officer_role_attribute(title), "chairperson_of", title)
 
+    def test_maps_cfo_and_coo_spellings(self):
+        # CFO and COO are mapped offices, not refusals. Across one month's paired
+        # Form 3s they contribute 43 and 15 filings against CEO's 28 — a
+        # CEO-only mapping discards most of the corroborated transitions.
+        for title in ("Chief Financial Officer", "CFO", "EVP, CFO & Treasurer",
+                      "EVP, Finance and CFO",
+                      "Executive Vice President & CFO"):
+            self.assertEqual(officer_role_attribute(title), "cfo_of", title)
+        for title in ("Chief Operating Officer", "Chief Operations Officer",
+                      "EVP, COO", "Executive VP and COO"):
+            self.assertEqual(officer_role_attribute(title), "coo_of", title)
+
+    def test_the_most_senior_office_wins_a_combined_title(self):
+        # A combined title names more than one office. The question asks about one
+        # of them, so the mapping must be deterministic about which.
+        self.assertEqual(officer_role_attribute("CEO & Chairman of the Board"),
+                         "ceo_of")
+        self.assertEqual(officer_role_attribute("CFO and COO"), "cfo_of")
+        self.assertEqual(officer_role_attribute("Chief Operating Officer & CLO"),
+                         "coo_of")
+
+    def test_president_is_not_mapped_on_its_own(self):
+        # "President, CARFAX" and "President, CSE" name business units, and
+        # neither is caught by the scoped-office check because neither uses "of X"
+        # nor a division keyword. The safe variants map through CEO_TITLE.
+        for title in ("President", "President, CARFAX", "President, CSE"):
+            self.assertIsNone(officer_role_attribute(title), title)
+
     def test_refuses_co_held_offices(self):
         # "Co-CEO" has no single answer to "who is the CEO", so it cannot be a
         # benchmark row however well it is corroborated.
@@ -173,8 +201,14 @@ class TitleMappingTests(unittest.TestCase):
             "Interim CEO",
             "Acting Chief Executive Officer",
             "Vice Chairman",
-            "Chief Financial Officer",
+            "Deputy Chief Financial Officer",
+            "Interim CFO",
+            "Assistant Chief Operating Officer",
+            "Chief Accounting Officer",
+            "Chief Legal Officer",
+            "Chief Medical Officer",
             "CEO of Acme Europe",
+            "Chief Financial Officer of Acme Europe",
             "President & CEO, Retail Division",
             "",
             None,

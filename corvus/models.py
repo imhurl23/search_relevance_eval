@@ -238,6 +238,8 @@ class TrapObservation(BaseModel):
 QUESTION_TEMPLATES: dict[str, str] = {
     "ceo_of": "Who is the CEO of {entity_name}?",
     "chairperson_of": "Who is the chairperson of {entity_name}?",
+    "cfo_of": "Who is the CFO of {entity_name}?",
+    "coo_of": "Who is the COO of {entity_name}?",
     "head_coach_of": "Who is the head coach of {entity_name}?",
     "latest_stable_version": "What is the latest stable release of {entity_name}?",
     "cvss_score": "What is the current CVSS score for {entity_name}?",

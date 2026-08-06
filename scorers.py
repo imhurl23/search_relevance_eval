@@ -281,7 +281,7 @@ REFUSAL_SENTINEL = "i could not find this"
 #    (judge keeps parity with evals/grade_answers.py)
 # ---------------------------------------------------------------------------
 
-def qa_answer_match(input, output, expected, **kwargs):
+def qa_answer_match(input, output, expected, metadata=None, **kwargs):
     """Deterministic answer correctness: normalized exact or containment match
     against any acceptable gold answer.
 
@@ -296,8 +296,25 @@ def qa_answer_match(input, output, expected, **kwargs):
     does not match. Semantic paraphrase is out of scope by design — that is what
     the judge is for. Disagreement between this and the judge is the interesting
     signal, so keep both.
+
+    A dataset's OWN curated aliases count as gold. This is not alias derivation —
+    it is reading the acceptable answers the dataset publishes. Corvus-QA's
+    `expected` is EDGAR's full legal name ("Steven Vincent Oroho Jr") while every
+    other source on the web writes the everyday form ("Steve Oroho"), and the
+    filing's own spelling is published in `metadata["answer_aliases"]` precisely
+    so a correct answer is not scored wrong for using it. Ignoring that field cost
+    7 of 29 correct answers on a fresh Corvus-QA freeze — a 24-point understatement
+    that landed entirely on the retrieval arms, since those are the arms that
+    return real-world name forms at all.
     """
     golds = _expected_answers(expected)
+    curated = _metadata(metadata, kwargs).get("answer_aliases") or []
+    seen = {_normalize_answer(gold) for gold in golds}
+    for alias in curated:
+        text = str(alias).strip()
+        if text and _normalize_answer(text) not in seen:
+            seen.add(_normalize_answer(text))
+            golds.append(text)
     prediction = _output_answer(output)
     pred_norm = _normalize_answer(prediction)
 
@@ -958,7 +975,7 @@ def gated_answer_match(input, output, expected, metadata=None, **kwargs):
     analysis-side join instead — Braintrust scorers cannot read each other's
     outputs.
     """
-    answer = qa_answer_match(input, output, expected, **kwargs)
+    answer = qa_answer_match(input, output, expected, metadata=metadata, **kwargs)
     if answer.get("score") is None:
         return {"name": "gated_answer_match", "score": None,
                 "metadata": {"applicable": False,
