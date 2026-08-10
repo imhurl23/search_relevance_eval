@@ -98,6 +98,13 @@ RUNTIME_ENV_NAMES = (
     "BASETEN_API_KEY",
     "YDC_API_KEY",
     "JUDGE_API_KEY",
+    # Serving path. Setting BRAINTRUST_GATEWAY_URL routes every vendor through
+    # the Braintrust gateway, which then supplies the vendor credentials from the
+    # org rather than from the three keys above. See agents.gateway_config.
+    agents.GATEWAY_URL_ENV,
+    agents.GATEWAY_KEY_ENV,
+    agents.GATEWAY_PROJECT_ENV,
+    agents.GATEWAY_ORG_ENV,
 )
 
 
@@ -508,6 +515,22 @@ def make_task(
         # not average it away.
         search_available = search_mode != SEARCH_MODE_NONE
         zero_search_row = bool(search_available and outcome["used_searches"] == 0)
+        # The sibling confound to zero_search_row: the model DID search, but the
+        # search layer failed, so the row carries a search arm's label while
+        # having been served less retrieval than the condition specifies. A
+        # partly-degraded row still answers, and the judge still scores that
+        # answer, so without this flag a provider outage reads as the model
+        # getting worse. Filter on it in analysis the same way — do not average
+        # it away.
+        search_errors = outcome["search_errors"]
+        search_degraded = bool(search_errors)
+        # Stronger case: every search the model attempted failed, so the row
+        # received no retrieval at all and its answer is parametric. That makes
+        # it a no-search row wearing a search arm's label, exactly what
+        # zero_search_row catches for the never-tried case.
+        search_fully_failed = bool(
+            search_available and outcome["used_searches"] > 0
+            and not outcome["trajectory"])
 
         hooks.metadata.update({
             # --- matrix axes: the four fields any slice should key on ---
@@ -561,10 +584,12 @@ def make_task(
             "search_budget": MAX_SEARCHES,
             # --- per-row integrity flags ---
             "zero_search_row": zero_search_row,
+            "search_degraded": search_degraded,
+            "search_fully_failed": search_fully_failed,
             "bad_tool_calls": outcome["bad_tool_calls"],
             "refused_searches": outcome["refused_searches"],
             "refused_clicks": outcome["refused_clicks"],
-            "search_errors": outcome["search_errors"],
+            "search_errors": search_errors,
             "model_refused": outcome["refused"],
             "answer_truncated": outcome["truncated"],
             "pause_turns": outcome["pause_turns"],
@@ -581,7 +606,8 @@ def make_task(
         # keeps that arm out of a cost frontier instead of placing it at the
         # origin — where it would read as free.
         inference_cost, cost_confirmed = agents.model_cost_usd(
-            agent_model, outcome["prompt_tokens"], outcome["completion_tokens"])
+            agent_model, outcome["prompt_tokens"], outcome["completion_tokens"],
+            outcome["cached_prompt_tokens"])
         cost_metrics = {"search_cost_usd": outcome["search_cost"]}
         if inference_cost is not None:
             cost_metrics["model_cost_usd"] = inference_cost
@@ -601,6 +627,14 @@ def make_task(
             "refused_tool_calls": (
                 outcome["refused_searches"] + outcome["refused_clicks"]),
             "agent_prompt_tokens": outcome["prompt_tokens"],
+            # Cached input bills at a fraction of the base rate, and OpenAI
+            # caches automatically on every turn after the first. Logged so a
+            # cost difference between arms can be traced to cache behavior
+            # rather than read as a difference in work done.
+            "agent_cached_prompt_tokens": outcome["cached_prompt_tokens"],
+            "agent_cache_hit_rate": (
+                outcome["cached_prompt_tokens"] / outcome["prompt_tokens"]
+                if outcome["prompt_tokens"] else 0.0),
             "agent_completion_tokens": outcome["completion_tokens"],
             "agent_total_tokens": (
                 outcome["prompt_tokens"] + outcome["completion_tokens"]),
@@ -608,7 +642,9 @@ def make_task(
             "answer_chars": len(final),
             "distinct_surfaced_domains": len(surfaced),
             "zero_search_row": int(zero_search_row),
-            "n_search_errors": len(outcome["search_errors"]),
+            "n_search_errors": len(search_errors),
+            "search_degraded": int(search_degraded),
+            "search_fully_failed": int(search_fully_failed),
         })
         return {
             "final_answer": final,
@@ -629,11 +665,26 @@ def make_task(
     return task
 
 
+def _search_error_code(exc: httpx.HTTPError) -> str:
+    """Normalize a search failure onto the native arms' `error_code` shape.
+
+    An HTTP status is the useful discriminator (429 and 5xx mean the provider
+    was overloaded and the row is retryable; 4xx means the request was wrong and
+    every row will fail the same way), so it is preferred over the exception
+    class. Transport failures have no status, so they fall back to the class
+    name rather than a fabricated code.
+    """
+    response = getattr(exc, "response", None)
+    status = getattr(response, "status_code", None)
+    return str(status) if status is not None else type(exc).__name__
+
+
 def _blank_outcome(decision_surface: str) -> dict:
     return {
         "final_answer": "", "trajectory": [], "used_searches": 0,
         "used_clicks": 0, "refused_searches": 0, "refused_clicks": 0,
         "bad_tool_calls": 0, "search_cost": 0.0, "prompt_tokens": 0,
+        "cached_prompt_tokens": 0,
         "completion_tokens": 0, "decision_surface": decision_surface,
         "exclusion_enforced": False, "citations": [], "search_errors": [],
         "refused": False, "truncated": False, "pause_turns": 0,
@@ -664,6 +715,7 @@ def _run_harness(client, spec, agent_model, system_prompt, question, excludes,
                          and out["used_clicks"] >= MAX_CLICKS)
         turn = session.step(tools_enabled=tools_allowed and not out_of_budget)
         out["prompt_tokens"] += turn.prompt_tokens
+        out["cached_prompt_tokens"] += turn.cached_prompt_tokens
         out["completion_tokens"] += turn.completion_tokens
         if turn.refused:
             out["refused"] = True
@@ -683,21 +735,51 @@ def _run_harness(client, spec, agent_model, system_prompt, question, excludes,
                     out["refused_searches"] += 1
                     content = "Search budget exhausted."
                 else:
+                    # Incremented BEFORE the call, so a failed search still
+                    # spends budget. The native arms already work this way ("an
+                    # error round still spent budget"), and not charging for a
+                    # failure would hand a flaky provider unlimited retries
+                    # inside the turn cap.
                     out["used_searches"] += 1
                     query = call["arguments"].get("query", "")
-                    results, content, tok = run_search(
-                        arm, query, excludes)
-                    # Accumulated per call rather than computed as
-                    # searches x rate at the end, so a mid-row failure still
-                    # bills what it actually spent. You.com prices per call
-                    # regardless of `count`, so the two agree today; keeping the
-                    # accumulation means a per-result price would not silently
-                    # under-report.
-                    out["search_cost"] += search_cost_usd(
-                        arm, len(results))
-                    out["trajectory"].append({
-                        "type": "search", "query": query,
-                        "tokens": tok, "results": results})
+                    try:
+                        results, content, tok = run_search(
+                            arm, query, excludes)
+                    except httpx.HTTPError as exc:
+                        # The provider failed after _provider_json's retries.
+                        # Recorded and survivable rather than fatal: killing the
+                        # row would drop it from the dataset entirely, and rows
+                        # do not drop at random — a provider fails hardest on the
+                        # queries it handles worst, so the surviving rows would
+                        # be a favorable subset of the ones actually asked.
+                        #
+                        # Only httpx.HTTPError is caught. The ValueErrors
+                        # _provider_json raises are integrity guards (refused
+                        # redirect, unapproved host, non-object JSON) — those
+                        # mean the environment is wrong, not that one search
+                        # failed, and they must stop the run rather than be
+                        # logged as routine.
+                        out["search_errors"].append(
+                            {"query": query, "error_code": _search_error_code(exc)})
+                        content = ("Search failed: the search API returned an "
+                                   "error for this query and no results are "
+                                   "available.")
+                    else:
+                        # Billed only on success. A request that errored out was
+                        # not a served search — the same rule the vendors apply
+                        # to their own server-side search.
+                        #
+                        # Accumulated per call rather than computed as
+                        # searches x rate at the end, so a mid-row failure still
+                        # bills what it actually spent. You.com prices per call
+                        # regardless of `count`, so the two agree today; keeping
+                        # the accumulation means a per-result price would not
+                        # silently under-report.
+                        out["search_cost"] += search_cost_usd(
+                            arm, len(results))
+                        out["trajectory"].append({
+                            "type": "search", "query": query,
+                            "tokens": tok, "results": results})
             else:
                 out["bad_tool_calls"] += 1
                 content = (f"Unknown tool: {call['name']}. "
@@ -738,6 +820,7 @@ def _run_native(client, spec, agent_model, system_prompt, question,
         # than fabricated — budget_economy reads used_searches, not this.
         "search_cost": rate * run.n_searches,
         "prompt_tokens": run.prompt_tokens,
+        "cached_prompt_tokens": run.cached_prompt_tokens,
         "completion_tokens": run.completion_tokens,
         "exclusion_enforced": run.exclusion_enforced,
         "citations": run.citations,
@@ -805,6 +888,194 @@ def _git_commit() -> str:
         return "unknown"
 
 
+# ---------------------------------------------------------------------------
+# Gateway preflight
+#
+# The gateway can fail in ways a direct vendor call cannot, and all of them are
+# cheaper to hit before a run than on row 1 of N:
+#   * the token belongs to an org that has no provider configured for the model
+#     (404, gateway-origin) — the common case when a key is copied from the wrong
+#     Braintrust org
+#   * the token is not authorized for the org named in x-bt-org-name (401)
+#   * the org's stored vendor key is stale (403, vendor-origin)
+# The x-bt-error-origin response header separates gateway-side from vendor-side
+# failures, which is the difference between "fix your Braintrust settings" and
+# "fix your vendor account", so the message repeats it verbatim.
+# ---------------------------------------------------------------------------
+
+
+def _gateway_probe(gw, spec, agent_model: str):
+    """One minimal request over the wire this vendor's arm will use.
+
+    Carries the same sampling and reasoning knobs the real arm sends, not a bare
+    "hello". A proxy that rejects `temperature` on the OSS row, or `thinking` /
+    `reasoning.effort` on a frontier row, would otherwise pass a stripped-down
+    probe and then fail every row of the run — and on the OSS row a silently
+    *dropped* temperature is worse than a rejected one, because it unpins the
+    only sampling parameter this study manages to pin.
+
+    Returns the httpx.Response. Uses httpx rather than the SDK clients on
+    purpose: the SDKs raise typed exceptions that discard the response headers
+    this needs, and a preflight should read the failure, not re-raise it.
+    """
+    headers = {"Authorization": f"Bearer {gw.api_key}",
+               "Content-Type": "application/json", **gw.headers()}
+    if spec.name == "anthropic":
+        url = f"{gw.anthropic_base_url}/v1/messages"
+        headers["anthropic-version"] = "2023-06-01"
+        body = {"model": agent_model, "max_tokens": agents.ANTHROPIC_MAX_TOKENS,
+                "messages": [{"role": "user", "content": "ping"}],
+                "thinking": agents.ANTHROPIC_THINKING,
+                "output_config": {"effort": agents.ANTHROPIC_EFFORT}}
+    elif spec.harness_protocol == agents.PROTOCOL_RESPONSES:
+        url = f"{gw.openai_base_url}/responses"
+        body = {"model": agent_model, "input": "ping", "max_output_tokens": 16}
+        if spec.reasoning_effort:
+            body["reasoning"] = {"effort": spec.reasoning_effort}
+    else:
+        url = f"{gw.openai_base_url}/chat/completions"
+        body = {"model": agent_model, "max_tokens": 16,
+                "messages": [{"role": "user", "content": "ping"}],
+                **spec.sampling}
+    return httpx.post(url, headers=headers, json=body, timeout=120.0)
+
+
+# Values x-bt-error-origin uses for a failure raised by the proxy itself rather
+# than relayed from a model vendor. A missing header means the same thing.
+_GATEWAY_ORIGINS = ("braintrust", "gateway", "proxy")
+
+
+def _gateway_failure(resp, agent_model: str) -> str:
+    origin = resp.headers.get("x-bt-error-origin") or "gateway"
+    from_gateway = origin.lower() in _GATEWAY_ORIGINS
+    detail = (resp.text or "").strip()[:400]
+    hint = ""
+    if resp.status_code == 404 and from_gateway:
+        hint = ("\nThe org this token belongs to has no AI provider configured "
+                f"for {agent_model!r}. Add the vendor key under Settings -> AI "
+                "Providers in that org, or point "
+                f"{agents.GATEWAY_ORG_ENV} at the org that has one.")
+    elif resp.status_code == 401:
+        hint = (f"\nThe token is not authorized for that org. Issue the key or "
+                f"service token from the same org named in "
+                f"{agents.GATEWAY_ORG_ENV}.")
+    elif resp.status_code == 403 and not from_gateway:
+        hint = (f"\nThe gateway reached {origin} and was rejected there — the "
+                "vendor key stored in the Braintrust org is invalid or expired.")
+    return (f"Gateway request failed: HTTP {resp.status_code} "
+            f"(origin: {origin})\n{detail}{hint}")
+
+
+def _gateway_preflight(gw, spec, agent_model: str, search_mode: str) -> None:
+    """Confirm the gateway will actually serve this arm's model."""
+    try:
+        resp = _gateway_probe(gw, spec, agent_model)
+    except httpx.HTTPError as exc:
+        raise SystemExit(
+            f"Could not reach the gateway at {gw.root}: {exc}") from None
+    if resp.status_code >= 400:
+        raise SystemExit(_gateway_failure(resp, agent_model))
+    if search_mode == SEARCH_MODE_NATIVE:
+        # Deliberately not tested here: a hosted-tool probe costs a real billed
+        # search, which is too much to spend on every run's preflight. It is also
+        # the one gateway failure the run cannot detect for itself — a dropped
+        # tool block yields an empty trajectory, which decision-surface gating
+        # reports as unobservable rather than as an error.
+        print("WARNING: native search through the gateway is not verified by "
+              "this preflight. Hosted-tool passthrough (OpenAI Responses "
+              "web_search, Anthropic web_search_20250305) is a property of the "
+              "proxy, and if the tool blocks are dropped this arm records an "
+              "empty trajectory. Run `python run_eval.py gateway-check "
+              f"--model-vendor {spec.name} --agent-model {agent_model}` once "
+              "per gateway/model pair before trusting a native arm.")
+
+
+def gateway_check(env_path: Path, model_vendor: str,
+                  agent_model: str | None) -> None:
+    """Verify a gateway/model pair end to end, including hosted search tools.
+
+    Separate from `run` because it spends a real billed search on purpose: the
+    only way to know whether the proxy preserves server-side search blocks is to
+    ask for one and look at what comes back.
+    """
+    load_runtime_env(env_path)
+    gw = agents.gateway_config()
+    if gw is None:
+        raise SystemExit(
+            f"{agents.GATEWAY_URL_ENV} is not set in {env_path}; there is no "
+            "gateway to check. Set it to https://gateway.braintrust.dev to route "
+            "model calls through Braintrust.")
+    spec = vendor_of(model_vendor)
+    agent_model = agent_model or spec.default_model
+    print(f"gateway {gw.root} | org {gw.org or '(token default)'} | "
+          f"project {gw.project or '(none)'}")
+    print(f"vendor {spec.name} | model {agent_model}")
+
+    resp = _gateway_probe(gw, spec, agent_model)
+    if resp.status_code >= 400:
+        raise SystemExit(_gateway_failure(resp, agent_model))
+    print(f"  chat/messages: OK (HTTP {resp.status_code})")
+
+    if not spec.supports_native_search:
+        print(f"  native search: N/A — {spec.notes}")
+        return
+
+    if spec.name == "anthropic":
+        tools = [{"type": agents.ANTHROPIC_WEB_SEARCH_TOOL_TYPE,
+                  "name": "web_search", "max_uses": 1}]
+        # The block types the native normalizer in agents.py reads. If these do
+        # not survive the proxy, the arm silently loses its trajectory.
+        wanted = ("server_tool_use", "web_search_tool_result")
+    else:
+        tools = [{"type": agents.OPENAI_WEB_SEARCH_TOOL_TYPE,
+                  "search_context_size": agents.OPENAI_SEARCH_CONTEXT_SIZE}]
+        wanted = ("web_search_call", "url_citation")
+    resp = _gateway_search_probe(gw, spec, agent_model, tools)
+    if resp.status_code >= 400:
+        raise SystemExit(
+            "Hosted search tool rejected through the gateway.\n"
+            + _gateway_failure(resp, agent_model)
+            + "\nThis vendor's --search-mode native arm cannot run on this "
+              "gateway. Run the native arms direct-to-vendor, and note that "
+              "doing so puts them on a different serving path from the harness "
+              "arms — which breaks the native-vs-harness contrast.")
+    body = resp.text
+    found = [name for name in wanted if f'"{name}"' in body]
+    if not found:
+        raise SystemExit(
+            f"The gateway returned HTTP {resp.status_code} but the response "
+            f"carries none of {wanted}. The proxy accepted the hosted search "
+            "tool and dropped its result blocks, which would give this arm an "
+            "empty trajectory and an unobservable decision surface. Do not run "
+            "--search-mode native on this gateway.")
+    print(f"  native search: OK — response carries {', '.join(found)}")
+    print("\nBoth checks passed. Record serving_path=gateway in the study notes "
+          "and keep every arm of a contrast on this same path.")
+
+
+def _gateway_search_probe(gw, spec, agent_model: str, tools: list):
+    """Hosted-search probe: a question that cannot be answered parametrically.
+
+    A stale-index model could answer 'what year is it' from memory without ever
+    calling the tool, and a no-tool-call response is indistinguishable from a
+    proxy that dropped the tool.
+    """
+    headers = {"Authorization": f"Bearer {gw.api_key}",
+               "Content-Type": "application/json", **gw.headers()}
+    question = ("Search the web and tell me one news headline published today. "
+                "You must use the web search tool.")
+    if spec.name == "anthropic":
+        url = f"{gw.anthropic_base_url}/v1/messages"
+        headers["anthropic-version"] = "2023-06-01"
+        body = {"model": agent_model, "max_tokens": 1024, "tools": tools,
+                "messages": [{"role": "user", "content": question}]}
+    else:
+        url = f"{gw.openai_base_url}/responses"
+        body = {"model": agent_model, "input": question, "tools": tools,
+                "include": ["web_search_call.action.sources"]}
+    return httpx.post(url, headers=headers, json=body, timeout=180.0)
+
+
 def _preflight(arm: str, search_mode: str, model_vendor: str,
                agent_model: str) -> None:
     """Fail before spending money, not on row 1 of N."""
@@ -818,12 +1089,20 @@ def _preflight(arm: str, search_mode: str, model_vendor: str,
             f"{model_vendor}. {spec.notes} Run this vendor with "
             "--search-mode harness or none.")
 
-    needed = [spec.api_key_env]
+    gw = agents.gateway_config()
+    # Under gateway routing the vendor key lives in the Braintrust org, so
+    # demanding a local one would block a correctly configured run. The You.com
+    # key is still local either way: the harness calls that API itself, and the
+    # gateway proxies model vendors only.
+    needed = [] if gw else [spec.api_key_env]
     if search_mode == SEARCH_MODE_HARNESS:
         needed.append(SEARCH_PROVIDER_KEY)
     missing = [k for k in needed if not os.environ.get(k)]
     if missing:
         raise SystemExit(f"Missing env var(s): {', '.join(missing)}")
+
+    if gw is not None:
+        _gateway_preflight(gw, spec, agent_model, search_mode)
 
     if search_mode == SEARCH_MODE_HARNESS:
         ydc_setup(arm)  # raises, naming the valid setups, if the arm is unknown
@@ -853,7 +1132,14 @@ def build_judges(specs: list[str]):
     OpenAI-compatible route, keyed by JUDGE_API_KEY. The second form is what
     lets the panel span vendors, which is the point — a single-vendor judge
     grading a single-vendor agent cannot rule out self-preference.
+
+    Under gateway routing the bare form follows the agent onto the gateway: a
+    judge is part of the measuring instrument, and leaving it on a direct route
+    while the agents move would mean the scores for a gateway study came from a
+    differently-served grader. An explicit `model@base_url` still wins — that
+    form names a route on purpose.
     """
+    gw = agents.gateway_config()
     judges = []
     for spec in specs:
         model, _, base_url = spec.partition("@")
@@ -863,6 +1149,9 @@ def build_judges(specs: list[str]):
                 raise SystemExit(
                     f"--judge {spec} needs JUDGE_API_KEY for {base_url}")
             judges.append((OpenAI(base_url=base_url, api_key=key), model))
+        elif gw is not None:
+            judges.append((OpenAI(base_url=gw.openai_base_url, api_key=gw.api_key,
+                                  default_headers=gw.headers() or None), model))
         else:
             judges.append((OpenAI(), model))
     return judges
@@ -978,7 +1267,14 @@ def run(arm: str, dataset_name: str, dataset_version: str | None,
                 spec.harness_protocol if search_mode != SEARCH_MODE_NATIVE
                 else agents.PROTOCOL_RESPONSES if spec.name == "openai"
                 else agents.PROTOCOL_MESSAGES),
-            "agent_base_url": spec.base_url,
+            "agent_base_url": agents.effective_base_url(spec),
+            # Direct-to-vendor or proxied through the Braintrust gateway. A
+            # contrast whose two runs disagree here is confounded: the serving
+            # stack moved along with whatever the contrast was testing. Recorded
+            # so that mix is detectable in analysis instead of invisible.
+            "serving_path": agents.serving_path(),
+            "gateway_project": (
+                gateway.project if (gateway := agents.gateway_config()) else None),
             # Whether the 5-search budget is API-enforced or only observed.
             # OpenAI's hosted web_search exposes no max_uses, so its native arm
             # can exceed the cap every other arm is held to — a real limit on the
@@ -1033,6 +1329,18 @@ def run(arm: str, dataset_name: str, dataset_version: str | None,
                     and model_vendor == "openai") else None),
             "anthropic_thinking": (
                 agents.ANTHROPIC_THINKING if model_vendor == "anthropic" else None),
+            # --- token pricing assumptions, recorded so a cost number is
+            # auditable without knowing which commit produced it ---
+            "model_usd_per_mtok": list(
+                agents.MODEL_USD_PER_MTOK.get(agent_model, ())) or None,
+            "cached_input_multiplier": (
+                agents.cached_input_multiplier(agent_model)
+                if agent_model in agents.MODEL_USD_PER_MTOK else None),
+            # OpenAI caches automatically above ~1k prompt tokens; Anthropic
+            # caches only on explicit cache_control, which these requests never
+            # send. So cache hits are expected on the OpenAI rows and expected to
+            # be zero everywhere else — agent_cache_hit_rate is the per-row check.
+            "prompt_caching_expected": model_vendor == "openai",
             "git_commit": _git_commit(),
             "prompt_version": PROMPT_VERSIONS[search_mode],
         },
@@ -1098,7 +1406,22 @@ def main():
                         "3 trials is ~88k rows.")
     r.add_argument("--env-file", type=Path, default=Path(".env"))
 
+    g = sub.add_parser(
+        "gateway-check",
+        help="Verify that the configured Braintrust gateway can serve a "
+             "vendor/model pair, including its hosted web-search tool. Spends "
+             "one billed search on the native check; run it once per "
+             "gateway/model pair, not per experiment.")
+    g.add_argument("--model-vendor", choices=sorted(VENDORS),
+                   default=DEFAULT_MODEL_VENDOR)
+    g.add_argument("--agent-model", default=None,
+                   help="Defaults to the vendor's pinned model.")
+    g.add_argument("--env-file", type=Path, default=Path(".env"))
+
     args = ap.parse_args()
+    if args.cmd == "gateway-check":
+        gateway_check(args.env_file, args.model_vendor, args.agent_model)
+        return
     if not args.dataset_version and not args.allow_latest:
         ap.error("--dataset-version is required for paired comparisons; pass "
                  "--allow-latest only for exploratory runs")

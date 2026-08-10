@@ -57,7 +57,12 @@ as publication-quality.
   [scorers.py](scorers.py). `gated_answer_match` is the composed headline number:
   answer correctness with hard-rule violations zeroed
 - Cost: `search_cost_usd`, `model_cost_usd`, and `total_cost_usd` per row, kept
-  decomposable because inference dominates the bill (see Design premises)
+  decomposable because inference dominates the bill (see Design premises).
+  Cached input is priced separately at each vendor's published multiplier —
+  OpenAI caches automatically on every turn after the first, so charging its
+  cached tokens at the base rate overstated the harness arm's cost by ~9x on a
+  cached call while barely touching the single-call native arm. `agent_cache_hit_rate`
+  is logged per row so that correction stays checkable
 
 ## What this study claims
 
@@ -241,6 +246,15 @@ search-call spend plus separately-reported token spend, never as one number.
 - **`zero_search_row`** — the tool was available and the model never used it, so
   the row is a no-search row wearing a search arm's label. Weak OSS tool-calling
   and a native model that declines to search both land here. Filter on it.
+- **`search_degraded` / `search_fully_failed`** — the model did search, but the
+  search layer errored. A search API failure degrades the row rather than killing
+  it, because rows do not fail at random: a provider fails hardest on the queries
+  it handles worst, so dropping failed rows would score the run over a favorable
+  subset of the questions actually asked. The row still gets answered and judged,
+  so without these flags a provider outage reads as the model getting worse.
+  `search_fully_failed` is the strong case — every attempted search failed, so the
+  answer is parametric and the row belongs with `zero_search_row`. Per-error
+  detail is in `search_errors`; the count is `n_search_errors`.
 - **`sampling_params` / `sampling_pinned`** — temp 0 + seed 42 is *not holdable on
   either frontier vendor*. Claude Opus 5 rejects `temperature`/`top_p`/`top_k`
   with a 400, and gpt-5-family models reject `temperature` ("only the default (1)
@@ -282,6 +296,51 @@ Fill `.env`; every supported credential is loaded from that file and overrides
 or clears the corresponding ambient credential. Each arm needs only its own
 vendor's key — `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or `BASETEN_API_KEY` —
 plus a search-API key when `--search-mode harness`.
+
+### Serving path: direct, or through the Braintrust gateway
+
+Model calls go direct to each vendor by default. Setting
+`BRAINTRUST_GATEWAY_URL` routes them through the Braintrust gateway instead:
+
+```bash
+BRAINTRUST_GATEWAY_URL=https://gateway.braintrust.dev
+BRAINTRUST_GATEWAY_PROJECT=automations-spend-control   # x-bt-project-name
+BRAINTRUST_GATEWAY_ORG=                                # x-bt-org-name, optional
+BRAINTRUST_GATEWAY_API_KEY=                            # defaults to BRAINTRUST_API_KEY
+```
+
+Under gateway routing the three vendor keys go unused: the vendor credentials
+come from that Braintrust org's **Settings → AI Providers**, and a model with no
+provider configured there returns 404 at the gateway without ever reaching a
+vendor. The switch is all-or-nothing on purpose. Agents *and* judges move
+together, and there is no per-vendor override, because a matrix whose arms sit
+behind different serving stacks has a second variable moving inside every
+contrast it was built to measure. Each run records `serving_path` and the
+effective `agent_base_url`, so a study that mixes the two is at least detectable
+afterward — but the fix is to re-run it, not to join across the boundary.
+
+Two things to verify before trusting gateway results:
+
+- **Model names must resolve in the org's provider registry.** The OSS rows are
+  the likely casualty: their names are Baseten catalog paths, and the gateway
+  resolves a name to a provider rather than passing it through.
+- **Hosted search tools must survive the proxy.** Both native arms depend on a
+  server-side tool (OpenAI's Responses `web_search`, Anthropic's
+  `web_search_20250305`) whose result blocks the adapters in `agents.py` parse.
+  If the proxy drops them, the native arm records an empty trajectory. Decision-
+  surface gating reports that as unobservable rather than as a passing score, so
+  it will not silently inflate a leaderboard — but it does waste the run.
+
+`gateway-check` tests both, per vendor/model pair. It spends one real billed
+search on the native half, so run it when the gateway config changes, not per
+experiment:
+
+```bash
+.venv/bin/python run_eval.py gateway-check --model-vendor openai
+.venv/bin/python run_eval.py gateway-check --model-vendor anthropic
+.venv/bin/python run_eval.py gateway-check --model-vendor baseten \
+  --agent-model zai-org/GLM-5.2
+```
 
 The suite is stdlib `unittest` and needs no test runner beyond the
 dependencies above. It makes no network requests:
@@ -609,6 +668,30 @@ separately and is never silently treated as the completion time.
 Only matching final scores from two independent authorities qualify under the
 existing dual-authority rule.
 
+The reconciliation stage is executable. Its decision JSONL records the exact
+provider event IDs, canonical team names, completion timestamp and evidence,
+and approval state. It rejects missing or reused candidates, score or sport
+disagreement, implausibly different start times, and insufficient independent
+resolvers or authorities:
+
+```bash
+python -m corvus.cli.curate_sports \
+    --candidates openligadb-results.jsonl \
+    --candidates thesportsdb-results.jsonl \
+    --decisions reconciliation-decisions.jsonl \
+    --output sports-events.jsonl
+python -m corvus.cli.build_dataset \
+    sports-events.jsonl corvus-sports-dev.jsonl \
+    --split dev --freeze-id sports-2026-05-bundesliga-dev \
+    --as-of 2026-08-07T19:00:00Z
+```
+
+An end-to-end three-match freeze is available locally under
+`data/corvus_live/2026-05-sports-dev/`. Its completion timestamps use a disclosed
+end-of-event-date upper bound because the two APIs expose scheduled start and
+completed status, but not a final-whistle timestamp. This is suitable for the
+`gte_30d` development rung; do not use that bound for hour-level freshness work.
+
 Optional trap JSONL can be supplied with `--traps-file` and `--run-end`. A trap
 is accepted only when two resolvers and two authorities agree on its scheduled
 resolution and it resolves more than seven days after the run:
@@ -734,11 +817,13 @@ metadata = upstream row fields (link, articles[], event_date, ...)
     — it must be excluded from cost comparisons rather than read as cheap; and
     list prices ignore promotional rates, deliberately, so a recorded cost does
     not change meaning when a promotion lapses.
-13. **No live smoke run yet.** Every adapter is asserted against the vendors'
-    published response schemas offline; none has been executed against the real
-    APIs. The Baseten model slug in particular is documented both as
-    `openai/gpt-oss-120b` and, in a migration note, as
-    `baseten/openai/gpt-oss-120b`.
+13. **Frontier gateway smoke checks pass; Baseten remains unverified.** On
+    2026-08-10, `gateway-check` returned HTTP 200 for both frontier models and
+    preserved the native-search blocks consumed by the adapters: OpenAI returned
+    `web_search_call` and `url_citation`; Anthropic returned `server_tool_use`
+    and `web_search_tool_result`. Re-run these billed checks whenever the gateway
+    or provider configuration changes. The Baseten model slugs and harness path
+    have not received the same live check.
 
 ## Open decisions
 
@@ -774,9 +859,9 @@ bound it; it is not built.
 
 **5. The judge and the agent can share a vendor.** The default `gpt-4.1` judge
 cannot rule out self-preference when grading `gpt-5.6-sol`, and that bias is
-confounded with the native-search treatment. `--judge` is repeatable and
-`ANTHROPIC_API_KEY` is configured, so use a cross-vendor jury for any reported
-frontier comparison.
+confounded with the native-search treatment. `--judge` is repeatable; use a
+cross-vendor jury through the configured gateway for any reported frontier
+comparison.
 
 **6. Search pricing must be rechecked before publication.** `YDC_USD_PER_CALL`
 and `agents.NATIVE_SEARCH_USD_PER_CALL` were checked on 2026-08-05: You.com is

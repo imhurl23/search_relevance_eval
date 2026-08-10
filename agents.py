@@ -438,17 +438,62 @@ MODEL_USD_PER_MTOK: dict[str, tuple[float, float]] = {
 }
 
 
-def model_cost_usd(model: str, prompt_tokens: int,
-                   completion_tokens: int) -> tuple[float | None, bool]:
+# Cached input is billed at a fraction of the base input rate, and both frontier
+# vendors publish the same 0.1x multiplier (OpenAI: $0.50 cached on $5.00 base
+# for gpt-5.6-sol; Anthropic: $1 cache-hit on $10 base for claude-fable-5). It is
+# expressed as a multiplier rather than eight more hand-entered numbers so the
+# cached rate cannot drift out of sync with the base rate it is derived from.
+#
+# Baseten publishes no cached-input rate, so its rows price cached tokens at the
+# full input rate. That is the conservative direction — it can only overstate the
+# OSS arm's cost, never understate it — and Baseten reports cached_tokens=0 today
+# anyway, so the multiplier is currently unexercised on that vendor.
+FRONTIER_CACHED_INPUT_MULTIPLIER = 0.1
+OSS_CACHED_INPUT_MULTIPLIER = 1.0
+
+
+def cached_input_multiplier(model: str) -> float:
+    """Baseten catalog paths carry an org prefix (`zai-org/GLM-5.2`); the two
+    frontier vendors' model names never do. That split is what separates the
+    priced-cache rows from the unpriced ones, and test_price_table_name_shapes
+    pins it so a future entry cannot quietly land on the wrong side."""
+    return (OSS_CACHED_INPUT_MULTIPLIER if "/" in model
+            else FRONTIER_CACHED_INPUT_MULTIPLIER)
+
+
+def model_cost_usd(model: str, prompt_tokens: int, completion_tokens: int,
+                   cached_prompt_tokens: int = 0) -> tuple[float | None, bool]:
     """Return (usd, confirmed). None when the model has no pinned price.
 
     Returning None rather than 0.0 keeps an unpriced arm out of a cost frontier
     instead of placing it at the origin, which would read as "free".
+
+    `cached_prompt_tokens` is the SUBSET of prompt_tokens served from a prompt
+    cache. Callers must normalize to that convention before calling: OpenAI and
+    the Chat Completions vendors already count cached tokens inside their input
+    total, whereas Anthropic reports cache reads OUTSIDE `input_tokens`, so its
+    adapter adds them in. Getting that backwards is a silent 10x error in either
+    direction, which is why the normalization lives at each adapter and this
+    function takes one unambiguous convention.
+
+    Why this matters here rather than being a rounding detail: OpenAI caches
+    automatically above ~1k prompt tokens, with no opt-in. The harness arm
+    re-sends a growing conversation on every tool turn, so turns 2..6 are almost
+    entirely cache hits, while the native arm makes a single uncached call.
+    Charging every input token at the base rate therefore inflated the harness
+    arm far more than the native arm — biasing the one cost comparison this
+    matrix is built to make. Anthropic caching stays off (the requests send no
+    cache_control), so its rows are unaffected and its cached count is 0.
     """
     rate = MODEL_USD_PER_MTOK.get(model)
     if rate is None:
         return None, False
-    return (prompt_tokens * rate[0] + completion_tokens * rate[1]) / 1_000_000, True
+    cached = max(0, min(cached_prompt_tokens, prompt_tokens))
+    uncached = prompt_tokens - cached
+    cached_rate = rate[0] * cached_input_multiplier(model)
+    usd = (uncached * rate[0] + cached * cached_rate
+           + completion_tokens * rate[1]) / 1_000_000
+    return usd, True
 
 # Models on which OpenAI bills the standard `web_search` rate. A non-reasoning
 # model routes to `web_search_preview` at 2.5x the price, so an unrecognized
@@ -466,6 +511,119 @@ def native_search_rate_usd(vendor: str, model: str) -> tuple[float, bool]:
 
 
 # ---------------------------------------------------------------------------
+# Serving path: direct-to-vendor, or through the Braintrust gateway
+#
+# The gateway (gateway.braintrust.dev) is an OpenAI/Anthropic-compatible proxy
+# that holds the vendor keys org-side and logs every call to a Braintrust
+# project. Setting BRAINTRUST_GATEWAY_URL routes EVERY vendor through it; there
+# is deliberately no per-vendor switch, because a study whose arms sit behind
+# different serving paths has a second variable moving inside every contrast the
+# matrix exists to measure. Move all arms or none, and re-run a study after
+# switching rather than joining across the boundary — `serving_path` is recorded
+# in run metadata so a mixed study is at least detectable after the fact.
+#
+# What the gateway changes, and what it does not:
+#   * Auth. One Braintrust key replaces the per-vendor keys, and the vendor keys
+#     live in the org's AI Providers settings. A model with no provider
+#     configured for the org 404s at the gateway rather than reaching a vendor.
+#   * Model names. The gateway resolves a model name to a provider, so a name
+#     the org's registry does not carry fails even if the vendor serves it. This
+#     is the likeliest failure for the OSS rows, whose names are Baseten paths.
+#   * Server-side search tools are NOT verified to survive the proxy. Both native
+#     arms depend on a hosted tool (OpenAI's Responses `web_search`, Anthropic's
+#     `web_search_20250305`) whose results come back as provider-specific block
+#     types that the normalizers below parse. If the gateway drops or reshapes
+#     those blocks, the native arms degrade to an empty trajectory — which
+#     decision-surface gating reports as unobservable rather than as a passing
+#     score, but which still costs a run. Verify before trusting a native arm on
+#     the gateway: `python run_eval.py gateway-check`.
+# ---------------------------------------------------------------------------
+
+
+GATEWAY_URL_ENV = "BRAINTRUST_GATEWAY_URL"
+GATEWAY_KEY_ENV = "BRAINTRUST_GATEWAY_API_KEY"
+GATEWAY_PROJECT_ENV = "BRAINTRUST_GATEWAY_PROJECT"
+GATEWAY_ORG_ENV = "BRAINTRUST_GATEWAY_ORG"
+
+SERVING_PATH_DIRECT = "direct"
+SERVING_PATH_GATEWAY = "gateway"
+
+
+@dataclass(frozen=True)
+class GatewayConfig:
+    """Resolved gateway routing, or None-valued when routing direct."""
+
+    root: str                       # no trailing /v1 — SDKs differ on the suffix
+    api_key: str
+    project: str | None = None
+    org: str | None = None
+
+    @property
+    def openai_base_url(self) -> str:
+        """openai-python appends /chat/completions or /responses to base_url."""
+        return f"{self.root}/v1"
+
+    @property
+    def anthropic_base_url(self) -> str:
+        """anthropic-python appends /v1/messages to base_url."""
+        return self.root
+
+    def headers(self) -> dict:
+        h = {}
+        if self.project:
+            h["x-bt-project-name"] = self.project
+        if self.org:
+            h["x-bt-org-name"] = self.org
+        return h
+
+
+def gateway_config() -> GatewayConfig | None:
+    """Read gateway routing from the environment. None means direct-to-vendor.
+
+    The key falls back to BRAINTRUST_API_KEY because the same token authenticates
+    the gateway and the logging SDK; BRAINTRUST_GATEWAY_API_KEY exists for the
+    case where the vendor credentials live in a different org from the one the
+    experiments are written to, so the two calls need two tokens.
+    """
+    root = (os.environ.get(GATEWAY_URL_ENV) or "").strip().rstrip("/")
+    if not root:
+        return None
+    # Accept either form of the URL — the doc writes the base as .../v1 in some
+    # places and bare in others, and the two SDKs want different suffixes.
+    if root.endswith("/v1"):
+        root = root[: -len("/v1")]
+    key = (os.environ.get(GATEWAY_KEY_ENV)
+           or os.environ.get("BRAINTRUST_API_KEY") or "").strip()
+    if not key:
+        raise SystemExit(
+            f"{GATEWAY_URL_ENV} is set, so {GATEWAY_KEY_ENV} or "
+            "BRAINTRUST_API_KEY is required to authenticate to the gateway")
+    return GatewayConfig(
+        root=root,
+        api_key=key,
+        project=(os.environ.get(GATEWAY_PROJECT_ENV) or "").strip() or None,
+        org=(os.environ.get(GATEWAY_ORG_ENV) or "").strip() or None,
+    )
+
+
+def serving_path() -> str:
+    return SERVING_PATH_GATEWAY if gateway_config() else SERVING_PATH_DIRECT
+
+
+def effective_base_url(spec: VendorSpec) -> str | None:
+    """The base URL this vendor's arm will actually be served from.
+
+    Recorded in run metadata: `agent_base_url` has to name the endpoint that
+    served the run, not the direct-to-vendor default it would have used.
+    """
+    gw = gateway_config()
+    if gw is None:
+        return spec.base_url
+    return (gw.anthropic_base_url if spec.name == "anthropic"
+            else gw.openai_base_url)
+
+
+# ---------------------------------------------------------------------------
 # Client construction
 # ---------------------------------------------------------------------------
 
@@ -477,19 +635,34 @@ def get_client(vendor: str, wrap):
 
     `wrap` is braintrust's wrap_openai / wrap_anthropic, injected so this module
     has no braintrust import of its own and stays unit-testable offline.
+
+    Under gateway routing the per-vendor key is not read at all — the vendor
+    credential lives in the Braintrust org, so requiring a local one here would
+    reject a correctly configured gateway run.
     """
     if vendor in _clients:
         return _clients[vendor]
     spec = vendor_of(vendor)
-    key = os.environ.get(spec.api_key_env)
-    if not key:
-        raise SystemExit(f"{spec.api_key_env} is required for --model-vendor {vendor}")
+    gw = gateway_config()
+    if gw is None:
+        key = os.environ.get(spec.api_key_env)
+        if not key:
+            raise SystemExit(
+                f"{spec.api_key_env} is required for --model-vendor {vendor}")
+        headers = None
+    else:
+        key = gw.api_key
+        headers = gw.headers() or None
     if vendor == "anthropic":
         import anthropic  # imported lazily so the OSS/OpenAI paths need no install
 
-        client = wrap(anthropic.Anthropic(api_key=key))
+        client = wrap(anthropic.Anthropic(
+            api_key=key, base_url=effective_base_url(spec),
+            default_headers=headers))
     else:
-        client = wrap(OpenAI(api_key=key, base_url=spec.base_url))
+        client = wrap(OpenAI(
+            api_key=key, base_url=effective_base_url(spec),
+            default_headers=headers))
     _clients[vendor] = client
     return client
 
@@ -514,6 +687,9 @@ class NativeRun:
     n_searches: int = 0
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    # Subset of prompt_tokens served from a prompt cache, normalized to the
+    # convention model_cost_usd documents (cached is INSIDE prompt_tokens).
+    cached_prompt_tokens: int = 0
     surface: str = SURFACE_NONE
     # Vendor-reported search count, when the API publishes one. Preferred over
     # counting parsed blocks: a search whose results were dropped from the
@@ -538,6 +714,48 @@ def _domain_of(url: str) -> str:
 ANTHROPIC_MAX_BLOCKED_DOMAINS = 50
 # OpenAI documents up to 100 entries in filters.blocked_domains.
 OPENAI_MAX_BLOCKED_DOMAINS = 100
+
+
+
+# ---------------------------------------------------------------------------
+# Cached-input accounting
+#
+# The two wire families disagree about whether cached tokens are inside the
+# input total, and the disagreement is invisible until it shows up as a 10x cost
+# error. Normalize here, once, to the convention model_cost_usd documents:
+# `cached` is always a SUBSET of the returned prompt-token count.
+#
+#   OpenAI (Responses) and Chat Completions: `input_tokens` / `prompt_tokens`
+#       ALREADY include cached tokens; the details block names the cached subset.
+#       Verified live: a repeated 2,811-token prefix returned input_tokens=2814
+#       with cached_tokens=2811.
+#   Anthropic (Messages): `input_tokens` EXCLUDES both cache reads and cache
+#       writes, which are reported as sibling fields. So the reads must be added
+#       back into the total before being named as its cached subset, or the
+#       tokens vanish from the bill entirely.
+#
+# Cache WRITES are folded into full-price input rather than given Anthropic's
+# 1.25x write multiplier. These requests send no cache_control, so writes are 0
+# and the simplification is exact today; if caching is ever enabled here, this is
+# the line to revisit.
+# ---------------------------------------------------------------------------
+
+
+def _openai_cached_tokens(usage) -> int:
+    """Cached subset of an OpenAI/Chat-Completions input total."""
+    for field_name in ("input_tokens_details", "prompt_tokens_details"):
+        details = _attr(usage, field_name)
+        if details is not None:
+            return int(_attr(details, "cached_tokens") or 0)
+    return 0
+
+
+def _anthropic_token_split(usage) -> tuple[int, int]:
+    """Return (billable_input_tokens, cached_subset) for a Messages response."""
+    base = int(_attr(usage, "input_tokens") or 0)
+    cache_read = int(_attr(usage, "cache_read_input_tokens") or 0)
+    cache_write = int(_attr(usage, "cache_creation_input_tokens") or 0)
+    return base + cache_read + cache_write, cache_read
 
 
 # ---------------------------------------------------------------------------
@@ -584,7 +802,9 @@ def anthropic_native_search(
             output_config={"effort": ANTHROPIC_EFFORT},
         )
         usage = _attr(response, "usage")
-        run.prompt_tokens += int(_attr(usage, "input_tokens") or 0)
+        billable_input, cached_input = _anthropic_token_split(usage)
+        run.prompt_tokens += billable_input
+        run.cached_prompt_tokens += cached_input
         run.completion_tokens += int(_attr(usage, "output_tokens") or 0)
         server_use = _attr(usage, "server_tool_use")
         requests = _attr(server_use, "web_search_requests")
@@ -737,6 +957,7 @@ def openai_native_search(
     )
     usage = _attr(response, "usage")
     run.prompt_tokens = int(_attr(usage, "input_tokens") or 0)
+    run.cached_prompt_tokens = _openai_cached_tokens(usage)
     run.completion_tokens = int(_attr(usage, "output_tokens") or 0)
     # Now that this arm pins max_output_tokens, a long reasoning trace can hit the
     # ceiling and return a partial answer. Recorded so answer_truncated explains a
@@ -837,6 +1058,7 @@ class Turn:
     tool_calls: list = field(default_factory=list)
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    cached_prompt_tokens: int = 0
     stop: str | None = None
     refused: bool = False
     truncated: bool = False
@@ -894,6 +1116,7 @@ class OpenAIHarnessSession(HarnessSession):
         turn = Turn(
             text=(getattr(message, "content", None) or "").strip(),
             prompt_tokens=int(getattr(usage, "prompt_tokens", 0) or 0),
+            cached_prompt_tokens=_openai_cached_tokens(usage),
             completion_tokens=int(getattr(usage, "completion_tokens", 0) or 0),
             stop=getattr(response.choices[0], "finish_reason", None),
         )
@@ -962,8 +1185,10 @@ class AnthropicHarnessSession(HarnessSession):
         )
         usage = getattr(response, "usage", None)
         stop = getattr(response, "stop_reason", None)
+        billable_input, cached_input = _anthropic_token_split(usage)
         turn = Turn(
-            prompt_tokens=int(getattr(usage, "input_tokens", 0) or 0),
+            prompt_tokens=billable_input,
+            cached_prompt_tokens=cached_input,
             completion_tokens=int(getattr(usage, "output_tokens", 0) or 0),
             stop=stop,
             refused=stop == "refusal",
@@ -1061,6 +1286,7 @@ class OpenAIResponsesHarnessSession(HarnessSession):
         usage = _attr(response, "usage")
         turn = Turn(
             prompt_tokens=int(_attr(usage, "input_tokens") or 0),
+            cached_prompt_tokens=_openai_cached_tokens(usage),
             completion_tokens=int(_attr(usage, "output_tokens") or 0),
             stop=_attr(response, "status"),
         )

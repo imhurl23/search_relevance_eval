@@ -18,6 +18,8 @@ import dataclasses
 import os
 import unittest
 
+import httpx
+
 os.environ.setdefault("YDC_API_KEY", "test-ydc-key")
 
 import agents
@@ -559,6 +561,71 @@ class ModelCostTest(unittest.TestCase):
         usd, _ = agents.model_cost_usd("gpt-5.6-sol", 0, 1_000_000)
         self.assertAlmostEqual(usd, 30.00)
 
+    def test_cached_input_bills_at_a_tenth_on_the_frontier_vendors(self):
+        # Both vendors publish 0.1x: OpenAI $0.50 cached on $5.00 base,
+        # Anthropic $1 cache-hit on $10 base.
+        full, _ = agents.model_cost_usd("gpt-5.6-sol", 1_000_000, 0)
+        cached, _ = agents.model_cost_usd("gpt-5.6-sol", 1_000_000, 0,
+                                          1_000_000)
+        self.assertAlmostEqual(full, 5.00)
+        self.assertAlmostEqual(cached, 0.50)
+
+    def test_a_partly_cached_prompt_splits_across_both_rates(self):
+        # The realistic shape: OpenAI caches automatically, so a harness turn is
+        # mostly a cache hit with a small uncached tail.
+        usd, _ = agents.model_cost_usd("gpt-5.6-sol", 1_000_000, 0, 900_000)
+        self.assertAlmostEqual(usd, 0.1 * 5.00 + 0.9 * 0.50)
+
+    def test_cached_tokens_are_a_subset_never_an_addition(self):
+        """The whole convention rests on cached ⊆ prompt_tokens. A caller that
+        passes a cached count exceeding the total must not produce a negative
+        uncached charge."""
+        usd, _ = agents.model_cost_usd("gpt-5.6-sol", 1000, 0, 999_999)
+        floor, _ = agents.model_cost_usd("gpt-5.6-sol", 1000, 0, 1000)
+        self.assertAlmostEqual(usd, floor)
+        self.assertGreater(usd, 0)
+
+    def test_the_oss_rows_get_no_cache_discount(self):
+        # Baseten publishes no cached-input rate, so cached tokens bill at full
+        # price. Overstating the OSS arm is the safe direction; understating it
+        # would flatter the cost-substitution claim this study is testing.
+        full, _ = agents.model_cost_usd("zai-org/GLM-5.2", 1_000_000, 0)
+        cached, _ = agents.model_cost_usd("zai-org/GLM-5.2", 1_000_000, 0,
+                                          1_000_000)
+        self.assertAlmostEqual(full, cached)
+
+    def test_price_table_name_shapes(self):
+        """cached_input_multiplier splits on the org-prefix in the model name,
+        so that shape has to hold for every row in the table."""
+        for model in agents.MODEL_USD_PER_MTOK:
+            is_oss = "/" in model
+            self.assertEqual(
+                agents.cached_input_multiplier(model),
+                agents.OSS_CACHED_INPUT_MULTIPLIER if is_oss
+                else agents.FRONTIER_CACHED_INPUT_MULTIPLIER,
+                f"{model} landed on the wrong side of the cache-rate split")
+
+    def test_anthropic_cache_reads_are_added_into_the_input_total(self):
+        """Anthropic reports cache reads OUTSIDE input_tokens. Treating its
+        payload like OpenAI's would drop those tokens off the bill entirely."""
+        usage = {"input_tokens": 100, "cache_read_input_tokens": 900,
+                 "cache_creation_input_tokens": 0, "output_tokens": 10}
+        billable, cached = agents._anthropic_token_split(usage)
+        self.assertEqual(billable, 1000)
+        self.assertEqual(cached, 900)
+
+    def test_openai_cached_tokens_are_read_as_a_subset(self):
+        """Verified against a live response: input_tokens=2814 carried
+        cached_tokens=2811, so the cached count is already inside the total."""
+        self.assertEqual(
+            agents._openai_cached_tokens(
+                {"input_tokens_details": {"cached_tokens": 2811}}), 2811)
+        # Chat Completions names the same block prompt_tokens_details.
+        self.assertEqual(
+            agents._openai_cached_tokens(
+                {"prompt_tokens_details": {"cached_tokens": 42}}), 42)
+        self.assertEqual(agents._openai_cached_tokens({}), 0)
+
     def test_unpriced_model_returns_none_not_zero(self):
         # 0.0 would place an unpriced arm at the origin of a cost frontier,
         # reading as free. None keeps it out of the frontier entirely.
@@ -775,6 +842,103 @@ class ClientConstructionTest(unittest.TestCase):
             agents.vendor_of("together")
 
 
+class GatewayRoutingTest(unittest.TestCase):
+    """Serving path is an experimental variable here, not a deployment detail.
+
+    Two arms served over different stacks are not a one-variable contrast, so
+    these cases pin the two properties that keep that from happening silently:
+    the switch moves every vendor at once, and the run records where it went.
+    """
+
+    GATEWAY_ENV = (agents.GATEWAY_URL_ENV, agents.GATEWAY_KEY_ENV,
+                   agents.GATEWAY_PROJECT_ENV, agents.GATEWAY_ORG_ENV,
+                   "BRAINTRUST_API_KEY")
+
+    def setUp(self):
+        agents.reset_clients()
+        self.addCleanup(agents.reset_clients)
+        for name in self.GATEWAY_ENV:
+            self._set_env(name, None)
+
+    def _set_env(self, name, value):
+        previous = os.environ.get(name)
+        if value is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = value
+        self.addCleanup(
+            lambda: os.environ.__setitem__(name, previous) if previous is not None
+            else os.environ.pop(name, None))
+
+    def _enable(self, url="https://gateway.braintrust.dev"):
+        self._set_env(agents.GATEWAY_URL_ENV, url)
+        self._set_env("BRAINTRUST_API_KEY", "bt-test-key")
+
+    def test_unset_url_means_direct_to_vendor(self):
+        self.assertIsNone(agents.gateway_config())
+        self.assertEqual(agents.serving_path(), agents.SERVING_PATH_DIRECT)
+        # The OSS vendor's own base URL must survive; only the gateway replaces it.
+        self.assertEqual(agents.effective_base_url(agents.VENDORS["baseten"]),
+                         "https://inference.baseten.co/v1")
+
+    def test_every_vendor_moves_together(self):
+        """No per-vendor opt-out: a mixed matrix is the failure being prevented."""
+        self._enable()
+        self.assertEqual(agents.serving_path(), agents.SERVING_PATH_GATEWAY)
+        for vendor in agents.VENDORS:
+            self.assertTrue(
+                agents.effective_base_url(agents.VENDORS[vendor])
+                .startswith("https://gateway.braintrust.dev"),
+                f"{vendor} was left on a direct route")
+
+    def test_the_two_sdks_get_the_v1_suffix_they_each_expect(self):
+        """openai-python appends /chat/completions; anthropic-python appends
+        /v1/messages. One shared base URL would 404 on one of them."""
+        self._enable()
+        gw = agents.gateway_config()
+        self.assertEqual(gw.openai_base_url, "https://gateway.braintrust.dev/v1")
+        self.assertEqual(gw.anthropic_base_url, "https://gateway.braintrust.dev")
+
+    def test_a_url_written_with_v1_is_accepted(self):
+        """The docs write the base both ways; neither should silently double it."""
+        self._enable("https://gateway.braintrust.dev/v1/")
+        gw = agents.gateway_config()
+        self.assertEqual(gw.openai_base_url, "https://gateway.braintrust.dev/v1")
+        self.assertEqual(gw.anthropic_base_url, "https://gateway.braintrust.dev")
+
+    def test_routing_headers_are_omitted_when_unconfigured(self):
+        """An empty x-bt-project-name is not the same as no header."""
+        self._enable()
+        self.assertEqual(agents.gateway_config().headers(), {})
+        self._set_env(agents.GATEWAY_PROJECT_ENV, "automations-spend-control")
+        self._set_env(agents.GATEWAY_ORG_ENV, "BT Staging")
+        self.assertEqual(
+            agents.gateway_config().headers(),
+            {"x-bt-project-name": "automations-spend-control",
+             "x-bt-org-name": "BT Staging"})
+
+    def test_gateway_key_overrides_the_logging_key(self):
+        self._enable()
+        self._set_env(agents.GATEWAY_KEY_ENV, "bt-service-token")
+        self.assertEqual(agents.gateway_config().api_key, "bt-service-token")
+
+    def test_a_url_with_no_key_fails_loudly_rather_than_calling_unauthenticated(self):
+        self._set_env(agents.GATEWAY_URL_ENV, "https://gateway.braintrust.dev")
+        with self.assertRaises(SystemExit) as caught:
+            agents.gateway_config()
+        self.assertIn(agents.GATEWAY_KEY_ENV, str(caught.exception))
+
+    def test_the_vendor_key_is_not_required_under_gateway_routing(self):
+        """The vendor credential lives in the Braintrust org, so demanding a
+        local one would reject a correctly configured run."""
+        self._enable()
+        self._set_env("BASETEN_API_KEY", None)
+        client = agents.get_client("baseten", lambda c: c)
+        self.assertEqual(str(client.base_url).rstrip("/"),
+                         "https://gateway.braintrust.dev/v1")
+        self.assertEqual(client.api_key, "bt-test-key")
+
+
 class PreflightTest(unittest.TestCase):
     def _set_env(self, name, value):
         """Restore the ambient value so these cases cannot order-depend."""
@@ -927,6 +1091,159 @@ class FakeResponsesSequence:
 class FakeSequencedOpenAIClient:
     def __init__(self, responses):
         self.responses = FakeResponsesSequence(responses)
+
+
+class _ScriptedSession:
+    """Replays a fixed list of Turns through the harness session interface."""
+
+    def __init__(self, turns):
+        self.turns = list(turns)
+        self.tool_results = []
+
+    def add_user(self, question):
+        del question
+
+    def step(self, tools_enabled=True):
+        del tools_enabled
+        return self.turns.pop(0)
+
+    def add_tool_results(self, results):
+        self.tool_results.extend(results)
+
+
+def _search_call(query, call_id="c1"):
+    return {"id": call_id, "name": agents.SEARCH_TOOL_NAME,
+            "arguments": {"query": query}, "malformed": False}
+
+
+class HarnessSearchErrorTest(unittest.TestCase):
+    """A failing search API must degrade the row, not delete it.
+
+    Before this, a You.com error propagated out of the task and killed the whole
+    row. That is the worst available option: rows do not fail at random — a
+    provider fails hardest on the queries it handles worst — so the surviving
+    rows are a favorable subset of the ones actually asked, and the run reports a
+    score over a dataset it silently narrowed.
+    """
+
+    def _run(self, search_side_effect, turns):
+        session = _ScriptedSession(turns)
+        original_session = run_eval.make_harness_session
+        original_search = run_eval.run_search
+        run_eval.make_harness_session = lambda *a, **k: session
+        run_eval.run_search = search_side_effect
+        self.addCleanup(setattr, run_eval, "make_harness_session",
+                        original_session)
+        self.addCleanup(setattr, run_eval, "run_search", original_search)
+        return run_eval._run_harness(
+            object(), agents.VENDORS["openai"], "gpt-5.6-sol", "sys",
+            "who won?", [], "normalized", agents.SEARCH_MODE_HARNESS)
+
+    @staticmethod
+    def _http_error(status):
+        request = httpx.Request("GET", "https://ydc-index.io/v1/search")
+        def raise_it(*args, **kwargs):
+            del args, kwargs
+            raise httpx.HTTPStatusError(
+                "boom", request=request,
+                response=httpx.Response(status, request=request))
+        return raise_it
+
+    def test_a_failed_search_is_recorded_and_the_row_survives(self):
+        out = self._run(
+            self._http_error(503),
+            [agents.Turn(tool_calls=[_search_call("who won")]),
+             agents.Turn(text="Team A won.")])
+        self.assertEqual(out["final_answer"], "Team A won.")
+        self.assertEqual(out["search_errors"],
+                         [{"query": "who won", "error_code": "503"}])
+
+    def test_a_failed_search_is_not_billed(self):
+        # The request errored out, so it was not a served search — the same rule
+        # the model vendors apply to their own server-side search.
+        out = self._run(
+            self._http_error(503),
+            [agents.Turn(tool_calls=[_search_call("who won")]),
+             agents.Turn(text="Team A won.")])
+        self.assertEqual(out["search_cost"], 0.0)
+
+    def test_a_failed_search_surfaces_no_trajectory_entry(self):
+        # An error round is not an empty SERP. Appending a zero-result entry
+        # would let leakage_guard and the snippet scorers read it as a clean,
+        # compliant search instead of an unobservable one.
+        out = self._run(
+            self._http_error(503),
+            [agents.Turn(tool_calls=[_search_call("who won")]),
+             agents.Turn(text="Team A won.")])
+        self.assertEqual(out["trajectory"], [])
+
+    def test_a_failed_search_still_spends_budget(self):
+        # Otherwise a flaky provider gets unlimited free retries inside the turn
+        # cap, and the arm quietly exceeds the budget every other arm is held to.
+        out = self._run(
+            self._http_error(503),
+            [agents.Turn(tool_calls=[_search_call("who won")]),
+             agents.Turn(text="Team A won.")])
+        self.assertEqual(out["used_searches"], 1)
+
+    def test_the_model_is_told_the_search_failed(self):
+        # A silent empty result would read as "nothing exists on the web for
+        # this query", which is a different claim than "the lookup broke".
+        session_turns = [agents.Turn(tool_calls=[_search_call("who won")]),
+                         agents.Turn(text="Team A won.")]
+        session = _ScriptedSession(session_turns)
+        original_session = run_eval.make_harness_session
+        original_search = run_eval.run_search
+        run_eval.make_harness_session = lambda *a, **k: session
+        run_eval.run_search = self._http_error(503)
+        self.addCleanup(setattr, run_eval, "make_harness_session",
+                        original_session)
+        self.addCleanup(setattr, run_eval, "run_search", original_search)
+        run_eval._run_harness(
+            object(), agents.VENDORS["openai"], "gpt-5.6-sol", "sys",
+            "who won?", [], "normalized", agents.SEARCH_MODE_HARNESS)
+        self.assertEqual(len(session.tool_results), 1)
+        self.assertIn("Search failed", session.tool_results[0][1])
+
+    def test_a_transport_failure_with_no_status_records_its_class(self):
+        def raise_timeout(*args, **kwargs):
+            del args, kwargs
+            raise httpx.ConnectTimeout("timed out")
+        out = self._run(
+            raise_timeout,
+            [agents.Turn(tool_calls=[_search_call("who won")]),
+             agents.Turn(text="Team A won.")])
+        self.assertEqual(out["search_errors"],
+                         [{"query": "who won", "error_code": "ConnectTimeout"}])
+
+    def test_integrity_guards_are_not_swallowed(self):
+        """_provider_json raises ValueError for a refused redirect or an
+        unapproved host. Those mean the environment is wrong, not that one
+        search failed, so they must stop the run rather than be logged as a
+        routine error and averaged into a score."""
+        def raise_guard(*args, **kwargs):
+            del args, kwargs
+            raise ValueError("provider API redirected to an unapproved host")
+        with self.assertRaises(ValueError):
+            self._run(
+                raise_guard,
+                [agents.Turn(tool_calls=[_search_call("who won")]),
+                 agents.Turn(text="Team A won.")])
+
+    def test_a_successful_search_is_still_billed_and_recorded(self):
+        # The regression guard for the try/except: the success path must not
+        # have moved.
+        def succeed(*args, **kwargs):
+            del args, kwargs
+            return ([{"rank": 1, "url": "https://e.com", "title": "t",
+                      "snippet": "s", "published_date": None}], "rendered", 7)
+        out = self._run(
+            succeed,
+            [agents.Turn(tool_calls=[_search_call("who won")]),
+             agents.Turn(text="Team A won.")])
+        self.assertEqual(out["search_errors"], [])
+        self.assertEqual(len(out["trajectory"]), 1)
+        self.assertAlmostEqual(out["search_cost"], run_eval.YDC_USD_PER_CALL)
 
 
 class HarnessProtocolRegistryTest(unittest.TestCase):
