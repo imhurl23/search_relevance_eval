@@ -124,7 +124,7 @@ ANTHROPIC_MAX_PAUSE_TURNS = 4
 # The harness arm runs on /v1/responses, not /v1/chat/completions. This is not a
 # style preference — chat completions REJECTS the combination this study needs:
 #
-#   400 Function tools with reasoning_effort are not supported for gpt-5.6-sol
+#   400 Function tools with reasoning_effort are not supported for gpt-5.6-terra
 #       in /v1/chat/completions. To use function tools, use /v1/responses or set
 #       reasoning_effort to 'none'.
 #
@@ -213,23 +213,17 @@ VENDORS: dict[str, VendorSpec] = {
         harness_protocol=PROTOCOL_CHAT_COMPLETIONS,
         notes="Server-side search is structurally unavailable; native arm N/A.",
     ),
-    # gpt-5.6-sol is pinned rather than the bare `gpt-5.6` alias, which points at
-    # sol today and will move.
+    # gpt-5.6-terra is pinned rather than the moving `gpt-5.6` alias.
     #
-    # Sol is NOT asserted to be equivalent to claude-opus-5. There is no
-    # vendor-neutral capability tier: matching on price pairs sol with opus-5
-    # ($5/$30 vs $5/$25), while matching on within-lineup position pairs sol with
-    # claude-fable-5 (Anthropic's flagship, $10/$50). Those two framings disagree,
-    # so any pairing here is a declared choice, not a measured equivalence.
+    # Terra and Opus 5 are NOT asserted to be capability-equivalent. Terra is
+    # OpenAI's cost-balanced tier while Opus is Anthropic's higher-capability
+    # tier. The pairing is an operational choice, not a cross-vendor control.
     #
     # This is tolerable because no primary contrast depends on it: native-vs-
     # harness and search-vs-none both hold the model fixed within a vendor, and
     # cross-vendor native comparisons are already ruled out as two-variable. The
     # pairing only bounds how far an oss-vs-frontier result generalizes — read
     # that contrast as "vs this frontier model", never "vs frontier models".
-    # Swap with --agent-model claude-fable-5 for flagship-vs-flagship (2x cost,
-    # and the org must not be on zero data retention).
-    #
     # NOTE the empty sampling dict: gpt-5-family reasoning models reject
     # `temperature` with a 400 ("only the default (1) is supported"), and do not
     # support `seed`. "temperature 0, seed 42" is therefore unavailable on this
@@ -246,36 +240,21 @@ VENDORS: dict[str, VendorSpec] = {
         name="openai",
         model_class="frontier",
         api_key_env="OPENAI_API_KEY",
-        default_model="gpt-5.6-sol",
+        default_model="gpt-5.6-terra",
         supports_native_search=True,
         sampling={},
         reasoning_effort=OPENAI_EFFORT,
         harness_protocol=PROTOCOL_RESPONSES,
         notes="Native search via the Responses API hosted web_search tool.",
     ),
-    # claude-fable-5 pairs with gpt-5.6-sol on within-lineup position: each is its
-    # vendor's most capable widely released model. That is a declared choice, not
-    # a measured equivalence — see the openai entry for why neither price nor tier
-    # settles the question. Flagship-vs-flagship is chosen over price parity
-    # because "the best each vendor offers" is at least a definition both vendors
-    # publish, whereas a price match is an artifact of their margin decisions.
-    # --agent-model claude-opus-5 is the cheaper alternative (about half the token
-    # cost) when the extra capability is not worth 2x.
-    #
-    # Two Fable-5 specifics that matter for an eval:
-    #   * It requires 30-day data retention. Under zero data retention EVERY
-    #     request returns 400 regardless of payload, so check the org's retention
-    #     config before blaming the request.
-    #   * Its safety classifiers decline more often, returning HTTP 200 with
-    #     stop_reason="refusal". We record that as model_refused and do NOT enable
-    #     the server-side `fallbacks` parameter: a fallback would silently serve
-    #     the row from a different model, destroying the experimental condition
-    #     while reporting a score. A refusal must stay a refusal here.
+    # Opus 5 is the cost-conscious Anthropic choice for this matrix. Comparisons
+    # against Terra remain descriptive; the causal contrasts hold the model fixed
+    # and compare no search, harness search, and native search within a vendor.
     "anthropic": VendorSpec(
         name="anthropic",
         model_class="frontier",
         api_key_env="ANTHROPIC_API_KEY",
-        default_model="claude-fable-5",
+        default_model="claude-opus-5",
         supports_native_search=True,
         # Opus 5 removed temperature/top_p/top_k — sending any of them is a 400.
         sampling={},
@@ -346,9 +325,9 @@ MATRIX_MODELS: tuple[ModelRow, ...] = (
     ModelRow("baseten", "zai-org/GLM-5.2",
              "OSS, mid-price row ($1.40/$4.40) — current-generation, stronger "
              "reasoning than the Flash row"),
-    ModelRow("openai", "gpt-5.6-sol",
+    ModelRow("openai", "gpt-5.6-terra",
              "frontier, also runs a native-search arm"),
-    ModelRow("anthropic", "claude-fable-5",
+    ModelRow("anthropic", "claude-opus-5",
              "frontier, also runs a native-search arm"),
 )
 
@@ -439,8 +418,8 @@ MODEL_USD_PER_MTOK: dict[str, tuple[float, float]] = {
 
 
 # Cached input is billed at a fraction of the base input rate, and both frontier
-# vendors publish the same 0.1x multiplier (OpenAI: $0.50 cached on $5.00 base
-# for gpt-5.6-sol; Anthropic: $1 cache-hit on $10 base for claude-fable-5). It is
+# vendors publish the same 0.1x multiplier (OpenAI: $0.20 cached on $2.00 base
+# for Terra; Anthropic: $0.50 cached on $5.00 base for Opus). It is
 # expressed as a multiplier rather than eight more hand-entered numbers so the
 # cached rate cannot drift out of sync with the base rate it is derived from.
 #

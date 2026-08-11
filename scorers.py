@@ -392,11 +392,17 @@ Predicted answer: {predicted}
 Reply with exactly one word: CORRECT, INCORRECT, or NOT_ATTEMPTED."""
 
 
-def make_simpleqa_grader(client, judge_model: str = "gpt-4.1"):
-    """LLM judge. Pass an OpenAI-compatible client; keep the judge model in a
-    different family from the frozen agent. LiveNewsBench's own grading uses
-    the SimpleQA prompt with GPT-4.1, so this stays comparable to their
-    published numbers while living in Braintrust's native scores.
+DEFAULT_JUDGE_MODEL = "gpt-5.6-luna"
+
+
+def make_simpleqa_grader(client, judge_model: str = DEFAULT_JUDGE_MODEL):
+    """LLM judge over the question, gold target, and final answer.
+
+    Luna is the default because this short-form three-way classification is
+    high-volume and the deterministic matcher stays the reproducible headline.
+    Luna shares a model family with the Terra agent, so audit disagreements and
+    pass ``--judge gpt-4.1`` when direct parity with LiveNewsBench's published
+    judge is required.
 
     Emits score 1.0 / 0.0 / None(NOT_ATTEMPTED scored as 0 but flagged), plus
     the categorical grade in metadata so you can compute the SimpleQA-style

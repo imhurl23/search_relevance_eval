@@ -97,7 +97,8 @@ Control, harness, and native examples:
 ```
 
 Repeat `--judge` to use a judge jury. A non-OpenAI route uses
-`model@base_url` and `JUDGE_API_KEY`.
+`model@base_url` and `JUDGE_API_KEY`. The default judge is `gpt-5.6-luna`.
+Pass `--judge gpt-4.1` for direct parity with LiveNewsBench's published judge.
 
 ## Experimental matrix
 
@@ -107,8 +108,8 @@ Repeat `--judge` to use a judge jury. A non-OpenAI route uses
 |---|---|---|---:|---|
 | Open | Baseten | `deepseek-ai/DeepSeek-V4-Flash-0731` | 0.13 / 0.26 | No |
 | Open | Baseten | `zai-org/GLM-5.2` | 1.40 / 4.40 | No |
-| Frontier | OpenAI | `gpt-5.6-sol` | 5.00 / 30.00 | Yes |
-| Frontier | Anthropic | `claude-fable-5` | 10.00 / 50.00 | Yes |
+| Frontier | OpenAI | `gpt-5.6-terra` | 2.00 / 12.00 | Yes |
+| Frontier | Anthropic | `claude-opus-5` | 5.00 / 25.00 | Yes |
 
 Prices are pinned list prices in `agents.MODEL_USD_PER_MTOK`. Recheck them
 before publication. Promotional and negotiated rates are excluded.
@@ -135,8 +136,8 @@ six. The total is 22:
 |---|---:|---:|---:|---:|---:|---:|
 | DeepSeek-V4-Flash | Yes | Yes | Yes | Yes | Yes | — |
 | GLM-5.2 | Yes | Yes | Yes | Yes | Yes | — |
-| gpt-5.6-sol | Yes | Yes | Yes | Yes | Yes | Yes |
-| claude-fable-5 | Yes | Yes | Yes | Yes | Yes | Yes |
+| gpt-5.6-terra | Yes | Yes | Yes | Yes | Yes | Yes |
+| claude-opus-5 | Yes | Yes | Yes | Yes | Yes | Yes |
 
 Run conditions close together and interleave them across models. The live web
 changes during a study, and the runner does not schedule time blocks for you.
@@ -360,7 +361,7 @@ Analyze an exported JSONL file with paired task bootstrapping:
 .venv/bin/python analyze_results.py experiments.jsonl \
   --score qa_answer_match \
   --study-id retrieval-study \
-  --baseline 'gpt-5.6-sol::no_search'
+  --baseline 'gpt-5.6-terra::no_search'
 ```
 
 The analyzer reports paired effects, a 95% task-bootstrap interval,

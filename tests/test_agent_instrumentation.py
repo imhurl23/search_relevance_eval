@@ -170,20 +170,18 @@ class VendorRegistryTest(unittest.TestCase):
         self.assertEqual(agents.VENDORS["baseten"].sampling, {"temperature": 0})
 
     def test_frontier_models_are_pinned_snapshots_not_moving_aliases(self):
-        # `gpt-5.6` is an alias for gpt-5.6-sol and will move to whatever sol
-        # becomes; an eval condition has to name the snapshot. The two frontier
-        # models are NOT asserted to be capability-equivalent — see the vendor
-        # registry comment; no primary contrast depends on that.
-        self.assertEqual(agents.VENDORS["openai"].default_model, "gpt-5.6-sol")
+        # `gpt-5.6` is a moving alias; an eval condition has to name the snapshot.
+        # The frontier models are not asserted to be capability-equivalent; no
+        # primary contrast depends on that.
+        self.assertEqual(agents.VENDORS["openai"].default_model, "gpt-5.6-terra")
         self.assertNotEqual(agents.VENDORS["openai"].default_model, "gpt-5.6")
 
-    def test_anthropic_default_is_the_flagship_pairing(self):
-        # Paired with gpt-5.6-sol on within-lineup position: each is its vendor's
-        # most capable widely released model. claude-opus-5 stays selectable via
-        # --agent-model when the extra capability is not worth 2x.
+    def test_anthropic_default_is_opus(self):
         self.assertEqual(agents.VENDORS["anthropic"].default_model,
-                         "claude-fable-5")
-        self.assertIn("claude-opus-5", agents.MODEL_USD_PER_MTOK)
+                         "claude-opus-5")
+
+    def test_default_judge_is_luna(self):
+        self.assertEqual(scorers.DEFAULT_JUDGE_MODEL, "gpt-5.6-luna")
 
     def test_every_frontier_vendor_pins_effort_on_all_of_its_arms(self):
         # This assertion is inverted from its previous form, which required

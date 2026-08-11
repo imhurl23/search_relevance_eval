@@ -86,8 +86,9 @@ from import_retrievalqa import (
     retrievalqa_answer_as_of,
 )
 from corvus.sources import SharedHostLimiter, retry_after_seconds
-from scorers import (DETERMINISTIC_SCORERS, iter_source_urls,
-                     make_jury_grader, make_simpleqa_grader)
+from scorers import (DEFAULT_JUDGE_MODEL, DETERMINISTIC_SCORERS,
+                     iter_source_urls, make_jury_grader,
+                     make_simpleqa_grader)
 
 # ---------------------------------------------------------------------------
 # Credentials: values from .env always override ambient credentials.
@@ -1500,11 +1501,12 @@ def main():
                  "vendor's native search exposes no freshness parameter")
 
     agent_model = args.agent_model or VENDORS[args.model_vendor].default_model
-    # gpt-4.1 default keeps parity with LiveNewsBench's published grading.
+    # Luna handles the high-volume semantic check. Use --judge gpt-4.1 when a
+    # run needs direct parity with LiveNewsBench's published judge.
     if args.limit is not None and args.limit < 1:
         ap.error("--limit must be at least 1")
     run(args.arm, args.dataset_name, args.dataset_version,
-        args.trials, args.judges or ["gpt-4.1"], agent_model,
+        args.trials, args.judges or [DEFAULT_JUDGE_MODEL], agent_model,
         args.study_id, args.env_file, search_mode, args.model_vendor,
         args.split, args.limit)
 
