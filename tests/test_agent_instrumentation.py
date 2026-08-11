@@ -23,6 +23,7 @@ import httpx
 os.environ.setdefault("YDC_API_KEY", "test-ydc-key")
 
 import agents
+import import_retrievalqa
 import run_eval
 import scorers
 
@@ -250,6 +251,67 @@ class ConditionLabelTest(unittest.TestCase):
             run_eval.condition_label(agents.SEARCH_MODE_NATIVE,
                                      run_eval.DEFAULT_ARM, "anthropic"))
 
+
+class RetrievalQATemporalQualificationTest(unittest.TestCase):
+    """Frozen dynamic labels must be searched in their historical frame."""
+
+    def test_freshqa_snapshot_has_an_explicit_reference_date(self):
+        date_value, basis = import_retrievalqa.retrievalqa_answer_as_of({
+            "data_source": "freshqa", "question_id": "freshqa_378"})
+        self.assertEqual(date_value, "2024-02-01")
+        self.assertEqual(basis, "retrievalqa_freshqa_snapshot")
+
+    def test_realtimeqa_date_comes_from_the_question_id(self):
+        date_value, basis = import_retrievalqa.retrievalqa_answer_as_of({
+            "data_source": "realtimeqa",
+            "question_id": "realtimeqa_20231013_1",
+        })
+        self.assertEqual(date_value, "2023-10-13")
+        self.assertEqual(basis, "realtimeqa_question_id")
+
+    def test_static_sources_are_not_given_a_fabricated_date(self):
+        self.assertEqual(
+            import_retrievalqa.retrievalqa_answer_as_of({
+                "data_source": "triviaqa", "question_id": "triviaqa_1"}),
+            (None, None),
+        )
+
+    def test_question_tells_the_agent_to_search_in_the_historical_frame(self):
+        qualified, answer_as_of, _ = run_eval.qualify_retrievalqa_question(
+            "Who is the richest man on earth?",
+            {"data_source": "freshqa", "question_id": "freshqa_379"},
+            "RetrievalQA",
+        )
+        self.assertEqual(answer_as_of, "2024-02-01")
+        self.assertIn("Reference date: 2024-02-01", qualified)
+        self.assertIn("not as of today", qualified)
+        self.assertIn("include the reference date", qualified)
+
+    def test_other_datasets_keep_the_original_question(self):
+        question = "Who won?"
+        self.assertEqual(
+            run_eval.qualify_retrievalqa_question(
+                question, {"data_source": "freshqa"}, "LiveNewsBench"),
+            (question, None, None),
+        )
+
+    def test_day_filter_resolves_to_the_reference_date(self):
+        setup = run_eval.ydc_setup("native_fresh", "2024-02-01")
+        self.assertEqual(setup["freshness"], "2024-02-01to2024-02-01")
+        self.assertEqual(setup["freshness_reference"], "answer_as_of")
+
+    def test_week_filter_ends_on_the_reference_date(self):
+        setup = run_eval.ydc_setup("fresh_week", "2024-02-01")
+        self.assertEqual(setup["freshness"], "2024-01-26to2024-02-01")
+
+    def test_unqualified_rows_keep_the_declared_relative_filters(self):
+        self.assertEqual(run_eval.ydc_setup("native_fresh")["freshness"], "day")
+        self.assertEqual(run_eval.ydc_setup("fresh_week")["freshness"], "week")
+
+    def test_experiment_metadata_declares_row_relative_resolution(self):
+        setup = run_eval.experiment_ydc_setup("fresh_week", "RetrievalQA")
+        self.assertEqual(setup["freshness"], "answer_as_of_week")
+        self.assertEqual(setup["freshness_reference"], "row_answer_as_of")
 
 # --- native adapters --------------------------------------------------------
 

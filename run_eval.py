@@ -68,7 +68,7 @@ import os
 import re
 import subprocess
 import time
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -81,6 +81,10 @@ from agents import (SEARCH_MODE_HARNESS, SEARCH_MODE_NATIVE, SEARCH_MODE_NONE,
                     SEARCH_MODES, SURFACE_FULL, SURFACE_NONE, VENDORS,
                     make_harness_session, native_search_rate_usd, vendor_of)
 from import_livenewsbench import DATASET_NAME, load_env
+from import_retrievalqa import (
+    DATASET_NAME as RETRIEVALQA_DATASET_NAME,
+    retrievalqa_answer_as_of,
+)
 from corvus.sources import SharedHostLimiter, retry_after_seconds
 from scorers import (DETERMINISTIC_SCORERS, iter_source_urls,
                      make_jury_grader, make_simpleqa_grader)
@@ -173,12 +177,48 @@ YDC_SETUPS: dict[str, dict] = {
 DEFAULT_ARM = "normalized"
 
 
-def ydc_setup(arm: str) -> dict:
+def ydc_setup(arm: str, answer_as_of: str | None = None) -> dict:
     try:
-        return YDC_SETUPS[arm]
+        setup = dict(YDC_SETUPS[arm])
     except KeyError:
         raise SystemExit(
             f"unknown --arm {arm!r}; expected one of {sorted(YDC_SETUPS)}") from None
+    if answer_as_of and setup["freshness"] in ("day", "week"):
+        end = date.fromisoformat(answer_as_of)
+        start = end if setup["freshness"] == "day" else end - timedelta(days=6)
+        setup["freshness"] = f"{start.isoformat()}to{end.isoformat()}"
+        setup["freshness_reference"] = "answer_as_of"
+    return setup
+
+
+def experiment_ydc_setup(arm: str, dataset_name: str) -> dict:
+    """Declare row-relative historical filtering without pretending it is `day`."""
+    setup = ydc_setup(arm)
+    if (dataset_name == RETRIEVALQA_DATASET_NAME
+            and setup["freshness"] in ("day", "week")):
+        setup["freshness"] = f"answer_as_of_{setup['freshness']}"
+        setup["freshness_reference"] = "row_answer_as_of"
+    return setup
+
+
+def qualify_retrievalqa_question(
+    question: str,
+    metadata: dict,
+    dataset_name: str,
+) -> tuple[str, str | None, str | None]:
+    """Anchor frozen dynamic QA labels to the date on which they were true."""
+    if dataset_name != RETRIEVALQA_DATASET_NAME:
+        return question, None, None
+    answer_as_of, basis = retrievalqa_answer_as_of(metadata)
+    if not answer_as_of:
+        return question, None, None
+    qualified = (
+        f"{question}\n\nReference date: {answer_as_of}. Answer as of that date, "
+        "not as of today. Interpret words such as latest, current, this week, "
+        "and most recent relative to the reference date. When searching, "
+        f"include the reference date ({answer_as_of}) in the query."
+    )
+    return qualified, answer_as_of, basis
 
 FROZEN_SYSTEM_PROMPT = """\
 You are a web research agent answering a time-sensitive factual question. You have one tool:
@@ -326,7 +366,8 @@ def _provider_json(method: str, url: str, **kwargs):
     raise AssertionError("unreachable")
 
 
-def youdotcom_search(query: str, arm: str, exclude_domains: list[str]):
+def youdotcom_search(query: str, arm: str, exclude_domains: list[str],
+                     setup: dict | None = None):
     # GET https://ydc-index.io/v1/search — the documented base host is
     # ydc-index.io (no api. prefix), and GET is the only shape You.com publishes
     # a full parameter spec for. Their docs do recommend POST for domain lists
@@ -335,7 +376,7 @@ def youdotcom_search(query: str, arm: str, exclude_domains: list[str]):
     # is a handful of domains, so GET stays well inside the documented path.
     # exclude_domains is one comma-separated string and is mutually exclusive
     # with include_domains (sending both returns 422).
-    setup = ydc_setup(arm)
+    setup = setup or ydc_setup(arm)
     params = {"query": query, "count": setup["count"]}
     if exclude_domains:
         # Omit rather than send an empty string, which is not a documented value.
@@ -387,10 +428,11 @@ def _provider_request_id(raw: dict) -> str | None:
 # ---------------------------------------------------------------------------
 
 @traced(type="tool", name="search_web", notrace_io=True)
-def run_search(arm: str, query: str, exclude_domains: list[str]):
-    setup = ydc_setup(arm)
+def run_search(arm: str, query: str, exclude_domains: list[str],
+               setup: dict | None = None):
+    setup = setup or ydc_setup(arm)
     t0 = time.perf_counter()
-    results, raw = youdotcom_search(query, arm, exclude_domains)
+    results, raw = youdotcom_search(query, arm, exclude_domains, setup)
     latency = time.perf_counter() - t0
     rendered = "\n".join(
         f"[{r['rank']}] {r['title']}\n    {r['url']}\n    "
@@ -475,8 +517,11 @@ def make_task(
         row_metadata = hooks.metadata or {}
         source_domains = source_domains_of(row_metadata, hooks.expected)
         excludes = source_domains + ARCHIVE_EXCLUDES
-        question = input["question"]
-        task_key = hashlib.sha256(question.encode("utf-8")).hexdigest()[:16]
+        original_question = input["question"]
+        question, answer_as_of, answer_as_of_basis = qualify_retrievalqa_question(
+            original_question, row_metadata, dataset_name)
+        search_setup = ydc_setup(arm, answer_as_of)
+        task_key = hashlib.sha256(original_question.encode("utf-8")).hexdigest()[:16]
         # Category is load-bearing for reporting, not decoration: the closest
         # published comparison saw this effect swing from ~+6 points to zero
         # across two domains, so a pooled number can hide a sign change. The
@@ -504,7 +549,8 @@ def make_task(
                                   question, excludes)
         else:
             outcome = _run_harness(client, spec, agent_model, system_prompt,
-                                   question, excludes, arm, search_mode)
+                                   question, excludes, arm, search_mode,
+                                   search_setup)
         wall_clock_s = time.perf_counter() - t0
 
         surfaced = agents.surfaced_domains(outcome["trajectory"])
@@ -554,8 +600,12 @@ def make_task(
             # The resolved You.com setup, so a row is interpretable without
             # reading YDC_SETUPS at the run's commit.
             "ydc_setup": (
-                dict(ydc_setup(arm)) if search_mode == SEARCH_MODE_HARNESS
+                search_setup if search_mode == SEARCH_MODE_HARNESS
                 else None),
+            "answer_as_of": answer_as_of,
+            "answer_as_of_basis": answer_as_of_basis,
+            "temporal_qualification_applied": answer_as_of is not None,
+            "effective_question": question,
             "agent_model": agent_model,
             "study_id": study_id,
             "condition_id": condition_id,
@@ -692,7 +742,7 @@ def _blank_outcome(decision_surface: str) -> dict:
 
 
 def _run_harness(client, spec, agent_model, system_prompt, question, excludes,
-                 arm, search_mode) -> dict:
+                 arm, search_mode, search_setup: dict | None = None) -> dict:
     """Tool-calling loop for the harness arm and the no-tool control arm.
 
     Identical driver for both: the control arm is this loop with the tool never
@@ -744,7 +794,7 @@ def _run_harness(client, spec, agent_model, system_prompt, question, excludes,
                     query = call["arguments"].get("query", "")
                     try:
                         results, content, tok = run_search(
-                            arm, query, excludes)
+                            arm, query, excludes, search_setup)
                     except httpx.HTTPError as exc:
                         # The provider failed after _provider_json's retries.
                         # Recorded and survivable rather than fatal: killing the
@@ -1237,7 +1287,8 @@ def run(arm: str, dataset_name: str, dataset_version: str | None,
                 if search_mode == SEARCH_MODE_NONE else f"{model_vendor}_native"),
             "arm": arm, "agent_model": agent_model,
             "ydc_setup": (
-                dict(ydc_setup(arm)) if search_mode == SEARCH_MODE_HARNESS
+                experiment_ydc_setup(arm, dataset.name)
+                if search_mode == SEARCH_MODE_HARNESS
                 else None),
             "study_id": study_id,
             "condition_id": condition_id,
@@ -1304,7 +1355,8 @@ def run(arm: str, dataset_name: str, dataset_version: str | None,
                 ydc_setup(arm)["count"] if search_mode == SEARCH_MODE_HARNESS
                 else None),
             "youdotcom_freshness": (
-                ydc_setup(arm)["freshness"] if search_mode == SEARCH_MODE_HARNESS
+                experiment_ydc_setup(arm, dataset.name)["freshness"]
+                if search_mode == SEARCH_MODE_HARNESS
                 else None),
             "ydc_setup_name": (
                 arm if search_mode == SEARCH_MODE_HARNESS else None),
@@ -1343,6 +1395,9 @@ def run(arm: str, dataset_name: str, dataset_version: str | None,
             "prompt_caching_expected": model_vendor == "openai",
             "git_commit": _git_commit(),
             "prompt_version": PROMPT_VERSIONS[search_mode],
+            "question_transform_version": (
+                "retrievalqa-answer-as-of-v1"
+                if dataset.name == RETRIEVALQA_DATASET_NAME else "identity-v1"),
         },
     )
 

@@ -126,6 +126,16 @@ class YouComSetupTest(unittest.TestCase):
         # would report a null effect that is really a duplicated arm.
         self.assertEqual(self._params("fresh_week")["freshness"], "week")
 
+    def test_historical_setup_sends_an_absolute_date_range(self):
+        setup = run_eval.ydc_setup("fresh_week", "2024-02-01")
+        with patch.object(run_eval, "_provider_json",
+                          return_value=YDC_RESPONSE) as sent:
+            run_eval.youdotcom_search("who won in 2024", "fresh_week", [], setup)
+        self.assertEqual(
+            sent.call_args[1]["params"]["freshness"],
+            "2024-01-26to2024-02-01",
+        )
+
     def test_wide_raises_count_without_adding_a_freshness_filter(self):
         params = self._params("wide")
         self.assertEqual(params["count"], 20)

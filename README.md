@@ -64,6 +64,16 @@ as publication-quality.
   cached call while barely touching the single-call native arm. `agent_cache_hit_rate`
   is logged per row so that correction stays checkable
 
+RetrievalQA's `freshqa` and `realtimeqa` rows are historical, time-sensitive
+questions rather than rolling labels. The runner appends an explicit
+`answer_as_of` reference date to those questions: RealTimeQA's date is parsed
+from its question ID, while the pinned FreshQA slice uses its February 1, 2024
+evidence snapshot. For these rows, You.com's `day` and `week` treatments resolve
+to absolute historical ranges ending on `answer_as_of`; using the present-day
+relative filters would guarantee a current answer against an old gold label.
+Static RetrievalQA sources are left unchanged. Each row records the effective
+question, reference date, provenance, and resolved You.com parameters.
+
 ## What this study claims
 
 The design is committed in [docs/study-design.md](docs/study-design.md) before the

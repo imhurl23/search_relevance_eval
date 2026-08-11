@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -18,6 +19,38 @@ from import_livenewsbench import load_env
 
 DATASET_NAME = "RetrievalQA"
 SOURCE_REPOSITORY = "https://huggingface.co/datasets/zihanz/RetrievalQA"
+
+# RetrievalQA's time-sensitive sources are frozen historical benchmarks, not
+# rolling questions. RealTimeQA puts its weekly quiz date in question_id. The
+# pinned FreshQA slice does not carry a date field, but its supplied evidence
+# and answers are the February 1, 2024 snapshot (for example, the richest-person
+# evidence is explicitly headed "as of February 1, 2024"). Keep that provenance
+# explicit so a live search in a later year is asked for the historical answer
+# rather than being penalized for returning today's correct answer.
+FRESHQA_ANSWER_AS_OF = "2024-02-01"
+_REALTIMEQA_ID = re.compile(r"^realtimeqa_(\d{4})(\d{2})(\d{2})(?:_|$)")
+
+
+def retrievalqa_answer_as_of(metadata: dict[str, Any]) -> tuple[str | None, str | None]:
+    """Return (ISO date, provenance) for a time-sensitive RetrievalQA row.
+
+    Explicit metadata wins so a future upstream release can supply a more
+    precise date without a code change. The fallbacks keep the already-imported
+    Braintrust snapshot usable without mutating it in place.
+    """
+    explicit = metadata.get("answer_as_of")
+    if explicit:
+        return str(explicit), str(metadata.get("answer_as_of_basis") or "upstream")
+
+    source = str(metadata.get("data_source") or "").lower()
+    if source == "realtimeqa":
+        match = _REALTIMEQA_ID.match(str(metadata.get("question_id") or ""))
+        if match:
+            year, month, day = match.groups()
+            return f"{year}-{month}-{day}", "realtimeqa_question_id"
+    if source == "freshqa":
+        return FRESHQA_ANSWER_AS_OF, "retrievalqa_freshqa_snapshot"
+    return None, None
 
 
 def iter_rows(source_path: Path) -> Iterator[dict[str, Any]]:
@@ -112,6 +145,8 @@ def main() -> int:
         question = source_row.pop("question")
         expected = source_row.pop("ground_truth")
         data_source = source_row.get("data_source")
+        answer_as_of, answer_as_of_basis = retrievalqa_answer_as_of(
+            {**source_row, "question_id": question_id})
         dataset.insert(
             id=question_id,
             input={"question": question},
@@ -122,6 +157,8 @@ def main() -> int:
                 "source_repository": SOURCE_REPOSITORY,
                 "source_revision": args.source_revision,
                 "source_sha256": args.source_sha256,
+                "answer_as_of": answer_as_of,
+                "answer_as_of_basis": answer_as_of_basis,
             },
             tags=[data_source] if data_source else None,
         )
