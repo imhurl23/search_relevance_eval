@@ -4,7 +4,7 @@ This repository measures how web retrieval changes short-form factual answers.
 It compares four models under no search, a shared You.com tool, and each frontier
 vendor's native search.
 
-The study has 22 conditions. Each condition uses the same pinned dataset rows,
+The study has 14 conditions. Each condition uses the same pinned dataset rows,
 answer format, five-search allowance, and scoring code. The preregistered
 contrasts and reporting rules live in [docs/study-design.md](docs/study-design.md).
 
@@ -12,7 +12,7 @@ contrasts and reporting rules live in [docs/study-design.md](docs/study-design.m
 
 - Four model configurations: two Baseten-hosted open models, OpenAI, and
   Anthropic.
-- Four You.com retrieval setups that vary result count and freshness filters.
+- Two You.com retrieval setups that vary result count.
 - Native search for OpenAI and Anthropic.
 - A no-search control for every model.
 - Importers for LiveNewsBench and RetrievalQA.
@@ -27,7 +27,8 @@ claims about You.com, not independent search APIs as a class.
 
 | Path | Purpose |
 |---|---|
-| `run_eval.py` | Run experiments and gateway checks |
+| `run_eval.py` | Run one experiment condition or a gateway check |
+| `run_matrix.py` | Preview or launch the finalized matrix |
 | `agents.py` | Provider clients, search adapters, prompts, and pricing |
 | `scorers.py` | Deterministic and judge-based row scorers |
 | `analyze_results.py` | Paired summaries for exported JSONL results |
@@ -89,7 +90,7 @@ Control, harness, and native examples:
 
 .venv/bin/python run_eval.py run \
   --dataset-version "$DATASET_VERSION" --study-id retrieval-study \
-  --model-vendor openai --search-mode harness --arm native_fresh
+  --model-vendor openai --search-mode harness --arm normalized
 
 .venv/bin/python run_eval.py run \
   --dataset-version "$DATASET_VERSION" --study-id retrieval-study \
@@ -120,8 +121,6 @@ before publication. Promotional and negotiated rates are excluded.
 |---|---|---|---:|
 | `none` | — | No search tool | $0 |
 | `harness` | `normalized` | You.com, 8 results, no freshness filter | $0.005/call |
-| `harness` | `native_fresh` | You.com, 8 results, day filter | $0.005/call |
-| `harness` | `fresh_week` | You.com, 8 results, week filter | $0.005/call |
 | `harness` | `wide` | You.com, 20 results, no freshness filter | $0.005/call |
 | `native` | — | Vendor-hosted search | $0.010/search |
 
@@ -129,54 +128,31 @@ Harness results expose at most 400 snippet characters. The agent may make five
 searches and cannot fetch arbitrary pages. You.com charges per call, so the
 `wide` arm costs the same per search as the 8-result arms.
 
-The two Baseten models each run five conditions. The frontier models each run
-six. The total is 22:
+The two Baseten models each run three conditions. The frontier models each run
+four. The total is 14:
 
-| Model | None | Normalized | Day | Week | Wide | Native |
-|---|---:|---:|---:|---:|---:|---:|
-| DeepSeek-V4-Flash | Yes | Yes | Yes | Yes | Yes | — |
-| GLM-5.2 | Yes | Yes | Yes | Yes | Yes | — |
-| gpt-5.6-terra | Yes | Yes | Yes | Yes | Yes | Yes |
-| claude-opus-5 | Yes | Yes | Yes | Yes | Yes | Yes |
+| Model | None | Normalized | Wide | Native |
+|---|---:|---:|---:|---:|
+| DeepSeek-V4-Flash | Yes | Yes | Yes | — |
+| GLM-5.2 | Yes | Yes | Yes | — |
+| gpt-5.6-terra | Yes | Yes | Yes | Yes |
+| claude-opus-5 | Yes | Yes | Yes | Yes |
 
-Run conditions close together and interleave them across models. The live web
-changes during a study, and the runner does not schedule time blocks for you.
+The launcher interleaves models by treatment and runs one condition at a time to
+avoid provider overload. Run the matrix without long pauses because the live web
+changes during a study.
 
-The following shell loop runs the full matrix:
+Preview the full launch without spending money:
 
 ```bash
-DATASET=LiveNewsBench
-VERSION=replace-with-snapshot-xact-id
-STUDY=replace-with-study-id
-TRIALS=3
-
-run_condition() {
-  .venv/bin/python run_eval.py run \
-    --dataset-name "$DATASET" --dataset-version "$VERSION" \
-    --study-id "$STUDY" --trials "$TRIALS" "$@"
-}
-
-run_condition --model-vendor baseten \
-  --agent-model deepseek-ai/DeepSeek-V4-Flash-0731 --search-mode none
-run_condition --model-vendor baseten \
-  --agent-model zai-org/GLM-5.2 --search-mode none
-run_condition --model-vendor openai --search-mode none
-run_condition --model-vendor anthropic --search-mode none
-
-for arm in normalized native_fresh fresh_week wide; do
-  run_condition --model-vendor baseten \
-    --agent-model deepseek-ai/DeepSeek-V4-Flash-0731 \
-    --search-mode harness --arm "$arm"
-  run_condition --model-vendor baseten \
-    --agent-model zai-org/GLM-5.2 \
-    --search-mode harness --arm "$arm"
-  run_condition --model-vendor openai --search-mode harness --arm "$arm"
-  run_condition --model-vendor anthropic --search-mode harness --arm "$arm"
-done
-
-run_condition --model-vendor openai --search-mode native
-run_condition --model-vendor anthropic --search-mode native
+.venv/bin/python run_matrix.py \
+  --dataset-name LiveNewsBench \
+  --dataset-version 1000197598003916222 \
+  --study-id livenewsbench-full-v1
 ```
+
+After checking all 14 commands, repeat with `--execute`. The launcher defaults
+to one trial. Add `--limit 5` for an end-to-end pilot.
 
 ## Gateway routing
 

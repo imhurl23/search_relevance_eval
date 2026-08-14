@@ -46,13 +46,13 @@ Usage:
 
     # one command per matrix cell; interleave them in time, don't run days apart
     python run_eval.py run --model-vendor openai --search-mode harness \
-      --arm native_fresh \
-      --dataset-version <xact-id> --study-id matrix-v1 --trials 3
+      --arm normalized \
+      --dataset-version <xact-id> --study-id matrix-v1 --trials 1
     python run_eval.py run --model-vendor openai --search-mode native \
-      --dataset-version <xact-id> --study-id matrix-v1 --trials 3
+      --dataset-version <xact-id> --study-id matrix-v1 --trials 1
     python run_eval.py run --model-vendor baseten \
       --agent-model deepseek-ai/DeepSeek-V4-Flash-0731 --search-mode none \
-      --dataset-version <xact-id> --study-id matrix-v1 --trials 3
+      --dataset-version <xact-id> --study-id matrix-v1 --trials 1
 
 Native search is only attributable WITHIN a vendor: run each frontier vendor's
 none/harness/native arms together and compare its native arm to its own harness
@@ -1435,7 +1435,7 @@ def main():
                         "same rows. Required unless --allow-latest is passed.")
     r.add_argument("--allow-latest", action="store_true",
                    help="Exploratory runs only: allow an unpinned dataset head.")
-    r.add_argument("--trials", type=int, default=3)
+    r.add_argument("--trials", type=int, default=1)
     r.add_argument("--study-id", default="freshness-v1",
                    help="Shared identifier for every condition in one experiment "
                         "matrix. Reuse it across providers, arms, and models.")
@@ -1447,8 +1447,8 @@ def main():
                         "the matrix under a second model to check that yours "
                         "generalizes.")
     r.add_argument("--judge", action="append", dest="judges", metavar="MODEL[@BASE_URL]",
-                   help="Repeatable. One judge keeps SimpleQA parity; three or "
-                        "more convene a majority-vote jury. Use model@base_url "
+                   help="Repeatable. One judge emits one semantic score; three "
+                        "or more convene a majority-vote jury. Use model@base_url "
                         "with JUDGE_API_KEY for non-OpenAI routes.")
     r.add_argument("--split", default=None,
                    help="Restrict to one dataset split (LiveNewsBench: val, "
@@ -1458,8 +1458,8 @@ def main():
     r.add_argument("--limit", type=int, default=None,
                    help="Cap rows per run, taken deterministically after "
                         "sorting by row id. Required for a cost-bounded pilot: "
-                        "the full LiveNewsBench set is 1329 rows, so 22 runs at "
-                        "3 trials is ~88k rows.")
+                        "the full LiveNewsBench matrix is 14 conditions and "
+                        "18,606 row executions at one trial.")
     r.add_argument("--env-file", type=Path, default=Path(".env"))
 
     g = sub.add_parser(

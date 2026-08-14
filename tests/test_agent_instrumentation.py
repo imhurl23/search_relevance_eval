@@ -17,6 +17,7 @@ schemas:
 import dataclasses
 import os
 import unittest
+from collections import Counter
 
 import httpx
 
@@ -25,6 +26,7 @@ os.environ.setdefault("YDC_API_KEY", "test-ydc-key")
 import agents
 import import_retrievalqa
 import run_eval
+import run_matrix
 import scorers
 
 
@@ -143,6 +145,25 @@ LNB_METADATA = {
 # --- axes -------------------------------------------------------------------
 
 class VendorRegistryTest(unittest.TestCase):
+    def test_finalized_matrix_has_fourteen_conditions(self):
+        self.assertEqual(len(run_matrix.MATRIX), 14)
+        labels = [condition.label for condition in run_matrix.MATRIX]
+        self.assertEqual(len(labels), len(set(labels)))
+
+    def test_finalized_matrix_uses_only_selected_search_arms(self):
+        harness_arms = {
+            condition.arm for condition in run_matrix.MATRIX
+            if condition.search_mode == "harness"
+        }
+        self.assertEqual(harness_arms, {"normalized", "wide"})
+
+    def test_finalized_matrix_condition_counts_by_model(self):
+        counts = Counter(condition.model for condition in run_matrix.MATRIX)
+        self.assertEqual(counts["deepseek-ai/DeepSeek-V4-Flash-0731"], 3)
+        self.assertEqual(counts["zai-org/GLM-5.2"], 3)
+        self.assertEqual(counts["gpt-5.6-terra"], 4)
+        self.assertEqual(counts["claude-opus-5"], 4)
+
     def test_model_class_split_matches_the_matrix(self):
         self.assertEqual(agents.VENDORS["baseten"].model_class, "oss")
         self.assertEqual(agents.VENDORS["openai"].model_class, "frontier")

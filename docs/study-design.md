@@ -18,12 +18,12 @@ The design answers three questions:
 
 ## Conditions
 
-The matrix contains 22 conditions:
+The matrix contains 14 conditions:
 
-- Four models each run no search and four You.com harness arms: 20 conditions.
+- Four models each run no search and two You.com harness arms: 12 conditions.
 - OpenAI and Anthropic each add one native-search arm: 2 conditions.
 
-The harness arms are `normalized`, `native_fresh`, `fresh_week`, and `wide`.
+The harness arms are `normalized` and `wide`.
 The exact models, parameters, prices, and commands are in the
 [README](../README.md#experimental-matrix).
 
@@ -88,21 +88,16 @@ surfaces.
 
 ## Registered contrasts
 
-Apply Holm correction across every primary test produced by these four contrast
+Apply Holm correction across every primary test produced by these three contrast
 definitions:
 
 1. `harness(normalized) - none` within each model.
-2. Each open model's best prespecified harness setup against each frontier
-   no-search condition.
+2. Each open model's `normalized` condition against each frontier no-search
+   condition.
 3. `native - harness(normalized)` within OpenAI and within Anthropic.
-4. `harness(native_fresh) - harness(normalized)`, pooled across models.
-
-Define the setup used in contrast 2 before examining test results. Development
-data may select it; test data may estimate it.
 
 The following analyses are exploratory:
 
-- `fresh_week - native_fresh`;
 - `wide - normalized`;
 - category and recency subgroups beyond the registered breakdowns;
 - mediator analyses;
@@ -133,18 +128,17 @@ condition rather than successful retrieval alone.
 
 ## Analysis
 
-1. Average repeated trials within each `task_key` and condition.
-2. Pair conditions on `task_key`.
-3. Compute the mean paired difference.
-4. Bootstrap tasks for a 95% confidence interval.
-5. Apply Holm correction to the registered contrast family.
-6. Report win, tie, and loss counts.
-7. Report results by `benchmark_category`; show any pooled mean as a summary.
-8. Report row exclusions and missing-score denominators by arm.
+1. Pair conditions on `task_key`.
+2. Compute the mean paired difference.
+3. Bootstrap tasks for a 95% confidence interval.
+4. Apply Holm correction to the registered contrast family.
+5. Report win, tie, and loss counts.
+6. Report results by `benchmark_category`; show any pooled mean as a summary.
+7. Report row exclusions and missing-score denominators by arm.
 
-Before interpreting an effect, compare it with the across-trial spread. Increase
-the trial count when the effect is smaller than normal run variation. The current
-default of three trials has no formal power analysis.
+The full matrix runs once. Estimate operational variance by repeating the same
+100-question subset twice, close in time, after the full run. Expand replication
+only when a reported effect is smaller than the observed repeat spread.
 
 For publication, add a mixed-effects model with condition as a fixed effect and
 task as a random intercept. The repository's bootstrap analyzer remains the
@@ -185,6 +179,5 @@ a general result about independent retrieval providers. Native-search evidence
 is less observable than harness evidence. The native-versus-harness contrast also
 changes one tool-specific prompt sentence.
 
-OpenAI and Anthropic gateway adapters passed live checks on August 10, 2026.
-Baseten gateway routing and current open-model tool use still need a live check
-before the full matrix.
+OpenAI Terra and Anthropic Opus gateway and native-search adapters passed live
+checks on August 14, 2026. Both Baseten model routes passed on the same date.
