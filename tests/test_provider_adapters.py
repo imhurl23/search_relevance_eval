@@ -8,14 +8,16 @@ comparison. If `freshness` were dropped on the fresh_day setup, that arm would
 quietly become a duplicate of `normalized` and the comparison would report a null
 effect that is really a bug.
 
-Spec: https://you.com/docs/api-reference/search (checked 2026-07-30)
+Spec: https://you.com/docs/api-reference/search (checked 2026-08-17)
   * base host is ydc-index.io, no api. prefix
-  * exclude_domains is one comma-separated string, mutually exclusive with
+  * POST is the documented path; extraction_mode: "highlights" is POST-only
+  * exclude_domains is a JSON array on POST, mutually exclusive with
     include_domains (sending both returns 422)
   * freshness accepts day | week | month | year | YYYY-MM-DDtoYYYY-MM-DD
   * count does not affect price
-  * results.web[] carries `snippets`; results.news[] does not
-  * `page_age` is the timestamp field; there is no publication-date field
+  * results.web[] carries `snippets` (or contents.highlights with extraction);
+    results.news[] carries `description` and `page_age` (publication timestamp)
+  * `page_age` is the timestamp field; for news results it is a publication date
 """
 
 import os
@@ -35,11 +37,24 @@ YDC_RESPONSE = {
                 "url": "https://publisher.example/story",
                 "title": "Story",
                 "description": "desc",
-                "snippets": ["s" * 5000],
+                "snippets": ["first snippet", "second snippet"],
                 "page_age": "2026-07-29T00:00:00Z",
+                "contents": {
+                    "highlights": ["highlight one", "highlight two"],
+                },
             }
         ],
-        "news": [],
+        "news": [
+            {
+                "url": "https://news.example/breaking",
+                "title": "Breaking News",
+                "description": "News article summary",
+                "page_age": "2026-08-17T10:00:00Z",
+                "contents": {
+                    "highlights": ["news highlight passage"],
+                },
+            }
+        ],
     },
 }
 
@@ -54,7 +69,7 @@ class YouComRequestShapeTest(unittest.TestCase):
 
     def test_uses_the_documented_host_and_method(self):
         (args, kwargs), _, _ = self._call("normalized")
-        self.assertEqual(args[0], "GET")
+        self.assertEqual(args[0], "POST")
         self.assertEqual(args[1], "https://ydc-index.io/v1/search")
 
     def test_sends_the_api_key_and_asks_intermediaries_not_to_cache(self):
@@ -64,37 +79,76 @@ class YouComRequestShapeTest(unittest.TestCase):
         self.assertEqual(kwargs["headers"]["X-API-Key"], os.environ["YDC_API_KEY"])
         self.assertEqual(kwargs["headers"]["Cache-Control"], "no-cache")
 
-    def test_exclude_domains_is_one_comma_separated_string(self):
+    def test_sends_extraction_mode_highlights(self):
+        # Highlights are query-aware passages purpose-built for agent grounding
+        # and are only available on POST.
+        (_, kwargs), _, _ = self._call("normalized")
+        self.assertEqual(kwargs["json"]["extraction"],
+                         {"extraction_mode": "highlights"})
+
+    def test_exclude_domains_is_a_json_array(self):
         (_, kwargs), _, _ = self._call(
             "normalized", ["source.example", "web.archive.org"])
-        self.assertEqual(kwargs["params"]["exclude_domains"],
-                         "source.example,web.archive.org")
+        self.assertEqual(kwargs["json"]["exclude_domains"],
+                         ["source.example", "web.archive.org"])
 
     def test_empty_exclude_list_is_omitted_not_sent_blank(self):
-        # An empty string is not a documented value for this parameter.
+        # An empty list is not a documented value for this parameter.
         (_, kwargs), _, _ = self._call("normalized", [])
-        self.assertNotIn("exclude_domains", kwargs["params"])
+        self.assertNotIn("exclude_domains", kwargs["json"])
 
     def test_include_domains_is_never_sent(self):
         # Mutually exclusive with exclude_domains; sending both returns 422.
         (_, kwargs), _, _ = self._call("normalized", ["source.example"])
-        self.assertNotIn("include_domains", kwargs["params"])
+        self.assertNotIn("include_domains", kwargs["json"])
 
-    def test_snippet_is_truncated_to_the_declared_budget(self):
+    def test_snippet_is_not_truncated(self):
+        # The full highlight passage is passed to the agent without truncation.
         _, results, _ = self._call("normalized")
-        self.assertEqual(len(results[0]["snippet"]), run_eval.SNIPPET_CHARS)
+        self.assertEqual(results[0]["snippet"], "highlight one\nhighlight two")
+
+    def test_all_highlights_are_used_not_just_the_first(self):
+        _, results, _ = self._call("normalized")
+        self.assertIn("highlight two", results[0]["snippet"])
 
     def test_page_age_maps_to_published_date(self):
-        # There is no publication-date field in this response shape, so
-        # published_date carries last-modified. temporal_grounding's construct
-        # limitation traces to exactly this line.
+        # For web results, page_age is last-modified. For news results, it is
+        # a publication timestamp. Both are carried through as published_date.
         _, results, _ = self._call("normalized")
         self.assertEqual(results[0]["published_date"], "2026-07-29T00:00:00Z")
 
-    def test_only_the_web_shape_is_read(self):
-        # results.news[] carries no snippets, so it yields no decision surface.
+    def test_news_results_are_read_alongside_web(self):
+        # results.news[] is automatically returned for news-intent queries and
+        # carries publication timestamps. It must not be discarded.
+        _, results, _ = self._call("normalized")
+        self.assertEqual(len(results), 2)  # 1 web + 1 news
+        self.assertEqual(results[1]["url"], "https://news.example/breaking")
+        self.assertEqual(results[1]["published_date"], "2026-08-17T10:00:00Z")
+        self.assertEqual(results[1]["snippet"], "news highlight passage")
+
+    def test_news_results_without_highlights_use_description(self):
+        # News results carry no snippets; without highlights, description is
+        # the fallback.
         response = {"metadata": {}, "results": {"web": [], "news": [
-            {"url": "https://n.example/x", "title": "N"}]}}
+            {"url": "https://n.example/x", "title": "N",
+             "description": "summary"}]}}
+        with patch.object(run_eval, "_provider_json", return_value=response):
+            results, _ = run_eval.youdotcom_search("q", "normalized", [])
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["snippet"], "summary")
+
+    def test_web_results_without_highlights_use_all_snippets(self):
+        # When highlights are not available, all snippets are joined, not just
+        # the first.
+        response = {"metadata": {}, "results": {"web": [
+            {"url": "https://w.example/x", "title": "W",
+             "snippets": ["first", "second"]}], "news": []}}
+        with patch.object(run_eval, "_provider_json", return_value=response):
+            results, _ = run_eval.youdotcom_search("q", "normalized", [])
+        self.assertEqual(results[0]["snippet"], "first\nsecond")
+
+    def test_empty_response_yields_no_results(self):
+        response = {"metadata": {}, "results": {"web": [], "news": []}}
         with patch.object(run_eval, "_provider_json", return_value=response):
             results, _ = run_eval.youdotcom_search("q", "normalized", [])
         self.assertEqual(results, [])
@@ -107,24 +161,24 @@ class YouComRequestShapeTest(unittest.TestCase):
 class YouComSetupTest(unittest.TestCase):
     """Each setup must send exactly the parameters that define it — no more."""
 
-    def _params(self, arm):
+    def _body(self, arm):
         with patch.object(run_eval, "_provider_json",
                           return_value=YDC_RESPONSE) as sent:
             run_eval.youdotcom_search("who won", arm, [])
-        return sent.call_args[1]["params"]
+        return sent.call_args[1]["json"]
 
     def test_normalized_sends_no_freshness_filter(self):
-        params = self._params("normalized")
-        self.assertNotIn("freshness", params)
-        self.assertEqual(params["count"], 8)
+        body = self._body("normalized")
+        self.assertNotIn("freshness", body)
+        self.assertEqual(body["count"], 8)
 
     def test_native_fresh_sends_one_day(self):
-        self.assertEqual(self._params("native_fresh")["freshness"], "day")
+        self.assertEqual(self._body("native_fresh")["freshness"], "day")
 
     def test_fresh_week_sends_one_week(self):
         # If this silently matched native_fresh, the window-width comparison
         # would report a null effect that is really a duplicated arm.
-        self.assertEqual(self._params("fresh_week")["freshness"], "week")
+        self.assertEqual(self._body("fresh_week")["freshness"], "week")
 
     def test_historical_setup_sends_an_absolute_date_range(self):
         setup = run_eval.ydc_setup("fresh_week", "2024-02-01")
@@ -132,18 +186,20 @@ class YouComSetupTest(unittest.TestCase):
                           return_value=YDC_RESPONSE) as sent:
             run_eval.youdotcom_search("who won in 2024", "fresh_week", [], setup)
         self.assertEqual(
-            sent.call_args[1]["params"]["freshness"],
+            sent.call_args[1]["json"]["freshness"],
             "2024-01-26to2024-02-01",
         )
 
     def test_wide_raises_count_without_adding_a_freshness_filter(self):
-        params = self._params("wide")
-        self.assertEqual(params["count"], 20)
-        self.assertNotIn("freshness", params)
+        body = self._body("wide")
+        self.assertEqual(body["count"], 20)
+        self.assertNotIn("freshness", body)
 
     def test_setups_differ_from_each_other(self):
         # The treatment axis is only real if the requests actually differ.
-        sent = {name: tuple(sorted(self._params(name).items()))
+        # json.dumps with sort_keys makes the body hashable for set comparison.
+        import json as _json
+        sent = {name: _json.dumps(self._body(name), sort_keys=True)
                 for name in run_eval.YDC_SETUPS}
         self.assertEqual(len(set(sent.values())), len(run_eval.YDC_SETUPS))
 

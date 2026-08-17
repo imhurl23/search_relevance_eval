@@ -276,17 +276,19 @@ VENDORS: dict[str, VendorSpec] = {
 NATIVE_BUDGET_ENFORCED = {"anthropic": True, "openai": False}
 
 # What each search layer's date field actually MEANS. temporal_grounding treats
-# `published_date` as a publication timestamp, but NO layer here reports one:
-# You.com's page_age and Anthropic native's page_age are both last-modified, and
-# OpenAI native has no date field. A re-rendered page therefore looks fresh
-# without carrying new information.
+# `published_date` as a publication timestamp. You.com now returns BOTH web and
+# news results: web page_age is last-modified, but news page_age is a
+# publication timestamp. The merged result list carries mixed semantics, so the
+# construct is stronger than before for news-intent queries but not uniform.
+# Anthropic native's page_age is last-modified, and OpenAI native has no date
+# field. A re-rendered web page still looks fresh without carrying new
+# information.
 #
-# Uniform semantics remove the pooling hazard but leave the construct weak, so
-# freshness conclusions should rest on Corvus-QA's recency_rung — dataset ground
+# Freshness conclusions should rest on Corvus-QA's recency_rung — dataset ground
 # truth about when the fact actually changed — rather than on vendor metadata.
 # Rows still record the semantic so this stays visible.
 DATE_FIELD_SEMANTICS = {
-    "youdotcom": "last_modified",         # page_age
+    "youdotcom": "mixed",                # web: last_modified, news: publication
     "anthropic_native": "last_modified",  # page_age
     "openai_native": None,                # no date field at all
 }

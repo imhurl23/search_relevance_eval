@@ -140,7 +140,10 @@ def load_runtime_env(env_path: Path) -> tuple[str, str]:
 DEFAULT_MODEL_VENDOR = "openai"
 AGENT_MODEL = VENDORS[DEFAULT_MODEL_VENDOR].default_model
 MAX_SEARCHES, MAX_CLICKS = 5, 0
-SNIPPET_CHARS = 400                    # snippet truncation, constant across setups
+# Snippets are no longer truncated. The full highlight/snippet passage is
+# passed to the agent so it has the complete text needed to ground an answer.
+# Kept as None for metadata recording; previous value was 400.
+SNIPPET_CHARS = None
 N_RESULTS = 8                          # default result count; `wide` overrides it
 
 # ---------------------------------------------------------------------------
@@ -369,49 +372,70 @@ def _provider_json(method: str, url: str, **kwargs):
 
 def youdotcom_search(query: str, arm: str, exclude_domains: list[str],
                      setup: dict | None = None):
-    # GET https://ydc-index.io/v1/search — the documented base host is
-    # ydc-index.io (no api. prefix), and GET is the only shape You.com publishes
-    # a full parameter spec for. Their docs do recommend POST for domain lists
-    # (up to 500 as a JSON array) because GET passes them comma-separated and is
-    # bounded by URL length, but the POST body schema is undocumented. Our list
-    # is a handful of domains, so GET stays well inside the documented path.
-    # exclude_domains is one comma-separated string and is mutually exclusive
+    # POST https://ydc-index.io/v1/search — POST is the documented path for
+    # new features. extraction_mode: "highlights" returns query-aware passages
+    # purpose-built for agent grounding, and is only available on POST. GET
+    # still works but receives no new feature updates.
+    #
+    # exclude_domains is a JSON array on POST (up to 500), mutually exclusive
     # with include_domains (sending both returns 422).
     setup = setup or ydc_setup(arm)
-    params = {"query": query, "count": setup["count"]}
+    body: dict = {
+        "query": query,
+        "count": setup["count"],
+        # Highlights return the passages from each page most relevant to the
+        # query, sized for token-sensitive agentic workflows. They replace
+        # snippets (snippets are omitted when highlights are requested) and
+        # are free — only full_page extraction carries a per-page charge.
+        "extraction": {"extraction_mode": "highlights"},
+    }
     if exclude_domains:
-        # Omit rather than send an empty string, which is not a documented value.
-        params["exclude_domains"] = ",".join(exclude_domains)
+        body["exclude_domains"] = exclude_domains
     if setup["freshness"] is not None:
         # day|week|month|year or YYYY-MM-DDtoYYYY-MM-DD. Never derived from a
         # row's event_date, which would leak the label into retrieval.
-        params["freshness"] = setup["freshness"]
+        body["freshness"] = setup["freshness"]
     raw = _provider_json(
-        "GET",
+        "POST",
         "https://ydc-index.io/v1/search",
-        params=params,
+        json=body,
         headers={
             "X-API-Key": os.environ["YDC_API_KEY"],
-            # You.com documents that GET responses are cacheable at CDN and
-            # proxy layers while POST responses are not. Freshness is the
-            # quantity under measurement here, so ask intermediaries not to
-            # serve a stale hit.
+            # POST responses are not cached at CDN/proxy layers per You.com
+            # docs, but the header documents intent and is harmless.
             "Cache-Control": "no-cache",
         },
     )
-    # results.web[] carries `snippets`; results.news[] does not, so web is the
-    # only shape that yields a snippet layer at all.
-    hits = (raw.get("results") or {}).get("web") or []
+    # Read BOTH result sections. You.com's classification system returns news
+    # results automatically when the query has news intent, and for a freshness
+    # study those results are the most relevant payload. News page_age is a
+    # publication timestamp; web page_age is last-modified. Merging them gives
+    # the agent the full decision surface the API actually returned.
+    results_obj = raw.get("results") or {}
+    web_hits = results_obj.get("web") or []
+    news_hits = results_obj.get("news") or []
     results = []
-    for i, res in enumerate(hits, start=1):
+    for i, res in enumerate(web_hits + news_hits, start=1):
+        # With extraction_mode: "highlights", snippets are omitted and
+        # contents.highlights carries the query-relevant passages. Fall back
+        # to snippets (when highlights are not available) and then to
+        # description (news results carry no snippets at all). Use ALL
+        # highlights/snippets, not just the first, and do not truncate — the
+        # agent needs the full passage to ground an answer.
+        contents = res.get("contents") or {}
+        highlights = contents.get("highlights") or []
         snippets = res.get("snippets") or []
+        if highlights:
+            snippet = "\n".join(highlights)
+        elif snippets:
+            snippet = "\n".join(snippets)
+        else:
+            snippet = res.get("description", "") or ""
         results.append({
             "rank": i,
             "url": res.get("url", ""),
             "title": res.get("title") or "",
-            "snippet": (snippets[0] if snippets else res.get("description", "") or "")[:SNIPPET_CHARS],
-            # `page_age` is the documented timestamp field on a web result;
-            # there is no `published_date` in this response shape.
+            "snippet": snippet,
             "published_date": res.get("page_age"),
         })
     return results, raw
@@ -439,6 +463,12 @@ def run_search(arm: str, query: str, exclude_domains: list[str],
         f"[{r['rank']}] {r['title']}\n    {r['url']}\n    "
         f"published: {r['published_date'] or 'unknown'}\n    {r['snippet']}"
         for r in results) or "No results."
+    # Break down web vs news for observability: the news section is where the
+    # freshest results live, and a row that surfaces only web results may be
+    # missing the most time-sensitive coverage the API returned.
+    results_obj = raw.get("results") or {}
+    n_web = len(results_obj.get("web") or [])
+    n_news = len(results_obj.get("news") or [])
     current_span().log(
         input={"query": query, "provider": SEARCH_PROVIDER, "arm": arm,
                "exclude_domains": exclude_domains},
@@ -448,14 +478,18 @@ def run_search(arm: str, query: str, exclude_domains: list[str],
                   # without cross-referencing YDC_SETUPS at the run's commit.
                   "ydc_count": setup["count"],
                   "ydc_freshness": setup["freshness"],
+                  "ydc_extraction_mode": "highlights",
                   "provider_request_id": _provider_request_id(raw),
                   "raw_payload_retained": False},
         metrics={"tokens": _tok(rendered),
                  "latency_s": latency,
                  "search_cost_usd": search_cost_usd(arm, len(results)),
                  "n_results": len(results),
-                 # Requested vs returned: You.com can return fewer than `count`,
-                 # and on the `wide` setup a shortfall is the finding, not noise.
+                 "n_web_results": n_web,
+                 "n_news_results": n_news,
+                 # Requested vs returned: You.com can return fewer than `count`
+                 # per section, and on the `wide` setup a shortfall is the
+                 # finding, not noise.
                  "n_results_requested": setup["count"]},
     )
     return results, rendered, _tok(rendered)

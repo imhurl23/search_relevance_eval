@@ -227,16 +227,13 @@ class VendorRegistryTest(unittest.TestCase):
         self.assertTrue(agents.NATIVE_BUDGET_ENFORCED["anthropic"])
         self.assertFalse(agents.NATIVE_BUDGET_ENFORCED["openai"])
 
-    def test_no_search_layer_reports_a_true_publication_date(self):
-        # With Exa and Parallel removed, every remaining dated surface reports
-        # LAST-MODIFIED, not publication. Uniform semantics remove the pooling
-        # hazard but leave temporal_grounding measuring "last touched" -- a
-        # re-rendered page looks fresh without carrying new information. Freshness
-        # conclusions should rest on Corvus-QA's recency_rung instead.
-        self.assertNotIn(
-            "publication", set(agents.DATE_FIELD_SEMANTICS.values()))
-        self.assertEqual(agents.DATE_FIELD_SEMANTICS["youdotcom"],
-                         "last_modified")
+    def test_youdotcom_date_semantics_are_mixed(self):
+        # You.com now returns both web (last-modified) and news (publication
+        # timestamp) results. The merged result list carries mixed semantics,
+        # which is stronger than the previous uniform last-modified for
+        # news-intent queries. Anthropic native remains last-modified; OpenAI
+        # native has no date field.
+        self.assertEqual(agents.DATE_FIELD_SEMANTICS["youdotcom"], "mixed")
         self.assertEqual(agents.DATE_FIELD_SEMANTICS["anthropic_native"],
                          "last_modified")
         self.assertIsNone(agents.DATE_FIELD_SEMANTICS["openai_native"])
