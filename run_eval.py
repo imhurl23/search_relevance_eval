@@ -383,9 +383,8 @@ def youdotcom_search(query: str, arm: str, exclude_domains: list[str],
     body: dict = {
         "query": query,
         "count": setup["count"],
-        # Highlights return the passages from each page most relevant to the
-        # query, sized for token-sensitive agentic workflows. They replace
-        # snippets (snippets are omitted when highlights are requested) and
+        # Highlights are token-efficient passages from each page most relevant to the
+        # query. They are designed to replace snippets and
         # are free — only full_page extraction carries a per-page charge.
         "extraction": {"extraction_mode": "highlights"},
     }
@@ -406,22 +405,16 @@ def youdotcom_search(query: str, arm: str, exclude_domains: list[str],
             "Cache-Control": "no-cache",
         },
     )
-    # Read BOTH result sections. You.com's classification system returns news
-    # results automatically when the query has news intent, and for a freshness
-    # study those results are the most relevant payload. News page_age is a
-    # publication timestamp; web page_age is last-modified. Merging them gives
-    # the agent the full decision surface the API actually returned.
+    # Read BOTH result sections. You.com returns news
+    # results automatically when the query has news intent.
     results_obj = raw.get("results") or {}
     web_hits = results_obj.get("web") or []
     news_hits = results_obj.get("news") or []
     results = []
     for i, res in enumerate(web_hits + news_hits, start=1):
-        # With extraction_mode: "highlights", snippets are omitted and
-        # contents.highlights carries the query-relevant passages. Fall back
-        # to snippets (when highlights are not available) and then to
-        # description (news results carry no snippets at all). Use ALL
-        # highlights/snippets, not just the first, and do not truncate — the
-        # agent needs the full passage to ground an answer.
+        # With extraction_mode: "highlights", snippets are replaced by
+        # contents.highlights. Fall back to snippets (when highlights are not available)
+        # and then to description (news results do not contain snippets).
         contents = res.get("contents") or {}
         highlights = contents.get("highlights") or []
         snippets = res.get("snippets") or []
