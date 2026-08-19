@@ -69,6 +69,7 @@ import re
 import subprocess
 import time
 from datetime import date, datetime, timedelta, timezone
+from itertools import zip_longest
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -140,8 +141,22 @@ def load_runtime_env(env_path: Path) -> tuple[str, str]:
 DEFAULT_MODEL_VENDOR = "openai"
 AGENT_MODEL = VENDORS[DEFAULT_MODEL_VENDOR].default_model
 MAX_SEARCHES, MAX_CLICKS = 5, 0
-SNIPPET_CHARS = 400                    # snippet truncation, constant across setups
+# Snippets are no longer truncated. The full highlight/snippet passage is
+# passed to the agent so it has the complete text needed to ground an answer.
+# None is the slice bound (no truncation); previous value was 400. Rows record
+# SNIPPET_TRUNCATION rather than this, so "harness applied no truncation" stays
+# distinguishable from "field does not apply to this arm".
+SNIPPET_CHARS = None
+SNIPPET_TRUNCATION = "none"            # recorded on harness rows; was "400" pre-highlights
 N_RESULTS = 8                          # default result count; `wide` overrides it
+
+# How the two You.com result sections are combined into one ranked list.
+# "interleave" alternates web and news by within-section rank. The sections are
+# independently ranked and carry no cross-comparable relevance score, so
+# alternating is the neutral merge. Plain concatenation would pin every news
+# result below every web result, which on a freshness study buries the freshest
+# coverage at the bottom of the surface the agent actually reads.
+YDC_MERGE_POLICY = "interleave"
 
 # ---------------------------------------------------------------------------
 # You.com setups — the harness treatment axis.
@@ -367,52 +382,97 @@ def _provider_json(method: str, url: str, **kwargs):
     raise AssertionError("unreachable")
 
 
+def _interleave(web: list, news: list) -> list:
+    """Alternate two independently ranked sections, appending the longer tail.
+
+    web[0], news[0], web[1], news[1], ... Neither section exposes a score the
+    other can be compared against, so alternating by within-section rank is the
+    neutral merge; whichever section is longer contributes the remainder.
+    """
+    merged = []
+    for pair in zip_longest(web, news):
+        merged.extend(hit for hit in pair if hit is not None)
+    return merged
+
+
 def youdotcom_search(query: str, arm: str, exclude_domains: list[str],
                      setup: dict | None = None):
-    # GET https://ydc-index.io/v1/search — the documented base host is
-    # ydc-index.io (no api. prefix), and GET is the only shape You.com publishes
-    # a full parameter spec for. Their docs do recommend POST for domain lists
-    # (up to 500 as a JSON array) because GET passes them comma-separated and is
-    # bounded by URL length, but the POST body schema is undocumented. Our list
-    # is a handful of domains, so GET stays well inside the documented path.
-    # exclude_domains is one comma-separated string and is mutually exclusive
+    # POST https://ydc-index.io/v1/search — POST is the documented path for
+    # new features. extraction_mode: "highlights" returns query-aware passages
+    # purpose-built for agent grounding, and is only available on POST. GET
+    # still works but receives no new feature updates.
+    #
+    # exclude_domains is a JSON array on POST (up to 500), mutually exclusive
     # with include_domains (sending both returns 422).
     setup = setup or ydc_setup(arm)
-    params = {"query": query, "count": setup["count"]}
+    body: dict = {
+        "query": query,
+        "count": setup["count"],
+        # Highlights are token-efficient passages from each page most relevant to the
+        # query. They are designed to replace snippets and
+        # are free — only full_page extraction carries a per-page charge.
+        "extraction": {"extraction_mode": "highlights"},
+    }
     if exclude_domains:
-        # Omit rather than send an empty string, which is not a documented value.
-        params["exclude_domains"] = ",".join(exclude_domains)
+        body["exclude_domains"] = exclude_domains
     if setup["freshness"] is not None:
         # day|week|month|year or YYYY-MM-DDtoYYYY-MM-DD. Never derived from a
         # row's event_date, which would leak the label into retrieval.
-        params["freshness"] = setup["freshness"]
+        body["freshness"] = setup["freshness"]
     raw = _provider_json(
-        "GET",
+        "POST",
         "https://ydc-index.io/v1/search",
-        params=params,
+        json=body,
         headers={
             "X-API-Key": os.environ["YDC_API_KEY"],
-            # You.com documents that GET responses are cacheable at CDN and
-            # proxy layers while POST responses are not. Freshness is the
-            # quantity under measurement here, so ask intermediaries not to
-            # serve a stale hit.
+            # POST responses are not cached at CDN/proxy layers per You.com
+            # docs, but the header documents intent and is harmless.
             "Cache-Control": "no-cache",
         },
     )
-    # results.web[] carries `snippets`; results.news[] does not, so web is the
-    # only shape that yields a snippet layer at all.
-    hits = (raw.get("results") or {}).get("web") or []
+    # Read BOTH result sections. You.com returns news
+    # results automatically when the query has news intent.
+    #
+    # `count` is applied by You.com PER SECTION, so a news-intent query returns
+    # up to 2x `count` across web + news. News is kept ADDITIVE rather than
+    # capped into `count`: two of the three datasets here are news benchmarks
+    # (LiveNewsBench, Corvus-QA), so the news section is on-target retrieval,
+    # not overflow, and it is the only section that reports a true publication
+    # timestamp -- the construct temporal_grounding actually wants. Capping it
+    # would displace on-topic fresh coverage to hold a number.
+    #
+    # The cost is that surface size varies with news intent, 1x to 2x `count`.
+    # That variation is per-QUERY, not per-arm -- every arm faces the same
+    # sections for the same query -- so it does not confound the setup
+    # contrast, but it is a covariate. n_web_results / n_news_results record it
+    # per row so analysis can condition on it. See docs/study-design.md.
+    results_obj = raw.get("results") or {}
+    web_hits = [("web", h) for h in results_obj.get("web") or []]
+    news_hits = [("news", h) for h in results_obj.get("news") or []]
     results = []
-    for i, res in enumerate(hits, start=1):
+    for i, (source, res) in enumerate(_interleave(web_hits, news_hits), start=1):
+        # With extraction_mode: "highlights", snippets are replaced by
+        # contents.highlights. Fall back to snippets (when highlights are not available)
+        # and then to description (news results do not contain snippets).
+        contents = res.get("contents") or {}
+        highlights = contents.get("highlights") or []
         snippets = res.get("snippets") or []
+        if highlights:
+            snippet = "\n".join(highlights)
+        elif snippets:
+            snippet = "\n".join(snippets)
+        else:
+            snippet = res.get("description", "") or ""
         results.append({
             "rank": i,
             "url": res.get("url", ""),
             "title": res.get("title") or "",
-            "snippet": (snippets[0] if snippets else res.get("description", "") or "")[:SNIPPET_CHARS],
-            # `page_age` is the documented timestamp field on a web result;
-            # there is no `published_date` in this response shape.
+            "snippet": snippet,
             "published_date": res.get("page_age"),
+            # Which section this came from. web page_age is last-modified,
+            # news page_age is a publication timestamp -- the two are different
+            # constructs, so analysis must be able to separate them.
+            "source": source,
         })
     return results, raw
 
@@ -439,6 +499,19 @@ def run_search(arm: str, query: str, exclude_domains: list[str],
         f"[{r['rank']}] {r['title']}\n    {r['url']}\n    "
         f"published: {r['published_date'] or 'unknown'}\n    {r['snippet']}"
         for r in results) or "No results."
+    # Break down web vs news for observability: the news section is where the
+    # freshest results live, and a row that surfaces only web results may be
+    # missing the most time-sensitive coverage the API returned. These count
+    # what the API RETURNED, before the merge cap; n_results is what survived
+    # it, and n_results_dropped is the gap.
+    results_obj = raw.get("results") or {}
+    n_web = len(results_obj.get("web") or [])
+    n_news = len(results_obj.get("news") or [])
+    # News descriptions are occasionally empty. Such a result still carries a
+    # title, a URL, and -- the reason to keep it -- a publication timestamp, so
+    # it is surfaced rather than dropped; this counts them so a run with an
+    # unusually thin surface is visible rather than inferred.
+    n_no_snippet = sum(1 for r in results if not r["snippet"].strip())
     current_span().log(
         input={"query": query, "provider": SEARCH_PROVIDER, "arm": arm,
                "exclude_domains": exclude_domains},
@@ -448,15 +521,26 @@ def run_search(arm: str, query: str, exclude_domains: list[str],
                   # without cross-referencing YDC_SETUPS at the run's commit.
                   "ydc_count": setup["count"],
                   "ydc_freshness": setup["freshness"],
+                  "ydc_extraction_mode": "highlights",
+                  "ydc_merge_policy": YDC_MERGE_POLICY,
                   "provider_request_id": _provider_request_id(raw),
                   "raw_payload_retained": False},
         metrics={"tokens": _tok(rendered),
                  "latency_s": latency,
                  "search_cost_usd": search_cost_usd(arm, len(results)),
                  "n_results": len(results),
-                 # Requested vs returned: You.com can return fewer than `count`,
-                 # and on the `wide` setup a shortfall is the finding, not noise.
-                 "n_results_requested": setup["count"]},
+                 # Per section. Both reach the agent: news is additive, not
+                 # capped into `count`. n_results is their sum.
+                 "n_web_results": n_web,
+                 "n_news_results": n_news,
+                 # Surfaced with a title, URL, and date but no text.
+                 "n_results_without_snippet": n_no_snippet,
+                 # Requested PER SECTION, not in total: You.com can return
+                 # fewer than `count` in a section, and on the `wide` setup a
+                 # shortfall is the finding, not noise. Compare against
+                 # n_web_results and n_news_results separately, never against
+                 # n_results.
+                 "n_results_requested_per_section": setup["count"]},
     )
     return results, rendered, _tok(rendered)
 
@@ -1335,21 +1419,27 @@ def run(arm: str, dataset_name: str, dataset_version: str | None,
                 agents.NATIVE_BUDGET_ENFORCED.get(model_vendor, False)
                 if search_mode == SEARCH_MODE_NATIVE
                 else search_mode == SEARCH_MODE_HARNESS),
-            # Publication date vs last-modified: two different constructs. With
-            # Exa and Parallel removed, NO arm reports a true publication date —
-            # You.com's page_age and Anthropic native's page_age are both
-            # last-modified, and OpenAI native has no date field. The semantics
-            # are now uniform, which removes the pooling hazard but leaves
-            # temporal_grounding measuring "last touched" everywhere. Prefer
-            # Corvus-QA's recency_rung as the freshness variable; it is dataset
-            # ground truth about when the fact changed rather than vendor
-            # metadata. See docs/study-design.md.
+            # Publication date vs last-modified: two different constructs, and
+            # the You.com arm now carries BOTH. Its web results report
+            # last-modified page_age while its news results report a
+            # publication timestamp, so the merged surface is "mixed" and a row
+            # cannot be read as one construct — split on each result's `source`
+            # before treating a date as a publication date. Anthropic native's
+            # page_age is last-modified; OpenAI native has no date field. Prefer
+            # Corvus-QA's recency_rung as the freshness variable regardless; it
+            # is dataset ground truth about when the fact changed rather than
+            # vendor metadata. See docs/study-design.md.
             "date_field_semantics": agents.DATE_FIELD_SEMANTICS.get(
                 SEARCH_PROVIDER if search_mode == SEARCH_MODE_HARNESS
                 else f"{model_vendor}_native" if search_mode == SEARCH_MODE_NATIVE
                 else None),
-            "snippet_chars": (
-                SNIPPET_CHARS if search_mode == SEARCH_MODE_HARNESS else None),
+            # What truncation the HARNESS applied to each snippet. Since the
+            # switch to highlights this is "none" rather than a character
+            # budget, recorded as a sentinel so harness rows stay distinct from
+            # native rows, where the field simply does not apply. Rows written
+            # before that switch carry the integer 400.
+            "snippet_truncation": (
+                SNIPPET_TRUNCATION if search_mode == SEARCH_MODE_HARNESS else None),
             # Requested result count for this setup. Not a global constant any
             # more: the `wide` setup varies it, which is the point of that arm.
             "n_results": (

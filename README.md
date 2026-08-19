@@ -124,9 +124,26 @@ before publication. Promotional and negotiated rates are excluded.
 | `harness` | `wide` | You.com, 20 results, no freshness filter | $0.005/call |
 | `native` | — | Vendor-hosted search | $0.010/search |
 
-Harness results expose at most 400 snippet characters. The agent may make five
-searches and cannot fetch arbitrary pages. You.com charges per call, so the
-`wide` arm costs the same per search as the 8-result arms.
+Harness results expose full untruncated passages: You.com is queried with
+`extraction_mode: "highlights"`, and every highlight on a result is passed to
+the agent. There is no character budget. The agent may make five searches and
+cannot fetch arbitrary pages. You.com charges per call, so the `wide` arm costs
+the same per search as the 8-result arms.
+
+The harness reads both result sections You.com returns, `web` and `news`, and
+interleaves them by within-section rank so news is not pinned below every web
+result. News is **additive**: the arm's result count is applied by You.com per
+section, and news results are not capped into it. Two of the three datasets are
+news benchmarks and news is the only section reporting a true publication
+timestamp, so it is on-target retrieval rather than overflow.
+
+A news-intent query therefore surfaces up to twice the arm's count while an
+evergreen query surfaces exactly the count. That variation is per query, not per
+arm — every arm sees the same sections for the same query — so it does not
+confound the setup contrast, but it is a covariate. Spans record
+`n_web_results`, `n_news_results`, and `n_results_without_snippet` so analysis
+can condition on it. Compare `n_results_requested_per_section` against each
+section separately, never against `n_results`.
 
 The two Baseten models each run three conditions. The frontier models each run
 four. The total is 14:
@@ -283,6 +300,17 @@ Run the compliance checks before collection or publication:
 .venv/bin/python -m corvus.cli.check_compliance
 ```
 
+The You.com request shape has its own live check. The adapter tests mock the
+response, so they pin our handling but cannot confirm that the API still
+returns `contents.highlights`; without that field the adapter falls back to
+`description` and every mocked test still passes while the decision surface
+degrades. Run it after any change to the request shape, and record the date in
+the spec block of `tests/test_provider_adapters.py`:
+
+```bash
+.venv/bin/python smoke_youdotcom.py
+```
+
 [docs/corvus-compliance.md](docs/corvus-compliance.md) contains the allowed
 sources, attestations, rate limits, retention rules, Section 16 workflow, and
 news/sports requirements.
@@ -350,9 +378,15 @@ and a cost frontier when `total_cost_usd` is present.
   records the prompt version; no prompt-only control arm exists.
 - OpenAI native search exposes no `max_uses`, so its five-search budget is
   observed but not API-enforced.
-- You.com and Anthropic expose last-modified dates. OpenAI native exposes no
-  result dates. Freshness claims should use Corvus-QA `recency_rung`; treat
-  `temporal_grounding` as a last-modified measure.
+- You.com dates are mixed: its web results expose last-modified and its news
+  results expose publication timestamps. Split on each result's `source` before
+  reading a date as a publication date. Anthropic exposes last-modified; OpenAI
+  native exposes no result dates. Freshness claims should use Corvus-QA
+  `recency_rung` regardless of vendor metadata.
+- The You.com retrieval surface changed when the harness moved to POST with
+  highlights, news results, and no snippet truncation. Runs from before and
+  after that change are not poolable; re-baseline rather than comparing across
+  it.
 - Native search exposes less evidence than the harness. Compare trajectory
   metrics only where the declared decision surface supports them.
 - A default OpenAI judge shares a vendor with the OpenAI agent. Use multiple
