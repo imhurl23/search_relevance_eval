@@ -292,6 +292,17 @@ Run the compliance checks before collection or publication:
 .venv/bin/python -m corvus.cli.check_compliance
 ```
 
+The You.com request shape has its own live check. The adapter tests mock the
+response, so they pin our handling but cannot confirm that the API still
+returns `contents.highlights`; without that field the adapter falls back to
+`description` and every mocked test still passes while the decision surface
+degrades. Run it after any change to the request shape, and record the date in
+the spec block of `tests/test_provider_adapters.py`:
+
+```bash
+.venv/bin/python smoke_youdotcom.py
+```
+
 [docs/corvus-compliance.md](docs/corvus-compliance.md) contains the allowed
 sources, attestations, rate limits, retention rules, Section 16 workflow, and
 news/sports requirements.

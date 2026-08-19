@@ -15,10 +15,13 @@ Spec: https://you.com/docs/api-reference/search (checked 2026-08-17)
     include_domains (sending both returns 422)
   * freshness accepts day | week | month | year | YYYY-MM-DDtoYYYY-MM-DD
   * count does not affect price
-  * results.web[] carries `snippets` (or contents.highlights with extraction);
-    results.news[] carries `description` and `page_age` (publication timestamp)
+  * results.web[] carries contents.highlights when extraction is requested, and
+    NO `snippets` key at all in that case (verified live 2026-08-18)
+  * results.news[] carries NO `contents` key, so news snippets come from
+    `description` — roughly 150 chars against ~2900 for a web highlight set
   * `page_age` is the timestamp field; for news results it is a publication date
   * `count` is applied PER SECTION, so web + news can return up to 2x count
+    (verified live: count=8 returned web=8 + news=8)
 
 Merge policy is ours, not You.com's: the two sections are interleaved by
 within-section rank and the merged list is then truncated to `count`, so `count`
