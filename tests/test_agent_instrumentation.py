@@ -227,6 +227,21 @@ class VendorRegistryTest(unittest.TestCase):
         self.assertTrue(agents.NATIVE_BUDGET_ENFORCED["anthropic"])
         self.assertFalse(agents.NATIVE_BUDGET_ENFORCED["openai"])
 
+    def test_native_arms_run_at_their_retrieval_ceiling(self):
+        # The harness arm passes every highlight through untruncated. Anything
+        # below "high" here compares You.com-at-maximum against OpenAI-at-mid
+        # and reads a configuration choice as a retrieval difference.
+        self.assertEqual(agents.OPENAI_SEARCH_CONTEXT_SIZE, "high")
+
+    def test_dynamic_filtering_is_pinned_off(self):
+        # ["direct"] is already the default for web_search_20250305 but flips to
+        # code execution on _20260209+, where the subset of results the model
+        # actually consumed stops being observable. Pinned so a version bump
+        # cannot change the decision surface silently.
+        self.assertEqual(agents.ANTHROPIC_WEB_SEARCH_ALLOWED_CALLERS, ["direct"])
+        self.assertEqual(agents.ANTHROPIC_WEB_SEARCH_TOOL_TYPE,
+                         "web_search_20250305")
+
     def test_youdotcom_date_semantics_are_mixed(self):
         # You.com now returns both web (last-modified) and news (publication
         # timestamp) results. The merged result list carries mixed semantics,

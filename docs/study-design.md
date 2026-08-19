@@ -159,6 +159,31 @@ Prices come from the pinned table in `agents.py`. Confirm current public prices
 before a publication run and record the check date. Do not substitute search
 spend for total cost.
 
+## Harness versus native
+
+Native arms run at the most retrieval each vendor exposes: OpenAI at
+`search_context_size: "high"`, Anthropic at `max_uses` parity with dynamic
+filtering pinned off (`allowed_callers: ["direct"]`). Anthropic's `web_search`
+exposes no content-volume parameter at all, so the arms are each at their own
+ceiling rather than at a common one.
+
+Three differences cannot be closed, and they bound what this contrast can claim:
+
+- **Freshness has no native equivalent.** No native API exposes a freshness
+  control, so that treatment axis is harness-only and freshness effects never
+  cross the harness/native boundary.
+- **Evidence volume is not equal and only partly observable.** The harness
+  surface is ours and counted exactly; native search content arrives inside
+  `prompt_tokens` and can only be isolated by differencing the same model's
+  `no_search` arm.
+- **Only the harness arm can ask for an uncached result.** Freshness is the
+  quantity under measurement, and `Cache-Control` has no native counterpart.
+
+Harness-versus-native is therefore a system comparison — You.com as configured
+here against vendor-native search as shipped — not a retrieval-quality
+comparison, and it does not support a claim that one retrieval engine beats
+another. Within-arm contrasts carry no such limit.
+
 ## Validity checks
 
 - Use one dataset snapshot, prompt version, model ID, and serving path within a
