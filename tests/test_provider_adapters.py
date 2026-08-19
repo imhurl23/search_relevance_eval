@@ -18,6 +18,12 @@ Spec: https://you.com/docs/api-reference/search (checked 2026-08-17)
   * results.web[] carries `snippets` (or contents.highlights with extraction);
     results.news[] carries `description` and `page_age` (publication timestamp)
   * `page_age` is the timestamp field; for news results it is a publication date
+  * `count` is applied PER SECTION, so web + news can return up to 2x count
+
+Merge policy is ours, not You.com's: the two sections are interleaved by
+within-section rank and the merged list is then truncated to `count`, so `count`
+is the size of the decision surface the agent sees. Concatenating instead would
+pin every news result below every web result and bury the freshest coverage.
 """
 
 import os
@@ -125,6 +131,65 @@ class YouComRequestShapeTest(unittest.TestCase):
         self.assertEqual(results[1]["url"], "https://news.example/breaking")
         self.assertEqual(results[1]["published_date"], "2026-08-17T10:00:00Z")
         self.assertEqual(results[1]["snippet"], "news highlight passage")
+
+    def test_each_result_records_which_section_it_came_from(self):
+        # web page_age is last-modified, news page_age is a publication
+        # timestamp. Analysis cannot pool them, so the section must survive
+        # into the result dict.
+        _, results, _ = self._call("normalized")
+        self.assertEqual([r["source"] for r in results], ["web", "news"])
+
+    def test_sections_are_interleaved_not_concatenated(self):
+        # Concatenation would pin every news result below every web result. On
+        # a freshness study that buries the freshest coverage at the bottom of
+        # the surface, confounding section with rank.
+        response = {"metadata": {}, "results": {
+            "web": [{"url": f"https://w.example/{i}", "title": f"W{i}",
+                     "description": "d"} for i in range(3)],
+            "news": [{"url": f"https://n.example/{i}", "title": f"N{i}",
+                      "description": "d"} for i in range(3)]}}
+        with patch.object(run_eval, "_provider_json", return_value=response):
+            results, _ = run_eval.youdotcom_search("q", "normalized", [])
+        self.assertEqual([r["source"] for r in results],
+                         ["web", "news", "web", "news", "web", "news"])
+        self.assertEqual([r["rank"] for r in results], [1, 2, 3, 4, 5, 6])
+
+    def test_uneven_sections_append_the_longer_tail(self):
+        response = {"metadata": {}, "results": {
+            "web": [{"url": f"https://w.example/{i}", "title": f"W{i}",
+                     "description": "d"} for i in range(3)],
+            "news": [{"url": "https://n.example/0", "title": "N0",
+                      "description": "d"}]}}
+        with patch.object(run_eval, "_provider_json", return_value=response):
+            results, _ = run_eval.youdotcom_search("q", "normalized", [])
+        self.assertEqual([r["source"] for r in results],
+                         ["web", "news", "web", "web"])
+
+    def test_merged_list_is_capped_at_the_requested_count(self):
+        # You.com applies `count` per section, so web + news can return up to
+        # 2x. `count` must stay the size of the merged decision surface, or the
+        # `wide` arm's contrast against the default is meaningless.
+        response = {"metadata": {}, "results": {
+            "web": [{"url": f"https://w.example/{i}", "title": f"W{i}",
+                     "description": "d"} for i in range(8)],
+            "news": [{"url": f"https://n.example/{i}", "title": f"N{i}",
+                      "description": "d"} for i in range(8)]}}
+        with patch.object(run_eval, "_provider_json", return_value=response):
+            results, _ = run_eval.youdotcom_search("q", "normalized", [])
+        self.assertEqual(len(results), 8)          # not 16
+        self.assertEqual([r["rank"] for r in results], list(range(1, 9)))
+        # The cap is applied AFTER interleaving, so news survives it.
+        self.assertEqual(sum(1 for r in results if r["source"] == "news"), 4)
+
+    def test_wide_setup_caps_at_its_own_larger_count(self):
+        response = {"metadata": {}, "results": {
+            "web": [{"url": f"https://w.example/{i}", "title": f"W{i}",
+                     "description": "d"} for i in range(20)],
+            "news": [{"url": f"https://n.example/{i}", "title": f"N{i}",
+                      "description": "d"} for i in range(20)]}}
+        with patch.object(run_eval, "_provider_json", return_value=response):
+            results, _ = run_eval.youdotcom_search("q", "wide", [])
+        self.assertEqual(len(results), 20)
 
     def test_news_results_without_highlights_use_description(self):
         # News results carry no snippets; without highlights, description is

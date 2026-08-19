@@ -124,9 +124,18 @@ before publication. Promotional and negotiated rates are excluded.
 | `harness` | `wide` | You.com, 20 results, no freshness filter | $0.005/call |
 | `native` | — | Vendor-hosted search | $0.010/search |
 
-Harness results expose at most 400 snippet characters. The agent may make five
-searches and cannot fetch arbitrary pages. You.com charges per call, so the
-`wide` arm costs the same per search as the 8-result arms.
+Harness results expose full untruncated passages: You.com is queried with
+`extraction_mode: "highlights"`, and every highlight on a result is passed to
+the agent. There is no character budget. The agent may make five searches and
+cannot fetch arbitrary pages. You.com charges per call, so the `wide` arm costs
+the same per search as the 8-result arms.
+
+The harness reads both result sections You.com returns, `web` and `news`. The
+two are interleaved by within-section rank and the merged list is truncated to
+the arm's result count, so that count is the size of the decision surface the
+agent sees rather than a per-section quota. News results therefore displace web
+results rather than adding to them; spans record returned-vs-surfaced counts per
+section and `n_results_dropped`.
 
 The two Baseten models each run three conditions. The frontier models each run
 four. The total is 14:
@@ -350,9 +359,15 @@ and a cost frontier when `total_cost_usd` is present.
   records the prompt version; no prompt-only control arm exists.
 - OpenAI native search exposes no `max_uses`, so its five-search budget is
   observed but not API-enforced.
-- You.com and Anthropic expose last-modified dates. OpenAI native exposes no
-  result dates. Freshness claims should use Corvus-QA `recency_rung`; treat
-  `temporal_grounding` as a last-modified measure.
+- You.com dates are mixed: its web results expose last-modified and its news
+  results expose publication timestamps. Split on each result's `source` before
+  reading a date as a publication date. Anthropic exposes last-modified; OpenAI
+  native exposes no result dates. Freshness claims should use Corvus-QA
+  `recency_rung` regardless of vendor metadata.
+- The You.com retrieval surface changed when the harness moved to POST with
+  highlights, news results, and no snippet truncation. Runs from before and
+  after that change are not poolable; re-baseline rather than comparing across
+  it.
 - Native search exposes less evidence than the harness. Compare trajectory
   metrics only where the declared decision surface supports them.
 - A default OpenAI judge shares a vendor with the OpenAI agent. Use multiple

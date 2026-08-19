@@ -166,7 +166,16 @@ spend for total cost.
 - Interleave conditions in time.
 - Report gold-domain availability and `exclusion_enforced` by arm.
 - Report `search_budget_enforced`; OpenAI native search lacks an API-level cap.
-- Treat You.com and Anthropic dates as last-modified timestamps.
+- Treat Anthropic dates as last-modified timestamps. You.com dates are mixed:
+  web results are last-modified, news results are publication timestamps. Split
+  on each result's `source` before treating a date as a publication date.
+- Hold the You.com decision surface to the arm's declared result count. The API
+  applies `count` per section, so web and news are interleaved and the merged
+  list is capped; otherwise the surface floats with news intent and the `wide`
+  contrast is not interpretable.
+- Do not pool runs across the change to POST + highlights + news results. That
+  change enlarged and reordered the harness decision surface, and it was
+  contributed by the search vendor under measurement; re-baseline instead.
 - Use Corvus-QA `recency_rung` for the main freshness analysis.
 - Use a cross-vendor judge jury for reported frontier comparisons.
 - Inspect disagreements between deterministic answer match and semantic judges.
