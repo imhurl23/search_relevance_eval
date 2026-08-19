@@ -141,21 +141,16 @@ def load_runtime_env(env_path: Path) -> tuple[str, str]:
 DEFAULT_MODEL_VENDOR = "openai"
 AGENT_MODEL = VENDORS[DEFAULT_MODEL_VENDOR].default_model
 MAX_SEARCHES, MAX_CLICKS = 5, 0
-# Snippets are no longer truncated. The full highlight/snippet passage is
-# passed to the agent so it has the complete text needed to ground an answer.
-# None is the slice bound (no truncation); previous value was 400. Rows record
-# SNIPPET_TRUNCATION rather than this, so "harness applied no truncation" stays
-# distinguishable from "field does not apply to this arm".
-SNIPPET_CHARS = None
-SNIPPET_TRUNCATION = "none"            # recorded on harness rows; was "400" pre-highlights
+# Highlights are passed through whole. Recorded as a sentinel so harness rows
+# stay distinct from native rows, where the field does not apply; rows written
+# before the switch to highlights carry the integer 400 under `snippet_chars`.
+SNIPPET_TRUNCATION = "none"
 N_RESULTS = 8                          # default result count; `wide` overrides it
 
-# How the two You.com result sections are combined into one ranked list.
-# "interleave" alternates web and news by within-section rank. The sections are
-# independently ranked and carry no cross-comparable relevance score, so
-# alternating is the neutral merge. Plain concatenation would pin every news
-# result below every web result, which on a freshness study buries the freshest
-# coverage at the bottom of the surface the agent actually reads.
+# Alternate web and news by within-section rank. The sections carry no
+# cross-comparable score, so alternating is the neutral merge; concatenating
+# would pin every news result below every web result and bury the freshest
+# coverage on a benchmark that is mostly news.
 YDC_MERGE_POLICY = "interleave"
 
 # ---------------------------------------------------------------------------
@@ -430,30 +425,19 @@ def youdotcom_search(query: str, arm: str, exclude_domains: list[str],
             "Cache-Control": "no-cache",
         },
     )
-    # Read BOTH result sections. You.com returns news
-    # results automatically when the query has news intent.
-    #
-    # `count` is applied by You.com PER SECTION, so a news-intent query returns
-    # up to 2x `count` across web + news. News is kept ADDITIVE rather than
-    # capped into `count`: two of the three datasets here are news benchmarks
-    # (LiveNewsBench, Corvus-QA), so the news section is on-target retrieval,
-    # not overflow, and it is the only section that reports a true publication
-    # timestamp -- the construct temporal_grounding actually wants. Capping it
-    # would displace on-topic fresh coverage to hold a number.
-    #
-    # The cost is that surface size varies with news intent, 1x to 2x `count`.
-    # That variation is per-QUERY, not per-arm -- every arm faces the same
-    # sections for the same query -- so it does not confound the setup
-    # contrast, but it is a covariate. n_web_results / n_news_results record it
-    # per row so analysis can condition on it. See docs/study-design.md.
+    # Both sections, with news ADDITIVE: `count` is applied per section, so a
+    # news-intent query surfaces up to 2x it. Two of the three datasets are news
+    # benchmarks and news is the only section reporting a true publication
+    # timestamp, so it is on-target retrieval rather than overflow. Surface size
+    # therefore varies per query, not per arm; n_web_results / n_news_results
+    # record it. See docs/study-design.md.
     results_obj = raw.get("results") or {}
     web_hits = [("web", h) for h in results_obj.get("web") or []]
     news_hits = [("news", h) for h in results_obj.get("news") or []]
     results = []
     for i, (source, res) in enumerate(_interleave(web_hits, news_hits), start=1):
-        # With extraction_mode: "highlights", snippets are replaced by
-        # contents.highlights. Fall back to snippets (when highlights are not available)
-        # and then to description (news results do not contain snippets).
+        # Highlights replace `snippets` entirely when extraction is requested.
+        # News results carry no `contents` at all, so they land on description.
         contents = res.get("contents") or {}
         highlights = contents.get("highlights") or []
         snippets = res.get("snippets") or []
@@ -499,19 +483,12 @@ def run_search(arm: str, query: str, exclude_domains: list[str],
         f"[{r['rank']}] {r['title']}\n    {r['url']}\n    "
         f"published: {r['published_date'] or 'unknown'}\n    {r['snippet']}"
         for r in results) or "No results."
-    # Break down web vs news for observability: the news section is where the
-    # freshest results live, and a row that surfaces only web results may be
-    # missing the most time-sensitive coverage the API returned. These count
-    # what the API RETURNED, before the merge cap; n_results is what survived
-    # it, and n_results_dropped is the gap.
+    # Split web vs news: the news section is where the freshest results live, so
+    # a row carrying only web results may be missing the most time-sensitive
+    # coverage the API returned.
     results_obj = raw.get("results") or {}
     n_web = len(results_obj.get("web") or [])
     n_news = len(results_obj.get("news") or [])
-    # News descriptions are occasionally empty. Such a result still carries a
-    # title, a URL, and -- the reason to keep it -- a publication timestamp, so
-    # it is surfaced rather than dropped; this counts them so a run with an
-    # unusually thin surface is visible rather than inferred.
-    n_no_snippet = sum(1 for r in results if not r["snippet"].strip())
     current_span().log(
         input={"query": query, "provider": SEARCH_PROVIDER, "arm": arm,
                "exclude_domains": exclude_domains},
@@ -529,17 +506,12 @@ def run_search(arm: str, query: str, exclude_domains: list[str],
                  "latency_s": latency,
                  "search_cost_usd": search_cost_usd(arm, len(results)),
                  "n_results": len(results),
-                 # Per section. Both reach the agent: news is additive, not
-                 # capped into `count`. n_results is their sum.
+                 # Per section; both reach the agent, so n_results is their sum.
                  "n_web_results": n_web,
                  "n_news_results": n_news,
-                 # Surfaced with a title, URL, and date but no text.
-                 "n_results_without_snippet": n_no_snippet,
-                 # Requested PER SECTION, not in total: You.com can return
-                 # fewer than `count` in a section, and on the `wide` setup a
-                 # shortfall is the finding, not noise. Compare against
-                 # n_web_results and n_news_results separately, never against
-                 # n_results.
+                 # Per section, NOT a total: compare against n_web_results and
+                 # n_news_results separately, never against n_results. On `wide`
+                 # a shortfall is the finding, not noise.
                  "n_results_requested_per_section": setup["count"]},
     )
     return results, rendered, _tok(rendered)
@@ -1433,11 +1405,7 @@ def run(arm: str, dataset_name: str, dataset_version: str | None,
                 SEARCH_PROVIDER if search_mode == SEARCH_MODE_HARNESS
                 else f"{model_vendor}_native" if search_mode == SEARCH_MODE_NATIVE
                 else None),
-            # What truncation the HARNESS applied to each snippet. Since the
-            # switch to highlights this is "none" rather than a character
-            # budget, recorded as a sentinel so harness rows stay distinct from
-            # native rows, where the field simply does not apply. Rows written
-            # before that switch carry the integer 400.
+            # What truncation the harness applied. See SNIPPET_TRUNCATION.
             "snippet_truncation": (
                 SNIPPET_TRUNCATION if search_mode == SEARCH_MODE_HARNESS else None),
             # Requested result count for this setup. Not a global constant any
