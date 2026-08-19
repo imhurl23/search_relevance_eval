@@ -90,6 +90,9 @@ SURFACE_FULL = "full"
 SURFACE_NO_SNIPPET = "no_snippet"
 SURFACE_URLS_ONLY = "urls_only"
 SURFACE_NONE = "none"
+# Same fields as `full` plus a different TEXT LAYER: query-aware highlight
+# passages rather than keyword snippets. Kept distinct so the two never pool.
+SURFACE_HIGHLIGHTS = "highlights"
 
 
 # ---------------------------------------------------------------------------
@@ -1022,12 +1025,82 @@ def _attr(obj, name):
 # ---------------------------------------------------------------------------
 
 SEARCH_TOOL_NAME = "search_web"
+
+# The tool-schema elicitation axis. `minimal` hands the model one string and
+# keeps every retrieval parameter harness-owned; `parametric` lets the model
+# choose retrieval parameters per call, which is closer to how a frontier model
+# uses its own native search. Comparing native against a one-parameter tool
+# measures tool familiarity as much as index quality, which is what this axis
+# separates.
+TOOL_SCHEMA_MINIMAL = "minimal"
+TOOL_SCHEMA_PARAMETRIC = "parametric"
+TOOL_SCHEMAS = (TOOL_SCHEMA_MINIMAL, TOOL_SCHEMA_PARAMETRIC)
+
+# Ceiling on a model-chosen `count`. Above this a single call could dominate the
+# five-search budget's token cost and make the per-row surface incomparable.
+YDC_MAX_AGENT_COUNT = 50
+
 SEARCH_TOOL_DESCRIPTION = "Search the web for news. Returns ranked results."
+_SEARCH_TOOL_DESCRIPTION_PARAMETRIC = (
+    "Search the web for news. Returns ranked results. Optional parameters tune "
+    "retrieval: `count` (results to return), `freshness` (restrict to recent "
+    "pages), `extraction_mode` (`snippets` for keyword excerpts, `highlights` "
+    "for query-aware passages), `boost_domains`, `country`, `safesearch`. "
+    "Omit any parameter to use the harness default."
+)
+
 SEARCH_TOOL_PARAMETERS = {
     "type": "object",
     "properties": {"query": {"type": "string"}},
     "required": ["query"],
 }
+
+# Parameters the model may set. Three You.com parameters are deliberately
+# WITHHELD, because each would let the model relax a guard the study depends on:
+#
+#   exclude_domains  carries the gold-source leakage exclusion
+#   include_domains  is mutually exclusive with it, so setting it drops the guard
+#   crawl_timeout    buys result quality with latency, which is a reported outcome
+#
+# `extraction_mode` omits `full_page`: that is page fetching, which MAX_CLICKS=0
+# bars, and it also carries a per-page charge.
+_SEARCH_TOOL_PARAMETERS_PARAMETRIC = {
+    "type": "object",
+    "properties": {
+        "query": {"type": "string"},
+        "count": {"type": "integer", "minimum": 1,
+                  "maximum": YDC_MAX_AGENT_COUNT},
+        "freshness": {"type": "string",
+                      "enum": ["day", "week", "month", "year"]},
+        "extraction_mode": {"type": "string",
+                            "enum": ["snippets", "highlights"]},
+        "boost_domains": {"type": "array", "items": {"type": "string"}},
+        "country": {"type": "string",
+                    "enum": ["US", "GB", "CA", "AU", "DE", "FR", "JP", "IN"]},
+        "safesearch": {"type": "string", "enum": ["off", "moderate", "strict"]},
+    },
+    # `query` stays the ONLY required field: a model must be able to ignore every
+    # parameter and still search, or the parametric arm stops degrading cleanly
+    # into its fixed-config twin.
+    "required": ["query"],
+}
+
+
+def search_tool_contract(tool_schema: str) -> tuple[str, dict]:
+    """(description, JSON schema) for one tool-schema variant.
+
+    One contract per variant, translated per wire protocol rather than written
+    per vendor, so the three harness protocols cannot drift into offering
+    different parameter surfaces.
+    """
+    if tool_schema == TOOL_SCHEMA_MINIMAL:
+        return SEARCH_TOOL_DESCRIPTION, SEARCH_TOOL_PARAMETERS
+    if tool_schema == TOOL_SCHEMA_PARAMETRIC:
+        return (_SEARCH_TOOL_DESCRIPTION_PARAMETRIC,
+                _SEARCH_TOOL_PARAMETERS_PARAMETRIC)
+    raise SystemExit(
+        f"unknown tool schema {tool_schema!r}; expected one of "
+        f"{sorted(TOOL_SCHEMAS)}")
 
 
 @dataclass
@@ -1050,11 +1123,17 @@ class HarnessSession:
 
     surface = SURFACE_FULL
 
-    def __init__(self, client, spec: VendorSpec, model: str, system_prompt: str):
+    def __init__(self, client, spec: VendorSpec, model: str, system_prompt: str,
+                 tool_schema: str = TOOL_SCHEMA_MINIMAL):
         self.client = client
         self.spec = spec
         self.model = model
         self.system_prompt = system_prompt
+        self.tool_schema = tool_schema
+        # Resolved once here rather than per subclass, so the protocols cannot
+        # drift into offering different parameter surfaces.
+        self.tool_description, self.tool_parameters = search_tool_contract(
+            tool_schema)
 
     def add_user(self, question: str) -> None:  # pragma: no cover - interface
         raise NotImplementedError
@@ -1069,8 +1148,9 @@ class HarnessSession:
 class OpenAIHarnessSession(HarnessSession):
     """Chat Completions tool calling — OpenAI and Baseten (OpenAI-compatible)."""
 
-    def __init__(self, client, spec, model, system_prompt):
-        super().__init__(client, spec, model, system_prompt)
+    def __init__(self, client, spec, model, system_prompt,
+                 tool_schema=TOOL_SCHEMA_MINIMAL):
+        super().__init__(client, spec, model, system_prompt, tool_schema)
         self.messages = [
             {"role": "system", "content": system_prompt},
         ]
@@ -1078,8 +1158,8 @@ class OpenAIHarnessSession(HarnessSession):
             "type": "function",
             "function": {
                 "name": SEARCH_TOOL_NAME,
-                "description": SEARCH_TOOL_DESCRIPTION,
-                "parameters": SEARCH_TOOL_PARAMETERS,
+                "description": self.tool_description,
+                "parameters": self.tool_parameters,
             },
         }]
 
@@ -1130,14 +1210,15 @@ class OpenAIHarnessSession(HarnessSession):
 class AnthropicHarnessSession(HarnessSession):
     """Messages API tool calling, so Claude can run the harness search arm."""
 
-    def __init__(self, client, spec, model, system_prompt):
-        super().__init__(client, spec, model, system_prompt)
+    def __init__(self, client, spec, model, system_prompt,
+                 tool_schema=TOOL_SCHEMA_MINIMAL):
+        super().__init__(client, spec, model, system_prompt, tool_schema)
         self.messages: list = []
         self._used_tools = False
         self.tools = [{
             "name": SEARCH_TOOL_NAME,
-            "description": SEARCH_TOOL_DESCRIPTION,
-            "input_schema": SEARCH_TOOL_PARAMETERS,
+            "description": self.tool_description,
+            "input_schema": self.tool_parameters,
         }]
 
     def add_user(self, question: str) -> None:
@@ -1219,8 +1300,9 @@ class OpenAIResponsesHarnessSession(HarnessSession):
     harness arm on the same endpoint as the native arm.
     """
 
-    def __init__(self, client, spec, model, system_prompt):
-        super().__init__(client, spec, model, system_prompt)
+    def __init__(self, client, spec, model, system_prompt,
+                 tool_schema=TOOL_SCHEMA_MINIMAL):
+        super().__init__(client, spec, model, system_prompt, tool_schema)
         # Responses keeps the system prompt out of the turn list, in
         # `instructions`. The prompt text is byte-identical to the other
         # protocols' system message; only its position on the wire differs.
@@ -1237,8 +1319,8 @@ class OpenAIResponsesHarnessSession(HarnessSession):
         self.tools = [{
             "type": "function",
             "name": SEARCH_TOOL_NAME,
-            "description": SEARCH_TOOL_DESCRIPTION,
-            "parameters": SEARCH_TOOL_PARAMETERS,
+            "description": self.tool_description,
+            "parameters": self.tool_parameters,
             "strict": False,
         }]
 
@@ -1334,7 +1416,8 @@ HARNESS_SESSIONS = {
 }
 
 
-def make_harness_session(client, spec: VendorSpec, model: str, system_prompt: str):
+def make_harness_session(client, spec: VendorSpec, model: str, system_prompt: str,
+                         tool_schema: str = TOOL_SCHEMA_MINIMAL):
     """Session for both the harness arm and the no-tool control arm.
 
     The control arm is the same session driven with tools_enabled=False on every
@@ -1349,7 +1432,7 @@ def make_harness_session(client, spec: VendorSpec, model: str, system_prompt: st
             f"{spec.harness_protocol!r}, which has no session class. "
             f"Known protocols: {sorted(HARNESS_SESSIONS)}."
         ) from None
-    return session_class(client, spec, model, system_prompt)
+    return session_class(client, spec, model, system_prompt, tool_schema)
 
 
 def surfaced_domains(trajectory) -> set[str]:

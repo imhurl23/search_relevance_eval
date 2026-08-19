@@ -172,18 +172,40 @@ YDC_MERGE_POLICY = "interleave"
 # label into retrieval.
 # ---------------------------------------------------------------------------
 
+# You.com's two text layers. `snippets` is keyword-matched excerpts, the
+# pre-highlights default; `highlights` is query-aware passages. Made an explicit
+# per-arm field rather than hardcoded so extraction stays a VARIABLE the study
+# can move — a hardcoded value collapses the axis and makes the text layer
+# unattributable. Every current arm defaults to `highlights`, which is what the
+# You.com harness change established and live-verified; a snippets arm is now
+# expressible without editing the request path.
+EXTRACTION_SNIPPETS = "snippets"
+EXTRACTION_HIGHLIGHTS = "highlights"
+EXTRACTIONS = (EXTRACTION_SNIPPETS, EXTRACTION_HIGHLIGHTS)
+
+# Which decision-surface tier each text layer declares. Pooling them would hide
+# the mediator the extraction axis exists to move.
+EXTRACTION_SURFACES = {
+    EXTRACTION_SNIPPETS: SURFACE_FULL,
+    EXTRACTION_HIGHLIGHTS: agents.SURFACE_HIGHLIGHTS,
+}
+
 YDC_SETUPS: dict[str, dict] = {
     # Baseline: no freshness filter, so the index decides recency on its own.
-    "normalized": {"count": N_RESULTS, "freshness": None},
+    "normalized": {"count": N_RESULTS, "freshness": None,
+                   "extraction": EXTRACTION_HIGHLIGHTS},
     # The declared one-day freshness treatment.
-    "native_fresh": {"count": N_RESULTS, "freshness": "day"},
+    "native_fresh": {"count": N_RESULTS, "freshness": "day",
+                     "extraction": EXTRACTION_HIGHLIGHTS},
     # Does the WIDTH of the freshness window matter, or just its presence? A
     # one-day filter can starve a query whose coverage lags by 48 hours.
-    "fresh_week": {"count": N_RESULTS, "freshness": "week"},
+    "fresh_week": {"count": N_RESULTS, "freshness": "week",
+                   "extraction": EXTRACTION_HIGHLIGHTS},
     # A bigger decision surface at identical cost: You.com bills per call
     # independent of `count`, so if 20 results beat 8 that is a free win. Tests
     # whether the 8-result default was leaving recall on the table.
-    "wide": {"count": 20, "freshness": None},
+    "wide": {"count": 20, "freshness": None,
+             "extraction": EXTRACTION_HIGHLIGHTS},
 }
 DEFAULT_ARM = "normalized"
 
@@ -200,6 +222,126 @@ def ydc_setup(arm: str, answer_as_of: str | None = None) -> dict:
         setup["freshness"] = f"{start.isoformat()}to{end.isoformat()}"
         setup["freshness_reference"] = "answer_as_of"
     return setup
+
+
+# ---------------------------------------------------------------------------
+# Elicitation axis 2, rails half: what the model is allowed to set per call.
+#
+# The parametric tool schema hands retrieval parameters to the model. Three
+# classes of value never make it through, because each would let the model
+# relax a guard the study's conclusions rest on:
+#
+#   the leakage guard   exclude_domains / include_domains are not in the schema,
+#                       and boost_domains is filtered against the exclusion list
+#                       so a boost cannot resurrect an excluded gold source
+#   page fetching       extraction_mode=full_page is refused; MAX_CLICKS=0
+#   reported outcomes   crawl_timeout would buy quality with latency, which the
+#                       study reports as an outcome
+#
+# Undocumented values are REFUSED rather than forwarded: forwarding would 422 and
+# spend one of five searches for nothing. Every refusal is recorded on the row,
+# so "the model tried to leave the rails" is measurable rather than invisible.
+# ---------------------------------------------------------------------------
+
+# Relative windows the model may ask for. Absolute ranges stay harness-owned: a
+# model-chosen window would either override the row's reference-date anchor or
+# leak the label's date into retrieval.
+_AGENT_FRESHNESS = ("day", "week", "month", "year")
+_AGENT_PARAMETERS = ("count", "freshness", "extraction_mode", "boost_domains",
+                     "country", "safesearch")
+
+
+def merge_agent_search_params(
+    setup: dict,
+    arguments: dict,
+    answer_as_of: str | None = None,
+) -> tuple[dict, list[str]]:
+    """Resolve one search call's config from the arm default plus model values.
+
+    Returns the resolved setup and a list of human-readable rejections. With no
+    model parameters the result is the arm default exactly, so the parametric arm
+    degrades cleanly into its fixed-config twin.
+    """
+    resolved = dict(setup)
+    rejections: list[str] = []
+    agent_set: list[str] = []
+    excluded = {d.lower() for d in setup.get("_exclude_domains") or ()}
+
+    for name, value in (arguments or {}).items():
+        if name == "query":
+            continue
+        if name not in _AGENT_PARAMETERS:
+            # Covers the withheld guard parameters and anything hallucinated.
+            rejections.append(f"{name}: not an available parameter")
+            continue
+
+        if name == "count":
+            if not isinstance(value, int) or isinstance(value, bool):
+                rejections.append(f"count: expected an integer, got {value!r}")
+                continue
+            clamped = max(1, min(value, agents.YDC_MAX_AGENT_COUNT))
+            if clamped != value:
+                rejections.append(
+                    f"count: {value} outside 1-{agents.YDC_MAX_AGENT_COUNT}, "
+                    f"clamped to {clamped}")
+            resolved["count"] = clamped
+            agent_set.append(name)
+
+        elif name == "freshness":
+            if value not in _AGENT_FRESHNESS:
+                rejections.append(
+                    f"freshness: {value!r} is not one of "
+                    f"{list(_AGENT_FRESHNESS)}; absolute ranges are "
+                    f"harness-owned")
+                resolved["freshness"] = None
+                continue
+            if answer_as_of and value in ("day", "week"):
+                # Anchor to the row's reference date, or the model searches
+                # today's web against a historical label.
+                end = date.fromisoformat(answer_as_of)
+                start = end if value == "day" else end - timedelta(days=6)
+                resolved["freshness"] = f"{start.isoformat()}to{end.isoformat()}"
+                resolved["freshness_reference"] = "answer_as_of"
+            else:
+                resolved["freshness"] = value
+            agent_set.append(name)
+
+        elif name == "extraction_mode":
+            if value not in EXTRACTIONS:
+                rejections.append(
+                    f"extraction_mode: {value!r} is not one of "
+                    f"{list(EXTRACTIONS)}"
+                    + ("; full_page is page fetching, which this study bars"
+                       if value == "full_page" else ""))
+                continue
+            resolved["extraction"] = value
+            agent_set.append(name)
+
+        elif name == "boost_domains":
+            if not isinstance(value, list):
+                rejections.append(f"boost_domains: expected a list, got {value!r}")
+                continue
+            kept = [d for d in value if str(d).lower() not in excluded]
+            for dropped in [d for d in value if str(d).lower() in excluded]:
+                rejections.append(
+                    f"boost_domains: {dropped} is an excluded source and "
+                    f"cannot be boosted")
+            if kept:
+                resolved["boost_domains"] = kept
+            agent_set.append(name)
+
+        else:  # country, safesearch — enum-checked against the declared schema
+            allowed = (agents._SEARCH_TOOL_PARAMETERS_PARAMETRIC["properties"]
+                       [name].get("enum") or ())
+            if value not in allowed:
+                rejections.append(
+                    f"{name}: {value!r} is not one of {list(allowed)}")
+                continue
+            resolved[name] = value
+            agent_set.append(name)
+
+    resolved["_agent_set"] = agent_set
+    return resolved, rejections
 
 
 def experiment_ydc_setup(arm: str, dataset_name: str) -> dict:
@@ -263,11 +405,54 @@ search. You may use at most 5 searches. When you know the answer, stop searching
 and reply with ONLY the final answer, as concisely as possible. If you cannot
 determine the answer within budget, reply exactly: I could not find this."""
 
+# ---------------------------------------------------------------------------
+# Elicitation axis 1: prompt variant.
+#
+# `native - harness` under a terse prompt measures tool FAMILIARITY as much as
+# index quality: a frontier model was post-trained to reach for its own search,
+# and the same model handed an unfamiliar third-party tool more often answers
+# from memory. `guided` states the search behaviour explicitly so that gap is
+# closed by instruction rather than left in the effect.
+#
+# The guided text is appended to BOTH search modes, identically. An elicitation
+# pass applied only to the harness arm would turn every native-vs-harness
+# contrast into an unfair-effort comparison, biased toward third-party search.
+# _GUIDED_CORE is the shared behavioural core; tests assert it appears verbatim
+# in both, which is what keeps the axis a retrieval comparison rather than a
+# prompt comparison.
+# ---------------------------------------------------------------------------
+
+PROMPT_TERSE = "terse"
+PROMPT_GUIDED = "guided"
+PROMPT_VARIANTS = (PROMPT_TERSE, PROMPT_GUIDED)
+
+_GUIDED_CORE = """\
+Search before answering unless you are certain. Prefer searching to guessing: a
+wrong confident answer is worse than a search. Issue a specific query rather
+than a broad one, and reformulate and search again if the results do not
+directly answer the question. Read the published dates and prefer the most
+recent source that actually addresses the question."""
+
+# Named per (mode, variant) so a row's prompt is identifiable without reading the
+# commit. The control arm has no tool to elicit use of, so both variants resolve
+# to the same text rather than inventing a third control condition — and it
+# therefore keeps ONE version string.
 PROMPT_VERSIONS = {
-    SEARCH_MODE_HARNESS: "frozen-v2-generic-factual",
-    SEARCH_MODE_NONE: "no-search-v2-parametric",
-    SEARCH_MODE_NATIVE: "native-search-v1-generic-factual",
+    (SEARCH_MODE_HARNESS, PROMPT_TERSE): "frozen-v2-generic-factual",
+    (SEARCH_MODE_HARNESS, PROMPT_GUIDED): "frozen-v2-guided",
+    (SEARCH_MODE_NATIVE, PROMPT_TERSE): "native-search-v1-generic-factual",
+    (SEARCH_MODE_NATIVE, PROMPT_GUIDED): "native-search-v1-guided",
+    (SEARCH_MODE_NONE, PROMPT_TERSE): "no-search-v2-parametric",
+    (SEARCH_MODE_NONE, PROMPT_GUIDED): "no-search-v2-parametric",
 }
+
+# Appended only on the parametric tool-schema arm, so the model knows the
+# parameters exist. Naming them in the prompt on a minimal arm would describe a
+# tool the model was not given.
+_PARAMETRIC_PROMPT_SUFFIX = """\
+The search tool accepts optional parameters: count, freshness, extraction_mode
+(snippets or highlights), boost_domains, country, safesearch. Choose them per
+search when they would help, or omit them to use the defaults."""
 
 # The harness tool schema lives in agents.SEARCH_TOOL_* — one definition
 # translated per wire protocol, so the OpenAI and Anthropic harness arms cannot
@@ -403,10 +588,11 @@ def youdotcom_search(query: str, arm: str, exclude_domains: list[str],
     body: dict = {
         "query": query,
         "count": setup["count"],
-        # Highlights are token-efficient passages from each page most relevant to the
-        # query. They are designed to replace snippets and
-        # are free — only full_page extraction carries a per-page charge.
-        "extraction": {"extraction_mode": "highlights"},
+        # Resolved per call: the arm supplies a default and, on the parametric
+        # tool-schema arm, the model may override it. Highlights are free; only
+        # full_page carries a per-page charge, and it is never reachable here.
+        "extraction": {
+            "extraction_mode": setup.get("extraction", EXTRACTION_SNIPPETS)},
     }
     if exclude_domains:
         body["exclude_domains"] = exclude_domains
@@ -498,7 +684,8 @@ def run_search(arm: str, query: str, exclude_domains: list[str],
                   # without cross-referencing YDC_SETUPS at the run's commit.
                   "ydc_count": setup["count"],
                   "ydc_freshness": setup["freshness"],
-                  "ydc_extraction_mode": "highlights",
+                  "ydc_extraction_mode": setup.get(
+                      "extraction", EXTRACTION_SNIPPETS),
                   "ydc_merge_policy": YDC_MERGE_POLICY,
                   "provider_request_id": _provider_request_id(raw),
                   "raw_payload_retained": False},
@@ -534,23 +721,56 @@ def get_agent_client(vendor: str):
     return agents.get_client(vendor, wrap_openai)
 
 
-def _system_prompt_for(search_mode: str) -> str:
+def _system_prompt_for(search_mode: str, prompt_variant: str = PROMPT_TERSE,
+                      tool_schema: str = agents.TOOL_SCHEMA_MINIMAL) -> str:
+    """The system prompt for one (mode, variant, tool schema) cell.
+
+    Every variant preserves the frozen answer contract, including the exact
+    refusal string the scorers match on.
+    """
+    if prompt_variant not in PROMPT_VARIANTS:
+        raise SystemExit(
+            f"unknown prompt variant {prompt_variant!r}; expected one of "
+            f"{sorted(PROMPT_VARIANTS)}")
     if search_mode == SEARCH_MODE_NONE:
+        # No tool to elicit use of, so guided collapses onto the control text.
         return NO_SEARCH_SYSTEM_PROMPT
-    if search_mode == SEARCH_MODE_NATIVE:
-        return NATIVE_SEARCH_SYSTEM_PROMPT
-    return FROZEN_SYSTEM_PROMPT
+    base = (NATIVE_SEARCH_SYSTEM_PROMPT if search_mode == SEARCH_MODE_NATIVE
+            else FROZEN_SYSTEM_PROMPT)
+    parts = [base]
+    if prompt_variant == PROMPT_GUIDED:
+        parts.append(_GUIDED_CORE)
+    # Parameter guidance is a property of the TOOL, so it belongs only on the
+    # harness arm that actually offers them.
+    if (search_mode == SEARCH_MODE_HARNESS
+            and tool_schema == agents.TOOL_SCHEMA_PARAMETRIC):
+        parts.append(_PARAMETRIC_PROMPT_SUFFIX)
+    return "\n\n".join(parts)
 
 
-def condition_label(search_mode: str, arm: str, model_vendor: str) -> str:
+def condition_label(search_mode: str, arm: str, model_vendor: str,
+                    prompt_variant: str = PROMPT_TERSE,
+                    tool_schema: str = agents.TOOL_SCHEMA_MINIMAL) -> str:
     """One slug per matrix cell. Distinguishes the two collision-prone names:
     `arm=native_fresh` is a SEARCH VENDOR's freshness parameter, while
     `search_mode=native` is the MODEL vendor's own server-side search."""
+    # Default axes produce the PREREGISTERED label unchanged, so experiments run
+    # before these axes existed still join on condition_id. A non-default axis
+    # appends a suffix rather than restructuring the label.
     if search_mode == SEARCH_MODE_NONE:
-        return "no_search"
-    if search_mode == SEARCH_MODE_NATIVE:
-        return f"native-{model_vendor}"
-    return f"harness-{SEARCH_PROVIDER}-{arm}"
+        base = "no_search"
+    elif search_mode == SEARCH_MODE_NATIVE:
+        base = f"native-{model_vendor}"
+    else:
+        base = f"harness-{SEARCH_PROVIDER}-{arm}"
+    suffix = ""
+    if prompt_variant != PROMPT_TERSE:
+        suffix += f"-{prompt_variant}"
+    # The tool schema is a harness-only axis: native search has no schema to vary.
+    if (search_mode == SEARCH_MODE_HARNESS
+            and tool_schema != agents.TOOL_SCHEMA_MINIMAL):
+        suffix += f"-{tool_schema}"
+    return base + suffix
 
 
 def make_task(
@@ -561,10 +781,13 @@ def make_task(
     dataset_version: str | None = None,
     search_mode: str = SEARCH_MODE_HARNESS,
     model_vendor: str = DEFAULT_MODEL_VENDOR,
+    prompt_variant: str = PROMPT_TERSE,
+    tool_schema: str = agents.TOOL_SCHEMA_MINIMAL,
 ):
     spec = vendor_of(model_vendor)
-    system_prompt = _system_prompt_for(search_mode)
-    condition = condition_label(search_mode, arm, model_vendor)
+    system_prompt = _system_prompt_for(search_mode, prompt_variant, tool_schema)
+    condition = condition_label(search_mode, arm, model_vendor, prompt_variant,
+                                tool_schema)
     condition_id = f"{model_vendor}:{agent_model}::{condition}"
 
     def task(input: dict, hooks) -> dict:
@@ -607,7 +830,7 @@ def make_task(
         else:
             outcome = _run_harness(client, spec, agent_model, system_prompt,
                                    question, excludes, arm, search_mode,
-                                   search_setup)
+                                   search_setup, tool_schema, answer_as_of)
         wall_clock_s = time.perf_counter() - t0
 
         surfaced = agents.surfaced_domains(outcome["trajectory"])
@@ -795,11 +1018,18 @@ def _blank_outcome(decision_surface: str) -> dict:
         "completion_tokens": 0, "decision_surface": decision_surface,
         "exclusion_enforced": False, "citations": [], "search_errors": [],
         "refused": False, "truncated": False, "pause_turns": 0,
+        # Parametric-arm telemetry. agent_param_calls counts searches where the
+        # model set at least one parameter, so a parametric arm that behaves
+        # exactly like its fixed twin is visible as 0 rather than assumed.
+        "agent_param_calls": 0, "param_rejections": [],
+        "extraction_mixed": False,
     }
 
 
 def _run_harness(client, spec, agent_model, system_prompt, question, excludes,
-                 arm, search_mode, search_setup: dict | None = None) -> dict:
+                 arm, search_mode, search_setup: dict | None = None,
+                 tool_schema: str = agents.TOOL_SCHEMA_MINIMAL,
+                 answer_as_of: str | None = None) -> dict:
     """Tool-calling loop for the harness arm and the no-tool control arm.
 
     Identical driver for both: the control arm is this loop with the tool never
@@ -810,9 +1040,16 @@ def _run_harness(client, spec, agent_model, system_prompt, question, excludes,
     out["exclusion_enforced"] = search_mode == SEARCH_MODE_HARNESS
     tools_allowed = search_mode == SEARCH_MODE_HARNESS
 
-    session = make_harness_session(client, spec, agent_model, system_prompt)
+    session = make_harness_session(client, spec, agent_model, system_prompt,
+                                   tool_schema)
     session.add_user(question)
     final = None
+    # The exclusion list travels with the setup so merge_agent_search_params can
+    # filter a boost against it without re-deriving the guard.
+    base_setup = dict(search_setup or {})
+    base_setup["_exclude_domains"] = list(excludes or ())
+    # Text layers actually used, to flag a row that mixed them mid-trajectory.
+    extractions_used: set[str] = set()
 
     for _ in range(2 * (MAX_SEARCHES + MAX_CLICKS) + 2):
         # Once both budgets are spent there is nothing left to call, so drop
@@ -849,9 +1086,23 @@ def _run_harness(client, spec, agent_model, system_prompt, question, excludes,
                     # inside the turn cap.
                     out["used_searches"] += 1
                     query = call["arguments"].get("query", "")
+                    # Only the parametric arm reads model parameters. A model can
+                    # emit extra keys even when the schema does not declare them,
+                    # and honouring those on the minimal arm would stop the
+                    # fixed-config arm being fixed.
+                    if tool_schema == agents.TOOL_SCHEMA_PARAMETRIC:
+                        call_setup, rejections = merge_agent_search_params(
+                            base_setup, call["arguments"], answer_as_of)
+                        if call_setup["_agent_set"]:
+                            out["agent_param_calls"] += 1
+                        out["param_rejections"].extend(rejections)
+                    else:
+                        call_setup, _ = dict(base_setup), None
+                    extractions_used.add(
+                        call_setup.get("extraction", EXTRACTION_SNIPPETS))
                     try:
                         results, content, tok = run_search(
-                            arm, query, excludes, search_setup)
+                            arm, query, excludes, call_setup)
                     except httpx.HTTPError as exc:
                         # The provider failed after _provider_json's retries.
                         # Recorded and survivable rather than fatal: killing the
@@ -893,6 +1144,18 @@ def _run_harness(client, spec, agent_model, system_prompt, question, excludes,
                            f"Use {agents.SEARCH_TOOL_NAME}.")
             results_to_send.append((call["id"], content))
         session.add_tool_results(results_to_send)
+
+    # Declare the text layer the row actually ran on. If a highlights row stayed
+    # `full`, it would pool into the snippet arms' mean with nothing recording
+    # that the text layer changed.
+    if search_mode == SEARCH_MODE_HARNESS and extractions_used:
+        out["extraction_mixed"] = len(extractions_used) > 1
+        # A mixed row is reported at the RICHER tier: some of its evidence really
+        # was highlights, and gating those metrics off would drop the row from
+        # the very measurement the axis exists to move.
+        chosen = (EXTRACTION_HIGHLIGHTS if EXTRACTION_HIGHLIGHTS in
+                  extractions_used else next(iter(extractions_used)))
+        out["decision_surface"] = EXTRACTION_SURFACES.get(chosen, SURFACE_FULL)
 
     out["final_answer"] = final if final else "I could not find this."
     return out
@@ -1268,7 +1531,9 @@ def run(arm: str, dataset_name: str, dataset_version: str | None,
         trials: int, judge_specs: list[str], agent_model: str, study_id: str,
         env_path: Path, search_mode: str = SEARCH_MODE_HARNESS,
         model_vendor: str = DEFAULT_MODEL_VENDOR,
-        split: str | None = None, limit: int | None = None):
+        split: str | None = None, limit: int | None = None,
+        prompt_variant: str = PROMPT_TERSE,
+        tool_schema: str = agents.TOOL_SCHEMA_MINIMAL):
     api_key, project_id = load_runtime_env(env_path)
     _preflight(arm, search_mode, model_vendor, agent_model)
     spec = vendor_of(model_vendor)
@@ -1301,7 +1566,8 @@ def run(arm: str, dataset_name: str, dataset_version: str | None,
               "decision_surface in the row metadata; compare only against this "
               "vendor's own harness and no_search arms.")
 
-    condition = condition_label(search_mode, arm, model_vendor)
+    condition = condition_label(search_mode, arm, model_vendor, prompt_variant,
+                                tool_schema)
     condition_id = f"{model_vendor}:{agent_model}::{condition}"
     model_slug = re.sub(r"[^a-zA-Z0-9_.-]+", "-", agent_model)
     experiment_name = f"{study_id}-{dataset.name}-{model_slug}-{condition}"
@@ -1323,6 +1589,8 @@ def run(arm: str, dataset_name: str, dataset_version: str | None,
             str(resolved_version),
             search_mode,
             model_vendor,
+            prompt_variant,
+            tool_schema,
         ),
         scores=[judge, *DETERMINISTIC_SCORERS],
         trial_count=trials,          # web nondeterminism > model nondeterminism
@@ -1453,7 +1721,13 @@ def run(arm: str, dataset_name: str, dataset_version: str | None,
             # be zero everywhere else — agent_cache_hit_rate is the per-row check.
             "prompt_caching_expected": model_vendor == "openai",
             "git_commit": _git_commit(),
-            "prompt_version": PROMPT_VERSIONS[search_mode],
+            "prompt_version": PROMPT_VERSIONS[(search_mode, prompt_variant)],
+            # The two elicitation axes, on every row so a condition is
+            # identifiable without reading the commit. tool_schema is
+            # harness-only: native search has no schema to vary.
+            "prompt_variant": prompt_variant,
+            "tool_schema": (
+                tool_schema if search_mode == SEARCH_MODE_HARNESS else None),
             "question_transform_version": (
                 "retrievalqa-answer-as-of-v1"
                 if dataset.name == RETRIEVALQA_DATASET_NAME else "identity-v1"),
@@ -1518,6 +1792,18 @@ def main():
                         "sorting by row id. Required for a cost-bounded pilot: "
                         "the full LiveNewsBench matrix is 14 conditions and "
                         "18,606 row executions at one trial.")
+    r.add_argument("--prompt-variant", choices=list(PROMPT_VARIANTS),
+                   default=PROMPT_TERSE,
+                   help="terse (preregistered) or guided. `guided` states the "
+                        "search behaviour explicitly and is applied IDENTICALLY "
+                        "to the harness and native arms, so the elicitation pass "
+                        "cannot flatter one of them.")
+    r.add_argument("--tool-schema", choices=list(agents.TOOL_SCHEMAS),
+                   default=agents.TOOL_SCHEMA_MINIMAL,
+                   help="harness only. minimal offers search_web(query); "
+                        "parametric lets the model choose retrieval parameters "
+                        "per call, within rails that keep the leakage guard, "
+                        "page fetching, and reported latency out of its reach.")
     r.add_argument("--env-file", type=Path, default=Path(".env"))
 
     g = sub.add_parser(
@@ -1551,6 +1837,10 @@ def main():
             ap.error(f"--arm no_search conflicts with --search-mode "
                      f"{search_mode}; drop one")
         search_mode = SEARCH_MODE_NONE
+    if (args.tool_schema != agents.TOOL_SCHEMA_MINIMAL
+            and search_mode != SEARCH_MODE_HARNESS):
+        ap.error(f"--tool-schema applies only to --search-mode harness; "
+                 f"{search_mode} has no tool schema to vary")
     if search_mode == SEARCH_MODE_NATIVE and args.arm != DEFAULT_ARM:
         # native_fresh is a search-API parameter; there is no such knob on a
         # model vendor's server-side search, so accepting it would imply a
@@ -1566,7 +1856,7 @@ def main():
     run(args.arm, args.dataset_name, args.dataset_version,
         args.trials, args.judges or [DEFAULT_JUDGE_MODEL], agent_model,
         args.study_id, args.env_file, search_mode, args.model_vendor,
-        args.split, args.limit)
+        args.split, args.limit, args.prompt_variant, args.tool_schema)
 
 
 if __name__ == "__main__":

@@ -153,13 +153,20 @@ SURFACE_FULL = "full"
 SURFACE_NO_SNIPPET = "no_snippet"
 SURFACE_URLS_ONLY = "urls_only"
 SURFACE_NONE = "none"
-_KNOWN_SURFACES = (SURFACE_FULL, SURFACE_NO_SNIPPET, SURFACE_URLS_ONLY,
+# Highlights carry rank, url, title, date AND text, so every metric the `full`
+# tier supports stays computable. It is a separate tier because the TEXT LAYER
+# differs — query-aware passages rather than keyword snippets — and pooling the
+# two would hide the mediator this axis exists to move.
+SURFACE_HIGHLIGHTS = "highlights"
+_KNOWN_SURFACES = (SURFACE_FULL, SURFACE_HIGHLIGHTS, SURFACE_NO_SNIPPET,
+                   SURFACE_URLS_ONLY,
                    SURFACE_NONE)
 
 # Which tiers populate which fields.
-_URL_SURFACES = {SURFACE_FULL, SURFACE_NO_SNIPPET, SURFACE_URLS_ONLY}
-_DATE_SURFACES = {SURFACE_FULL, SURFACE_NO_SNIPPET}
-_SNIPPET_SURFACES = {SURFACE_FULL}
+_URL_SURFACES = {SURFACE_FULL, SURFACE_HIGHLIGHTS, SURFACE_NO_SNIPPET,
+                 SURFACE_URLS_ONLY}
+_DATE_SURFACES = {SURFACE_FULL, SURFACE_HIGHLIGHTS, SURFACE_NO_SNIPPET}
+_SNIPPET_SURFACES = {SURFACE_FULL, SURFACE_HIGHLIGHTS}
 
 
 def _surface(output) -> str:
