@@ -169,10 +169,16 @@ spend for total cost.
 - Treat Anthropic dates as last-modified timestamps. You.com dates are mixed:
   web results are last-modified, news results are publication timestamps. Split
   on each result's `source` before treating a date as a publication date.
-- Hold the You.com decision surface to the arm's declared result count. The API
-  applies `count` per section, so web and news are interleaved and the merged
-  list is capped; otherwise the surface floats with news intent and the `wide`
-  contrast is not interpretable.
+- Read both You.com sections and interleave them; news is additive, not capped
+  into the arm's result count. The API applies `count` per section, so surface
+  size runs 1x to 2x count depending on whether the query has news intent.
+  Record `n_web_results` and `n_news_results` per row and condition on them.
+  The variation is per query rather than per arm, so it does not confound the
+  setup contrast, but it does mean `n_results` is not a constant and must not
+  be compared against a single requested count.
+- News results are the only surface in the study reporting a true publication
+  timestamp. Prefer them when auditing `temporal_grounding`, and split on each
+  result's `source` before pooling dates.
 - Do not pool runs across the change to POST + highlights + news results. That
   change enlarged and reordered the harness decision surface, and it was
   contributed by the search vendor under measurement; re-baseline instead.

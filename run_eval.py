@@ -433,20 +433,24 @@ def youdotcom_search(query: str, arm: str, exclude_domains: list[str],
     # Read BOTH result sections. You.com returns news
     # results automatically when the query has news intent.
     #
-    # `count` is applied by You.com PER SECTION, so web + news can return up to
-    # 2x what the setup asked for. We interleave the sections and then truncate
-    # to `count`, which keeps `count` the size of the merged decision surface
-    # and therefore a real independent variable -- the `wide` arm varies it
-    # deliberately, and that contrast is meaningless if the actual surface
-    # floats with news intent. The trade is that news DISPLACES web results
-    # rather than adding to them; n_web_results / n_news_results on the span
-    # record what the API returned before the cap. See docs/study-design.md.
+    # `count` is applied by You.com PER SECTION, so a news-intent query returns
+    # up to 2x `count` across web + news. News is kept ADDITIVE rather than
+    # capped into `count`: two of the three datasets here are news benchmarks
+    # (LiveNewsBench, Corvus-QA), so the news section is on-target retrieval,
+    # not overflow, and it is the only section that reports a true publication
+    # timestamp -- the construct temporal_grounding actually wants. Capping it
+    # would displace on-topic fresh coverage to hold a number.
+    #
+    # The cost is that surface size varies with news intent, 1x to 2x `count`.
+    # That variation is per-QUERY, not per-arm -- every arm faces the same
+    # sections for the same query -- so it does not confound the setup
+    # contrast, but it is a covariate. n_web_results / n_news_results record it
+    # per row so analysis can condition on it. See docs/study-design.md.
     results_obj = raw.get("results") or {}
     web_hits = [("web", h) for h in results_obj.get("web") or []]
     news_hits = [("news", h) for h in results_obj.get("news") or []]
-    merged = _interleave(web_hits, news_hits)[:setup["count"]]
     results = []
-    for i, (source, res) in enumerate(merged, start=1):
+    for i, (source, res) in enumerate(_interleave(web_hits, news_hits), start=1):
         # With extraction_mode: "highlights", snippets are replaced by
         # contents.highlights. Fall back to snippets (when highlights are not available)
         # and then to description (news results do not contain snippets).
@@ -503,8 +507,11 @@ def run_search(arm: str, query: str, exclude_domains: list[str],
     results_obj = raw.get("results") or {}
     n_web = len(results_obj.get("web") or [])
     n_news = len(results_obj.get("news") or [])
-    n_surfaced_web = sum(1 for r in results if r["source"] == "web")
-    n_surfaced_news = sum(1 for r in results if r["source"] == "news")
+    # News descriptions are occasionally empty. Such a result still carries a
+    # title, a URL, and -- the reason to keep it -- a publication timestamp, so
+    # it is surfaced rather than dropped; this counts them so a run with an
+    # unusually thin surface is visible rather than inferred.
+    n_no_snippet = sum(1 for r in results if not r["snippet"].strip())
     current_span().log(
         input={"query": query, "provider": SEARCH_PROVIDER, "arm": arm,
                "exclude_domains": exclude_domains},
@@ -522,20 +529,18 @@ def run_search(arm: str, query: str, exclude_domains: list[str],
                  "latency_s": latency,
                  "search_cost_usd": search_cost_usd(arm, len(results)),
                  "n_results": len(results),
-                 # Returned by the API, per section, before the merge cap.
+                 # Per section. Both reach the agent: news is additive, not
+                 # capped into `count`. n_results is their sum.
                  "n_web_results": n_web,
                  "n_news_results": n_news,
-                 # Survived the cap and reached the agent, per section.
-                 "n_surfaced_web": n_surfaced_web,
-                 "n_surfaced_news": n_surfaced_news,
-                 # Returned-but-cut by the `count` cap. Non-zero means news
-                 # displaced web results; it is the cost of holding the
-                 # decision surface to a declared size.
-                 "n_results_dropped": (n_web + n_news) - len(results),
-                 # Requested vs returned: You.com can return fewer than `count`
-                 # per section, and on the `wide` setup a shortfall is the
-                 # finding, not noise.
-                 "n_results_requested": setup["count"]},
+                 # Surfaced with a title, URL, and date but no text.
+                 "n_results_without_snippet": n_no_snippet,
+                 # Requested PER SECTION, not in total: You.com can return
+                 # fewer than `count` in a section, and on the `wide` setup a
+                 # shortfall is the finding, not noise. Compare against
+                 # n_web_results and n_news_results separately, never against
+                 # n_results.
+                 "n_results_requested_per_section": setup["count"]},
     )
     return results, rendered, _tok(rendered)
 

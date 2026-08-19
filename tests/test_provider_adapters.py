@@ -24,9 +24,9 @@ Spec: https://you.com/docs/api-reference/search (checked 2026-08-17)
     (verified live: count=8 returned web=8 + news=8)
 
 Merge policy is ours, not You.com's: the two sections are interleaved by
-within-section rank and the merged list is then truncated to `count`, so `count`
-is the size of the decision surface the agent sees. Concatenating instead would
-pin every news result below every web result and bury the freshest coverage.
+within-section rank, and news is additive rather than capped into `count`.
+Concatenating instead would pin every news result below every web result and
+bury the freshest coverage on a benchmark that is mostly news.
 """
 
 import os
@@ -168,10 +168,12 @@ class YouComRequestShapeTest(unittest.TestCase):
         self.assertEqual([r["source"] for r in results],
                          ["web", "news", "web", "web"])
 
-    def test_merged_list_is_capped_at_the_requested_count(self):
-        # You.com applies `count` per section, so web + news can return up to
-        # 2x. `count` must stay the size of the merged decision surface, or the
-        # `wide` arm's contrast against the default is meaningless.
+    def test_news_is_additive_and_not_capped_into_count(self):
+        # `count` is per section. Two of the three datasets are news benchmarks
+        # and news is the only section reporting a true publication timestamp,
+        # so it is on-target retrieval; capping it would displace fresh
+        # coverage to hold a number. A news-intent query legitimately surfaces
+        # up to 2x count.
         response = {"metadata": {}, "results": {
             "web": [{"url": f"https://w.example/{i}", "title": f"W{i}",
                      "description": "d"} for i in range(8)],
@@ -179,20 +181,34 @@ class YouComRequestShapeTest(unittest.TestCase):
                       "description": "d"} for i in range(8)]}}
         with patch.object(run_eval, "_provider_json", return_value=response):
             results, _ = run_eval.youdotcom_search("q", "normalized", [])
-        self.assertEqual(len(results), 8)          # not 16
-        self.assertEqual([r["rank"] for r in results], list(range(1, 9)))
-        # The cap is applied AFTER interleaving, so news survives it.
-        self.assertEqual(sum(1 for r in results if r["source"] == "news"), 4)
+        self.assertEqual(len(results), 16)
+        self.assertEqual([r["rank"] for r in results], list(range(1, 17)))
+        self.assertEqual(sum(1 for r in results if r["source"] == "web"), 8)
+        self.assertEqual(sum(1 for r in results if r["source"] == "news"), 8)
 
-    def test_wide_setup_caps_at_its_own_larger_count(self):
+    def test_no_news_section_leaves_the_web_surface_untouched(self):
+        # An evergreen query returns no news section. The surface must then be
+        # exactly the web results -- news being additive must not change the
+        # non-news case.
         response = {"metadata": {}, "results": {
             "web": [{"url": f"https://w.example/{i}", "title": f"W{i}",
-                     "description": "d"} for i in range(20)],
-            "news": [{"url": f"https://n.example/{i}", "title": f"N{i}",
-                      "description": "d"} for i in range(20)]}}
+                     "description": "d"} for i in range(8)], "news": []}}
         with patch.object(run_eval, "_provider_json", return_value=response):
-            results, _ = run_eval.youdotcom_search("q", "wide", [])
-        self.assertEqual(len(results), 20)
+            results, _ = run_eval.youdotcom_search("q", "normalized", [])
+        self.assertEqual(len(results), 8)
+        self.assertEqual({r["source"] for r in results}, {"web"})
+
+    def test_results_without_text_are_surfaced_for_their_date(self):
+        # A news result with an empty description still carries a publication
+        # timestamp, which is the construct temporal_grounding wants. Keep it.
+        response = {"metadata": {}, "results": {"web": [], "news": [
+            {"url": "https://n.example/x", "title": "N", "description": "",
+             "page_age": "2026-08-17T10:00:00Z"}]}}
+        with patch.object(run_eval, "_provider_json", return_value=response):
+            results, _ = run_eval.youdotcom_search("q", "normalized", [])
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["snippet"], "")
+        self.assertEqual(results[0]["published_date"], "2026-08-17T10:00:00Z")
 
     def test_news_results_without_highlights_use_description(self):
         # News results carry no snippets; without highlights, description is

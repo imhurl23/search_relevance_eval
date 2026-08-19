@@ -130,12 +130,20 @@ the agent. There is no character budget. The agent may make five searches and
 cannot fetch arbitrary pages. You.com charges per call, so the `wide` arm costs
 the same per search as the 8-result arms.
 
-The harness reads both result sections You.com returns, `web` and `news`. The
-two are interleaved by within-section rank and the merged list is truncated to
-the arm's result count, so that count is the size of the decision surface the
-agent sees rather than a per-section quota. News results therefore displace web
-results rather than adding to them; spans record returned-vs-surfaced counts per
-section and `n_results_dropped`.
+The harness reads both result sections You.com returns, `web` and `news`, and
+interleaves them by within-section rank so news is not pinned below every web
+result. News is **additive**: the arm's result count is applied by You.com per
+section, and news results are not capped into it. Two of the three datasets are
+news benchmarks and news is the only section reporting a true publication
+timestamp, so it is on-target retrieval rather than overflow.
+
+A news-intent query therefore surfaces up to twice the arm's count while an
+evergreen query surfaces exactly the count. That variation is per query, not per
+arm — every arm sees the same sections for the same query — so it does not
+confound the setup contrast, but it is a covariate. Spans record
+`n_web_results`, `n_news_results`, and `n_results_without_snippet` so analysis
+can condition on it. Compare `n_results_requested_per_section` against each
+section separately, never against `n_results`.
 
 The two Baseten models each run three conditions. The frontier models each run
 four. The total is 14:

@@ -82,12 +82,11 @@ def main() -> int:
                     f"{query!r}: news results carry no contents.highlights; "
                     f"their snippet is the short `description` field")
 
-        # The cap has to hold, or `count` is not the treatment variable the
-        # `wide` arm assumes it is.
-        if len(results) > setup_count:
+        # News is additive, so the surface is web + news, both sections whole.
+        if len(results) != len(web) + len(news):
             failures.append(
-                f"{query!r}: surfaced {len(results)} results for count="
-                f"{setup_count}; the merge cap is not holding")
+                f"{query!r}: surfaced {len(results)} of {len(web) + len(news)} "
+                f"returned results; the merge is dropping results")
 
         if [r["rank"] for r in results] != list(range(1, len(results) + 1)):
             failures.append(f"{query!r}: ranks are not contiguous from 1")
@@ -104,8 +103,8 @@ def main() -> int:
 
         empty = [r["rank"] for r in results if not r["snippet"].strip()]
         if empty:
-            notes.append(f"{query!r}: empty snippet at rank(s) {empty}; "
-                         f"a capped slot carrying no text is wasted surface")
+            notes.append(f"{query!r}: no text at rank(s) {empty}; surfaced for "
+                         f"the title, URL, and publication date they carry")
 
         for r in results:
             (web_chars if r["source"] == "web" else news_chars).append(
@@ -121,8 +120,10 @@ def main() -> int:
         if n and w // max(n, 1) >= 5:
             notes.append(
                 f"web results carry ~{w // max(n, 1)}x the text of news results "
-                f"({w} vs {n} chars). Under a 1:1 interleave plus cap, each news "
-                f"result displaces a substantially richer web result.")
+                f"({w} vs {n} chars). Expected: news snippets come from the "
+                f"short `description` field. News earns its place on freshness "
+                f"and publication dates, not text volume, and is additive, so "
+                f"this costs no web coverage.")
 
     for note in notes:
         print(f"\nNOTE: {note}")
