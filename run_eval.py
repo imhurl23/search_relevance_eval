@@ -235,7 +235,7 @@ FROZEN_SYSTEM_PROMPT = """\
 You are a web research agent answering a time-sensitive factual question. You have one tool:
 search_web(query). You may use at most 5 searches and may not fetch result pages.
 Search results show rank, title, url, snippet, and
-published date when available. When you know the answer, stop calling tools
+published date when available. Do not use search operators (such as site:, intitle:, inurl:, intext:, filetype:, before:, after:, OR, or quoted exact-match). Write the query as a plain natural-language phrase. When you know the answer, stop calling tools
 and reply with ONLY the final answer, as concisely as possible. If you cannot
 determine the answer within budget, reply exactly: I could not find this."""
 
@@ -264,7 +264,7 @@ and reply with ONLY the final answer, as concisely as possible. If you cannot
 determine the answer within budget, reply exactly: I could not find this."""
 
 PROMPT_VERSIONS = {
-    SEARCH_MODE_HARNESS: "frozen-v2-generic-factual",
+    SEARCH_MODE_HARNESS: "frozen-v3-no-operators",
     SEARCH_MODE_NONE: "no-search-v2-parametric",
     SEARCH_MODE_NATIVE: "native-search-v1-generic-factual",
 }
@@ -288,6 +288,51 @@ YDC_USD_PER_CALL = 0.005
 
 SEARCH_PROVIDER = "youdotcom"
 SEARCH_PROVIDER_KEY = "YDC_API_KEY"
+
+
+# ---------------------------------------------------------------------------
+# Search-operator sanitization.
+#
+# The harness arm's queries must be plain natural language. If one model emits
+# `site:reuters.com Apple CEO` and another emits `Apple CEO`, a score difference
+# is query-construction, not retrieval quality. The prompt forbids operators,
+# but prompts are soft control — a model may still emit them. The harness strips
+# them so the constraint is enforced regardless of model compliance, and logs
+# every violation so the per-model violation rate is auditable in the spans.
+#
+# Only the unambiguous `operator:term` forms are stripped. Boolean `OR`, leading
+# `-` exclusions, and quoted exact-match are ambiguous in natural language (a
+# hyphenated word, a quoted title), so stripping them would corrupt legitimate
+# queries. The `operator:` forms have no natural-language reading.
+# ---------------------------------------------------------------------------
+
+_SEARCH_OPERATOR_RE = re.compile(
+    r"(?<!\w)(?:site|inurl|intitle|intext|inanchor|filetype|ext|"
+    r"allintitle|allinurl|allintext|allinanchor|related|cache|define|"
+    r"author|before|after|source|loc|location|language|num|filter|"
+    r"safe|sort|date|info|link|blogurl)"
+    r":(?:\"[^\"]*\"|\S+)",
+    re.IGNORECASE,
+)
+
+
+def _strip_search_operators(query: str) -> tuple[str, list[str]]:
+    """Remove search operators (site:, intitle:, etc.) from a query.
+
+    Returns (sanitized_query, list_of_removed_operators). Operators are
+    stripped rather than rejected so the search still runs and no budget is
+    wasted on a retry loop; the prompt forbids them and the violation is
+    logged for per-model audit. If stripping leaves an empty query, the
+    original is returned unchanged so the search layer sees something to run.
+    """
+    removed = [m.group(0) for m in _SEARCH_OPERATOR_RE.finditer(query)]
+    if not removed:
+        return query, []
+    sanitized = _SEARCH_OPERATOR_RE.sub("", query)
+    sanitized = re.sub(r"\s{2,}", " ", sanitized).strip()
+    if not sanitized:
+        return query, removed
+    return sanitized, removed
 
 
 def search_cost_usd(arm: str, n_results: int) -> float:
@@ -694,6 +739,7 @@ def make_task(
             "search_degraded": search_degraded,
             "search_fully_failed": search_fully_failed,
             "bad_tool_calls": outcome["bad_tool_calls"],
+            "operator_violations": outcome["operator_violations"],
             "refused_searches": outcome["refused_searches"],
             "refused_clicks": outcome["refused_clicks"],
             "search_errors": search_errors,
@@ -749,6 +795,7 @@ def make_task(
             "answer_chars": len(final),
             "distinct_surfaced_domains": len(surfaced),
             "zero_search_row": int(zero_search_row),
+            "n_operator_violations": len(outcome["operator_violations"]),
             "n_search_errors": len(search_errors),
             "search_degraded": int(search_degraded),
             "search_fully_failed": int(search_fully_failed),
@@ -795,6 +842,7 @@ def _blank_outcome(decision_surface: str) -> dict:
         "completion_tokens": 0, "decision_surface": decision_surface,
         "exclusion_enforced": False, "citations": [], "search_errors": [],
         "refused": False, "truncated": False, "pause_turns": 0,
+        "operator_violations": [],
     }
 
 
@@ -848,7 +896,14 @@ def _run_harness(client, spec, agent_model, system_prompt, question, excludes,
                     # failure would hand a flaky provider unlimited retries
                     # inside the turn cap.
                     out["used_searches"] += 1
-                    query = call["arguments"].get("query", "")
+                    raw_query = call["arguments"].get("query", "")
+                    query, removed_ops = _strip_search_operators(raw_query)
+                    if removed_ops:
+                        out["operator_violations"].append({
+                            "raw_query": raw_query,
+                            "sanitized_query": query,
+                            "removed": removed_ops,
+                        })
                     try:
                         results, content, tok = run_search(
                             arm, query, excludes, search_setup)
