@@ -1454,6 +1454,17 @@ def run(arm: str, dataset_name: str, dataset_version: str | None,
             "prompt_caching_expected": model_vendor == "openai",
             "git_commit": _git_commit(),
             "prompt_version": PROMPT_VERSIONS[search_mode],
+            # Native retrieval configuration, so each arm is reproducible from
+            # the row. allowed_callers ["direct"] means dynamic filtering was
+            # off and every result the model saw is observable to us.
+            "native_search_allowed_callers": (
+                agents.ANTHROPIC_WEB_SEARCH_ALLOWED_CALLERS
+                if (search_mode == SEARCH_MODE_NATIVE
+                    and model_vendor == "anthropic") else None),
+            "native_search_context_size": (
+                agents.OPENAI_SEARCH_CONTEXT_SIZE
+                if (search_mode == SEARCH_MODE_NATIVE
+                    and model_vendor == "openai") else None),
             "question_transform_version": (
                 "retrievalqa-answer-as-of-v1"
                 if dataset.name == RETRIEVALQA_DATASET_NAME else "identity-v1"),

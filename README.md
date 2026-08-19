@@ -371,6 +371,10 @@ and a cost frontier when `total_cost_usd` is present.
 
 - Native and harness prompts differ by one tool-specific sentence. The runner
   records the prompt version; no prompt-only control arm exists.
+- Native arms run at each vendor's retrieval ceiling, but the ceilings are not
+  equal and no native API exposes a freshness filter. Harness-versus-native is a
+  system comparison, not a retrieval-quality one — see
+  [docs/study-design.md](docs/study-design.md#harness-versus-native).
 - OpenAI native search exposes no `max_uses`, so its five-search budget is
   observed but not API-enforced.
 - You.com dates are mixed: web results expose last-modified, news results

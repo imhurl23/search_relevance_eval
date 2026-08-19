@@ -98,14 +98,19 @@ SURFACE_NONE = "none"
 # ---------------------------------------------------------------------------
 
 # web_search_20250305 is the BASIC tool, chosen deliberately over the newer
-# _20260209/_20260318 versions. Those add "dynamic filtering", which runs the
-# search inside code execution and drops results before they reach the context
-# window — the model would then answer from a surface we cannot observe and that
-# does not correspond to the harness arms, where every returned result is
-# rendered into the prompt. _20260318's response_inclusion can also omit result
-# blocks entirely. Basic search keeps the decision surface both complete and
-# comparable, at the cost of more input tokens.
+# _20260209/_20260318 versions, which add "dynamic filtering": the search runs
+# inside code execution and the model writes code that drops results before they
+# reach the context window. The candidate set stays visible either way — at
+# response_inclusion's default "full" the raw result blocks still come back — but
+# WHICH SUBSET survived into the model's context does not, because that lives in
+# model-authored code-execution output. Retrieval precision, snippet-derived
+# scores, and leakage over the consumed surface all read exactly that quantity.
 ANTHROPIC_WEB_SEARCH_TOOL_TYPE = "web_search_20250305"
+# Pinned, not inherited: ["direct"] is already the default here, but flips to
+# ["code_execution_20260120"] on _20260209 and later, so without this a one-word
+# version bump would enable dynamic filtering with nothing in the diff to show
+# it. Stating it makes a future bump a no-op.
+ANTHROPIC_WEB_SEARCH_ALLOWED_CALLERS = ["direct"]
 # Thinking stays on (adaptive). Disabling it on Opus 5 has a documented failure
 # mode where a tool call is written into the visible text instead of emitted as
 # a tool_use block: the turn succeeds, the search never runs, and nothing
@@ -757,6 +762,7 @@ def anthropic_native_search(
         "name": "web_search",
         # A hard cap, matching the harness arms' search budget exactly.
         "max_uses": max_searches,
+        "allowed_callers": ANTHROPIC_WEB_SEARCH_ALLOWED_CALLERS,
     }
     blocked = exclude_domains[:ANTHROPIC_MAX_BLOCKED_DOMAINS]
     if blocked:
@@ -887,7 +893,14 @@ def _parse_anthropic_content(response, run: NativeRun, texts: list[str]) -> None
 OPENAI_WEB_SEARCH_TOOL_TYPE = "web_search"
 # low | medium | high. Pinned so the retrieval depth is a declared condition
 # rather than a per-request default that can shift under us.
-OPENAI_SEARCH_CONTEXT_SIZE = "medium"
+# Raised to the ceiling: the harness arm passes every You.com highlight through
+# untruncated, so a mid setting here would compare You.com-at-maximum against
+# OpenAI-at-medium and read a configuration choice as a retrieval difference.
+# This is the only content-volume dial any native arm exposes — Anthropic's
+# web_search has none, max_content_tokens belonging to the barred web_fetch — so
+# that arm is already at its own ceiling and the gap between them is a stated
+# limit rather than a setting anyone forgot to raise.
+OPENAI_SEARCH_CONTEXT_SIZE = "high"
 
 
 def openai_native_search(
