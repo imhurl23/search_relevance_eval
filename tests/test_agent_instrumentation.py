@@ -1339,67 +1339,53 @@ class HarnessSearchErrorTest(unittest.TestCase):
         self.assertAlmostEqual(out["search_cost"], run_eval.YDC_USD_PER_CALL)
 
 
-class SearchOperatorSanitizerTest(unittest.TestCase):
-    """The harness strips search operators so every arm's queries are plain
-    natural language. Without this, one model emitting `site:reuters.com ...`
+class SearchOperatorDetectionTest(unittest.TestCase):
+    """The harness detects search operators so the per-model violation rate is
+    auditable. The query is never altered — the raw query goes to You.com
+    unchanged. Without detection, one model emitting `site:reuters.com ...`
     and another emitting a plain phrase is a query-construction difference
-    reading as a retrieval difference."""
+    reading as a retrieval difference, and nothing surfaces it."""
 
-    def test_plain_query_passes_through_unchanged(self):
-        q, removed = run_eval._strip_search_operators("who won the 2026 final")
-        self.assertEqual(q, "who won the 2026 final")
-        self.assertEqual(removed, [])
+    def test_plain_query_detects_nothing(self):
+        detected = run_eval._detect_search_operators("who won the 2026 final")
+        self.assertEqual(detected, [])
 
-    def test_site_operator_is_stripped(self):
-        q, removed = run_eval._strip_search_operators(
+    def test_site_operator_is_detected(self):
+        detected = run_eval._detect_search_operators(
             "site:reuters.com Apple CEO")
-        self.assertEqual(q, "Apple CEO")
-        self.assertEqual(removed, ["site:reuters.com"])
+        self.assertEqual(detected, ["site:reuters.com"])
 
-    def test_intitle_operator_is_stripped(self):
-        q, removed = run_eval._strip_search_operators(
+    def test_intitle_operator_with_quotes_is_detected(self):
+        detected = run_eval._detect_search_operators(
             'intitle:"Apple CEO" Tim Cook')
-        self.assertEqual(q, "Tim Cook")
-        self.assertEqual(removed, ['intitle:"Apple CEO"'])
+        self.assertEqual(detected, ['intitle:"Apple CEO"'])
 
-    def test_multiple_operators_are_all_stripped(self):
-        q, removed = run_eval._strip_search_operators(
+    def test_multiple_operators_are_all_detected(self):
+        detected = run_eval._detect_search_operators(
             "site:reuters.com intitle:Apple filetype:pdf CEO")
-        self.assertEqual(q, "CEO")
-        self.assertEqual(len(removed), 3)
+        self.assertEqual(len(detected), 3)
 
     def test_operator_is_case_insensitive(self):
-        q, removed = run_eval._strip_search_operators("SITE:reuters.com Apple")
-        self.assertEqual(q, "Apple")
-        self.assertEqual(removed, ["SITE:reuters.com"])
+        detected = run_eval._detect_search_operators("SITE:reuters.com Apple")
+        self.assertEqual(detected, ["SITE:reuters.com"])
 
-    def test_natural_language_colon_is_not_stripped(self):
-        # "note: this is important" should not lose "note: this is important"
-        # because "note" is not a recognized operator.
-        q, removed = run_eval._strip_search_operators(
+    def test_natural_language_colon_is_not_detected(self):
+        # "note: this is important" is not an operator — "note" is not in the
+        # recognized set, so it must not trigger a false positive.
+        detected = run_eval._detect_search_operators(
             "note: this is a question about Apple")
-        self.assertEqual(q, "note: this is a question about Apple")
-        self.assertEqual(removed, [])
+        self.assertEqual(detected, [])
 
-    def test_hyphenated_word_is_not_stripped(self):
+    def test_hyphenated_word_is_not_detected(self):
         # A leading hyphen is boolean NOT in search syntax, but it is also a
-        # hyphenated word. Only operator: forms are stripped, not bare -term.
-        q, removed = run_eval._strip_search_operators("state-of-the-art AI")
-        self.assertEqual(q, "state-of-the-art AI")
-        self.assertEqual(removed, [])
-
-    def test_stripping_all_operators_leaves_original_when_empty(self):
-        # If every token was an operator, the sanitized query is empty. Return
-        # the original so the search layer has something to run rather than an
-        # empty string that would error or return nothing.
-        q, removed = run_eval._strip_search_operators("site:reuters.com")
-        self.assertEqual(q, "site:reuters.com")
-        self.assertEqual(removed, ["site:reuters.com"])
+        # hyphenated word. Only operator: forms are detected, not bare -term.
+        detected = run_eval._detect_search_operators("state-of-the-art AI")
+        self.assertEqual(detected, [])
 
 
 class HarnessOperatorViolationTest(unittest.TestCase):
-    """When the agent emits operators, the harness strips them, records the
-    violation, and still runs the search on the sanitized query."""
+    """When the agent emits operators, the harness records the violation and
+    passes the raw query through to You.com unchanged."""
 
     def _run(self, search_side_effect, turns):
         session = _ScriptedSession(turns)
@@ -1414,7 +1400,7 @@ class HarnessOperatorViolationTest(unittest.TestCase):
             object(), agents.VENDORS["openai"], "gpt-5.6-sol", "sys",
             "who won?", [], "normalized", agents.SEARCH_MODE_HARNESS)
 
-    def test_operator_query_is_sanitized_before_search(self):
+    def test_raw_query_reaches_search_unchanged(self):
         captured = {}
 
         def capture(arm, query, excludes, setup):
@@ -1424,10 +1410,10 @@ class HarnessOperatorViolationTest(unittest.TestCase):
         self._run(capture, [agents.Turn(tool_calls=[
             _search_call("site:reuters.com who won")]),
             agents.Turn(text="Team A.")])
-        # The search layer received the sanitized query, not the raw one.
-        self.assertEqual(captured["query"], "who won")
+        # The search layer received the raw query, not a sanitized one.
+        self.assertEqual(captured["query"], "site:reuters.com who won")
 
-    def test_violation_is_recorded_with_raw_and_sanitized(self):
+    def test_violation_is_recorded_with_query_and_operators(self):
         out = self._run(
             lambda *a: ([], "No results.", 2),
             [agents.Turn(tool_calls=[
@@ -1435,9 +1421,8 @@ class HarnessOperatorViolationTest(unittest.TestCase):
              agents.Turn(text="Team A.")])
         self.assertEqual(len(out["operator_violations"]), 1)
         v = out["operator_violations"][0]
-        self.assertEqual(v["raw_query"], "site:reuters.com who won")
-        self.assertEqual(v["sanitized_query"], "who won")
-        self.assertEqual(v["removed"], ["site:reuters.com"])
+        self.assertEqual(v["query"], "site:reuters.com who won")
+        self.assertEqual(v["operators"], ["site:reuters.com"])
 
     def test_plain_query_produces_no_violation(self):
         out = self._run(
@@ -1446,14 +1431,14 @@ class HarnessOperatorViolationTest(unittest.TestCase):
              agents.Turn(text="Team A.")])
         self.assertEqual(out["operator_violations"], [])
 
-    def test_trajectory_records_sanitized_query(self):
+    def test_trajectory_records_raw_query(self):
         out = self._run(
             lambda *a: ([{"rank": 1, "url": "https://e.com", "title": "t",
                           "snippet": "s", "published_date": None}], "r", 5),
             [agents.Turn(tool_calls=[
                 _search_call("intitle:winner who won")]),
              agents.Turn(text="Team A.")])
-        self.assertEqual(out["trajectory"][0]["query"], "who won")
+        self.assertEqual(out["trajectory"][0]["query"], "intitle:winner who won")
 
 
 class HarnessProtocolRegistryTest(unittest.TestCase):

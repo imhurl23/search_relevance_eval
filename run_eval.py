@@ -291,19 +291,23 @@ SEARCH_PROVIDER_KEY = "YDC_API_KEY"
 
 
 # ---------------------------------------------------------------------------
-# Search-operator sanitization.
+# Search-operator detection.
 #
-# The harness arm's queries must be plain natural language. If one model emits
-# `site:reuters.com Apple CEO` and another emits `Apple CEO`, a score difference
-# is query-construction, not retrieval quality. The prompt forbids operators,
-# but prompts are soft control — a model may still emit them. The harness strips
-# them so the constraint is enforced regardless of model compliance, and logs
-# every violation so the per-model violation rate is auditable in the spans.
+# The harness arm's queries should be plain natural language. If one model
+# emits `site:reuters.com Apple CEO` and another emits `Apple CEO`, a score
+# difference is query-construction, not retrieval quality. The prompt forbids
+# operators, but prompts are soft control — a model may still emit them.
 #
-# Only the unambiguous `operator:term` forms are stripped. Boolean `OR`, leading
-# `-` exclusions, and quoted exact-match are ambiguous in natural language (a
-# hyphenated word, a quoted title), so stripping them would corrupt legitimate
-# queries. The `operator:` forms have no natural-language reading.
+# The harness does NOT alter the query: rewriting what the model decided to
+# send is itself an intervention, and the logged query would no longer be what
+# the model actually chose. Instead the harness detects operators, records them
+# so the per-model violation rate is auditable in the spans, and passes the
+# raw query through to You.com unchanged.
+#
+# Only the unambiguous `operator:term` forms are detected. Boolean `OR`,
+# leading `-` exclusions, and quoted exact-match are ambiguous in natural
+# language (a hyphenated word, a quoted title), so matching them would produce
+# false positives. The `operator:` forms have no natural-language reading.
 # ---------------------------------------------------------------------------
 
 _SEARCH_OPERATOR_RE = re.compile(
@@ -316,23 +320,14 @@ _SEARCH_OPERATOR_RE = re.compile(
 )
 
 
-def _strip_search_operators(query: str) -> tuple[str, list[str]]:
-    """Remove search operators (site:, intitle:, etc.) from a query.
+def _detect_search_operators(query: str) -> list[str]:
+    """Return the list of search operators (site:, intitle:, etc.) in a query.
 
-    Returns (sanitized_query, list_of_removed_operators). Operators are
-    stripped rather than rejected so the search still runs and no budget is
-    wasted on a retry loop; the prompt forbids them and the violation is
-    logged for per-model audit. If stripping leaves an empty query, the
-    original is returned unchanged so the search layer sees something to run.
+    Detection only — the query is never modified. The raw query is passed to
+    the search layer unchanged; the detected operators are logged so the
+    per-model violation rate is auditable.
     """
-    removed = [m.group(0) for m in _SEARCH_OPERATOR_RE.finditer(query)]
-    if not removed:
-        return query, []
-    sanitized = _SEARCH_OPERATOR_RE.sub("", query)
-    sanitized = re.sub(r"\s{2,}", " ", sanitized).strip()
-    if not sanitized:
-        return query, removed
-    return sanitized, removed
+    return [m.group(0) for m in _SEARCH_OPERATOR_RE.finditer(query)]
 
 
 def search_cost_usd(arm: str, n_results: int) -> float:
@@ -896,13 +891,12 @@ def _run_harness(client, spec, agent_model, system_prompt, question, excludes,
                     # failure would hand a flaky provider unlimited retries
                     # inside the turn cap.
                     out["used_searches"] += 1
-                    raw_query = call["arguments"].get("query", "")
-                    query, removed_ops = _strip_search_operators(raw_query)
-                    if removed_ops:
+                    query = call["arguments"].get("query", "")
+                    detected_ops = _detect_search_operators(query)
+                    if detected_ops:
                         out["operator_violations"].append({
-                            "raw_query": raw_query,
-                            "sanitized_query": query,
-                            "removed": removed_ops,
+                            "query": query,
+                            "operators": detected_ops,
                         })
                     try:
                         results, content, tok = run_search(
