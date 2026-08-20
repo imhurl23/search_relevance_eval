@@ -20,8 +20,8 @@ Spec: https://you.com/docs/api-reference/search (checked 2026-08-17)
   * results.news[] carries NO `contents` key, so news snippets come from
     `description` — roughly 150 chars against ~2900 for a web highlight set
   * `page_age` is the timestamp field; for news results it is a publication date
-  * `count` is applied PER SECTION, so web + news can return up to 2x count
-    (verified live: count=8 returned web=8 + news=8)
+  * `count` is applied PER SECTION, so the registered baseline requests up to
+    5 web + 5 news results
 
 Merge policy is ours, not You.com's: the two sections are interleaved by
 within-section rank, and news is additive rather than capped into `count`.
@@ -176,15 +176,15 @@ class YouComRequestShapeTest(unittest.TestCase):
         # up to 2x count.
         response = {"metadata": {}, "results": {
             "web": [{"url": f"https://w.example/{i}", "title": f"W{i}",
-                     "description": "d"} for i in range(8)],
+                     "description": "d"} for i in range(5)],
             "news": [{"url": f"https://n.example/{i}", "title": f"N{i}",
-                      "description": "d"} for i in range(8)]}}
+                      "description": "d"} for i in range(5)]}}
         with patch.object(run_eval, "_provider_json", return_value=response):
             results, _ = run_eval.youdotcom_search("q", "normalized", [])
-        self.assertEqual(len(results), 16)
-        self.assertEqual([r["rank"] for r in results], list(range(1, 17)))
-        self.assertEqual(sum(1 for r in results if r["source"] == "web"), 8)
-        self.assertEqual(sum(1 for r in results if r["source"] == "news"), 8)
+        self.assertEqual(len(results), 10)
+        self.assertEqual([r["rank"] for r in results], list(range(1, 11)))
+        self.assertEqual(sum(1 for r in results if r["source"] == "web"), 5)
+        self.assertEqual(sum(1 for r in results if r["source"] == "news"), 5)
 
     def test_no_news_section_leaves_the_web_surface_untouched(self):
         # An evergreen query returns no news section. The surface must then be
@@ -254,7 +254,7 @@ class YouComSetupTest(unittest.TestCase):
     def test_normalized_sends_no_freshness_filter(self):
         body = self._body("normalized")
         self.assertNotIn("freshness", body)
-        self.assertEqual(body["count"], 8)
+        self.assertEqual(body["count"], 5)
 
     def test_native_fresh_sends_one_day(self):
         self.assertEqual(self._body("native_fresh")["freshness"], "day")

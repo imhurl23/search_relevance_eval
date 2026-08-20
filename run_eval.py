@@ -145,7 +145,12 @@ MAX_SEARCHES, MAX_CLICKS = 5, 0
 # stay distinct from native rows, where the field does not apply; rows written
 # before the switch to highlights carry the integer 400 under `snippet_chars`.
 SNIPPET_TRUNCATION = "none"
-N_RESULTS = 8                          # default result count; `wide` overrides it
+# You.com applies `count` independently to its web and news sections. Five per
+# section therefore gives the registered harness/native contrast a target
+# surface of up to 10 results per search: 5 web + 5 news when both sections are
+# available. Native providers do not expose section-specific result counts, so
+# their observed surface size is recorded rather than post-hoc truncated.
+N_RESULTS = 5                          # per section; `wide` overrides it
 
 # Alternate web and news by within-section rank. The sections carry no
 # cross-comparable score, so alternating is the neutral merge; concatenating
@@ -181,8 +186,8 @@ YDC_SETUPS: dict[str, dict] = {
     # one-day filter can starve a query whose coverage lags by 48 hours.
     "fresh_week": {"count": N_RESULTS, "freshness": "week"},
     # A bigger decision surface at identical cost: You.com bills per call
-    # independent of `count`, so if 20 results beat 8 that is a free win. Tests
-    # whether the 8-result default was leaving recall on the table.
+    # independent of `count`, so if 20 results beat 5 that is a free win. Tests
+    # whether the 5-per-section baseline was leaving recall on the table.
     "wide": {"count": 20, "freshness": None},
 }
 DEFAULT_ARM = "normalized"
@@ -1457,11 +1462,27 @@ def run(arm: str, dataset_name: str, dataset_version: str | None,
             # What truncation the harness applied. See SNIPPET_TRUNCATION.
             "snippet_truncation": (
                 SNIPPET_TRUNCATION if search_mode == SEARCH_MODE_HARNESS else None),
-            # Requested result count for this setup. Not a global constant any
-            # more: the `wide` setup varies it, which is the point of that arm.
+            # Requested result count PER SECTION for this setup. Not a global
+            # constant: the `wide` setup varies it, which is the point of that
+            # arm. Kept under the legacy field name for older experiment joins.
             "n_results": (
                 ydc_setup(arm)["count"] if search_mode == SEARCH_MODE_HARNESS
                 else None),
+            # Registered native-vs-harness target: the normalized You.com arm
+            # enforces a maximum of 5 results in each of two sections. Native
+            # APIs expose neither that split nor an exact source-count control,
+            # so 10 is a declared target there and observed trajectory volume is
+            # the measurement. Never truncate native results after the model has
+            # already seen them; that would change metrics, not treatment.
+            "result_count_target_per_search": (
+                2 * ydc_setup(arm)["count"]
+                if search_mode == SEARCH_MODE_HARNESS
+                else 2 * N_RESULTS if search_mode == SEARCH_MODE_NATIVE
+                else None),
+            "result_count_control": (
+                "per_section_max" if search_mode == SEARCH_MODE_HARNESS
+                else "unavailable_observed_only"
+                if search_mode == SEARCH_MODE_NATIVE else None),
             "youdotcom_freshness": (
                 experiment_ydc_setup(arm, dataset.name)["freshness"]
                 if search_mode == SEARCH_MODE_HARNESS

@@ -120,25 +120,38 @@ before publication. Promotional and negotiated rates are excluded.
 | Mode | Arm | Retrieval parameters | Search price |
 |---|---|---|---:|
 | `none` | — | No search tool | $0 |
-| `harness` | `normalized` | You.com, 8 results, no freshness filter | $0.005/call |
+| `harness` | `normalized` | You.com, up to 5 web + 5 news results, no freshness filter | $0.005/call |
 | `harness` | `wide` | You.com, 20 results, no freshness filter | $0.005/call |
-| `native` | — | Vendor-hosted search | $0.010/search |
+| `native` | — | Vendor-hosted search; 10-result target, observed-only volume | $0.010/search |
 
 Harness results expose full untruncated passages: You.com is queried with
-`extraction_mode: "highlights"` and every highlight is passed to the agent, with
-no character budget. The agent may make five searches and cannot fetch arbitrary
-pages. You.com charges per call, so the `wide` arm costs the same per search as
-the 8-result arms.
+`extraction_mode: "highlights"`, and every highlight on a result is passed to
+the agent. There is no character budget. The agent may make five searches and
+cannot fetch arbitrary pages. You.com charges per call, so the `wide` arm costs
+the same per search as the 5-per-section arms.
 
-Both result sections are read, `web` and `news`, interleaved by within-section
-rank so news is not pinned below every web result. News is **additive** — the
-result count is applied by You.com per section and news is not capped into it —
-because two of the three datasets are news benchmarks and news is the only
-section reporting a true publication timestamp. A news-intent query therefore
-surfaces up to twice the count, an evergreen query exactly the count. That
-varies per query rather than per arm, so it does not confound the setup
-contrast, but spans record `n_web_results` and `n_news_results` so analysis can
-condition on it.
+The harness reads both result sections You.com returns, `web` and `news`, and
+interleaves them by within-section rank so news is not pinned below every web
+result. News is **additive**: the arm's result count is applied by You.com per
+section, and news results are not capped into it. Two of the three datasets are
+news benchmarks and news is the only section reporting a true publication
+timestamp, so it is on-target retrieval rather than overflow.
+
+A news-intent query in the normalized arm therefore surfaces up to 5 web and 5
+news results, while an evergreen query surfaces up to 5 web results. That
+variation is per query, not per arm — every arm sees the same sections for the
+same query — so it does not confound the setup contrast, but it is a covariate.
+Spans record
+`n_web_results`, `n_news_results`, and `n_results_without_snippet` so analysis
+can condition on it. Compare `n_results_requested_per_section` against each
+section separately, never against `n_results`.
+
+The native APIs do not expose a 5-web/5-news or exact source-count control.
+OpenAI therefore uses `search_context_size: "high"`; Anthropic uses its basic
+web-search surface. Both record a target of 10 results per search and report the
+sources actually observed. Native trajectories are not truncated after the
+model has seen them, because that would hide evidence without equalizing the
+decision surface.
 
 The two Baseten models each run three conditions. The frontier models each run
 four. The total is 14:

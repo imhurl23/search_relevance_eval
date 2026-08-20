@@ -385,6 +385,7 @@ class AnthropicNativeSearchTest(unittest.TestCase):
         tool = client.messages.calls[0]["tools"][0]
         self.assertEqual(tool["type"], agents.ANTHROPIC_WEB_SEARCH_TOOL_TYPE)
         self.assertEqual(tool["max_uses"], 5)
+        self.assertEqual(tool["allowed_callers"], ["direct"])
         self.assertEqual(tool["blocked_domains"],
                          ["source.example", "web.archive.org"])
 
