@@ -160,6 +160,12 @@ Prices come from the pinned table in `agents.py`. Confirm current public prices
 before a publication run and record the check date. Do not substitute search
 spend for total cost.
 
+The matrix launcher requires an acknowledged maximum search bill for execution.
+It computes the ceiling from selected rows, trials, five calls per row, every
+condition, and all allowed condition attempts. This ceiling excludes model and
+judge inference because the vendor APIs expose no common enforceable dollar
+budget. `max_row_executions` bounds that remaining exposure and includes retries.
+
 `latency_s` is deployed end-to-end latency and includes harness scheduling and
 rate-limit waits. Use `provider_http_latency_s` for You.com's HTTP service time;
 do not compare a You.com tool-span queue wait with a native provider's hidden
@@ -210,6 +216,13 @@ another. Within-arm contrasts carry no such limit.
   contrast.
 - Randomize condition order reproducibly with `run_matrix.py`; record
   `matrix_order_seed` and `matrix_order_index`.
+- Execute from a clean tracked worktree. The checkpoint binds resume operations
+  to the git commit, pinned dataset version, row count, order, concurrency, and
+  error policy.
+- Require the selected row count to equal `expected_rows` before every condition.
+- Treat task, scorer, and classifier errors above the registered threshold as a
+  failed condition. A retry writes a separate experiment; never append retry rows
+  to a partial attempt.
 - Report gold-domain availability and `exclusion_requested` by arm. Audit
   returned domains separately because a sent filter does not prove enforcement.
 - Report observed results per search against `result_count_target_per_search`;

@@ -1197,6 +1197,15 @@ class SubsetSelectionTest(unittest.TestCase):
         self.assertIs(data, self.ROWS)
         self.assertFalse(meta["subset_applied"])
 
+    def test_full_count_guard_counts_and_preserves_dataset_object(self):
+        data, meta = run_eval.select_rows(
+            self.ROWS, None, None, count_full=True
+        )
+        self.assertIs(data, self.ROWS)
+        self.assertFalse(meta["subset_applied"])
+        self.assertEqual(meta["n_rows"], len(self.ROWS))
+        self.assertEqual(meta["n_available"], len(self.ROWS))
+
     def test_limit_is_deterministic_across_input_orderings(self):
         # Iteration order of a dataset is not contractually stable, so the slice
         # must be taken after sorting by id -- otherwise two arms can request

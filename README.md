@@ -177,7 +177,56 @@ Preview the full launch without spending money:
 ```
 
 After checking all 14 commands, repeat with `--execute`. The launcher defaults
-to one trial. Add `--limit 5` for an end-to-end pilot.
+to one trial. For a five-row pilot, add `--limit 5`,
+`--max-search-cost-usd 4`, and `--execute`.
+
+For the pinned 1,329-row LiveNewsBench version, launch the full run with explicit
+row and search-spend guards:
+
+```bash
+.venv/bin/python run_matrix.py \
+  --dataset-name LiveNewsBench \
+  --dataset-version 1000197598003916222 \
+  --study-id livenewsbench-full-v1 \
+  --expected-rows 1329 \
+  --max-search-cost-usd 810 \
+  --execute
+```
+
+The $810 ceiling covers the maximum search fees for all 14 conditions plus one
+complete retry of every condition ($797.40 at the pinned rates). Model and judge
+inference are additional; the providers expose no shared dollar-budget API, so
+the launcher also caps worst-case row executions at 40,000 by default.
+
+### Crash recovery
+
+An executing matrix writes an atomic checkpoint to
+`.eval-checkpoints/<study-id>.json` before and after every condition attempt.
+The checkpoint records the dataset version, condition order, git commit,
+concurrency, error policy, a hash of `.env` without its contents, commands,
+timestamps, and exit codes.
+
+- A repeated study ID refuses to launch unless `--resume` is present.
+- A process lock rejects concurrent launchers for the same checkpoint.
+- `--resume` verifies the complete plan and skips completed conditions.
+- A condition left in `running` state fails closed because its orphaned child
+  may still be active. After confirming that process is dead, resume with
+  `--retry-running`; a late completion marker is reconciled automatically.
+- A failed condition gets one retry by default. Retries use a new Braintrust
+  experiment ending in `-retry-02`, so partial and complete denominators do not
+  mix.
+- Each condition has a four-hour subprocess timeout. Braintrust gets a timeout
+  60 seconds shorter so it can flush before the launcher terminates the process.
+- The default row-error tolerance is zero. Task, scorer, or classifier errors
+  make the condition exit nonzero and enter the retry path.
+- The launcher stops after an exhausted condition. Completed experiments and the
+  checkpoint remain available.
+
+Resume with the same command and append `--resume`. The dataset, order seed,
+commit, concurrency, row count, and error policy must match the checkpoint.
+Increase `--condition-retries` and the acknowledged cost ceiling if an exhausted
+condition should receive another attempt. Raise `--max-row-executions` as well
+when the added retry would exceed its conservative ceiling.
 
 ## Gateway routing
 

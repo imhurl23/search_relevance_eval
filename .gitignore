@@ -28,6 +28,7 @@ dist/
 # Braintrust CLI-generated local state
 .bt/
 .corvus/
+.eval-checkpoints/
 # Legacy locations used before Corvus runtime state was consolidated.
 .corvus-rate-limits/
 .corvus-collector.lock
