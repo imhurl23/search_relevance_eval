@@ -1594,8 +1594,9 @@ def run(arm: str, dataset_name: str, dataset_version: str | None,
             "budget": {"searches": MAX_SEARCHES, "clicks": MAX_CLICKS},
             # --- what the agent was actually configured with ---
             # No frontier vendor permits temperature/seed: gpt-5-family models
-            # reject `temperature` with a 400 and support no `seed`, and Opus 5
-            # rejects temperature/top_p/top_k. Only the OSS arm pins sampling, so
+            # reject `temperature` with a 400 and support no `seed`, and Sonnet
+            # 5 rejects non-default temperature/top_p/top_k. Only the OSS arm
+            # pins sampling, so
             # sampling_pinned is False on both frontier vendors by necessity.
             "sampling_params": sampling,
             "sampling_pinned": bool(sampling),

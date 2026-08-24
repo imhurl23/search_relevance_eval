@@ -111,13 +111,11 @@ ANTHROPIC_WEB_SEARCH_TOOL_TYPE = "web_search_20250305"
 # version bump would enable dynamic filtering with nothing in the diff to show
 # it. Stating it makes a future bump a no-op.
 ANTHROPIC_WEB_SEARCH_ALLOWED_CALLERS = ["direct"]
-# Thinking stays on (adaptive). Disabling it on Opus 5 has a documented failure
-# mode where a tool call is written into the visible text instead of emitted as
-# a tool_use block: the turn succeeds, the search never runs, and nothing
-# errors. On a search eval that would silently produce no-search rows.
+# Thinking stays on (adaptive) and effort is pinned so Sonnet's Anthropic arms
+# share one declared reasoning configuration rather than inheriting defaults.
 ANTHROPIC_THINKING = {"type": "adaptive"}
 ANTHROPIC_EFFORT = "high"
-# max_tokens caps thinking + text together on Opus 5, so leave headroom or the
+# max_tokens caps thinking + text together on Sonnet 5, so leave headroom or the
 # answer truncates mid-sentence and scores as a wrong answer.
 ANTHROPIC_MAX_TOKENS = 8192
 ANTHROPIC_MAX_PAUSE_TURNS = 4
@@ -220,9 +218,10 @@ VENDORS: dict[str, VendorSpec] = {
     ),
     # gpt-5.6-terra is pinned rather than the moving `gpt-5.6` alias.
     #
-    # Terra and Opus 5 are NOT asserted to be capability-equivalent. Terra is
-    # OpenAI's cost-balanced tier while Opus is Anthropic's higher-capability
-    # tier. The pairing is an operational choice, not a cross-vendor control.
+    # Terra and Sonnet 5 are NOT asserted to be capability-equivalent. They are
+    # paired because both vendors position them as cost/intelligence-balanced
+    # tiers and their list prices are close. Cross-vendor results remain
+    # descriptive rather than causal.
     #
     # This is tolerable because no primary contrast depends on it: native-vs-
     # harness and search-vs-none both hold the model fixed within a vendor, and
@@ -252,16 +251,16 @@ VENDORS: dict[str, VendorSpec] = {
         harness_protocol=PROTOCOL_RESPONSES,
         notes="Native search via the Responses API hosted web_search tool.",
     ),
-    # Opus 5 is the cost-conscious Anthropic choice for this matrix. Comparisons
-    # against Terra remain descriptive; the causal contrasts hold the model fixed
-    # and compare no search, harness search, and native search within a vendor.
+    # Sonnet 5 is paired with Terra on operational tier and price. Comparisons
+    # remain descriptive; the causal contrasts hold the model fixed and compare
+    # no search, harness search, and native search within a vendor.
     "anthropic": VendorSpec(
         name="anthropic",
         model_class="frontier",
         api_key_env="ANTHROPIC_API_KEY",
-        default_model="claude-opus-5",
+        default_model="claude-sonnet-5",
         supports_native_search=True,
-        # Opus 5 removed temperature/top_p/top_k — sending any of them is a 400.
+        # Sonnet 5 rejects non-default temperature/top_p/top_k with a 400.
         sampling={},
         # Pinnable here because effort and tools coexist fine on the Messages
         # API, so both this vendor's arms get the same declared depth.
@@ -328,7 +327,7 @@ MATRIX_MODELS: tuple[ModelRow, ...] = (
              "reasoning than the Flash row"),
     ModelRow("openai", "gpt-5.6-terra",
              "frontier, also runs a native-search arm"),
-    ModelRow("anthropic", "claude-opus-5",
+    ModelRow("anthropic", "claude-sonnet-5",
              "frontier, also runs a native-search arm"),
 )
 
@@ -383,9 +382,8 @@ NATIVE_SEARCH_USD_PER_CALL = {"openai": 0.010, "anthropic": 0.010}
 # this table the arm with the highest hidden token cost is the one that reports
 # the lowest cost.
 #
-# Prices are list prices, checked 2026-08-05. Deliberately NOT using Sonnet 5's
-# promotional $2/$10 intro rate (expires 2026-08-31), so a run's recorded cost
-# does not silently change meaning when the promotion lapses.
+# Prices are list prices, checked 2026-08-24. Anthropic made Sonnet 5's $2/$10
+# introductory price its standard price on 2026-08-10.
 #
 # A model absent from this table yields None, and the row records
 # model_cost_confirmed=False rather than a fabricated $0.00 — the same discipline
@@ -400,7 +398,7 @@ MODEL_USD_PER_MTOK: dict[str, tuple[float, float]] = {
     # Anthropic (platform.claude.com/docs/en/pricing)
     "claude-fable-5": (10.00, 50.00),
     "claude-opus-5": (5.00, 25.00),
-    "claude-sonnet-5": (3.00, 15.00),
+    "claude-sonnet-5": (2.00, 10.00),
     "claude-haiku-4-5": (1.00, 5.00),
     # Baseten Model APIs (baseten.co/pricing). Pricing the OSS arm is what makes
     # the capability-substitution question answerable rather than rhetorical:
@@ -420,7 +418,7 @@ MODEL_USD_PER_MTOK: dict[str, tuple[float, float]] = {
 
 # Cached input is billed at a fraction of the base input rate, and both frontier
 # vendors publish the same 0.1x multiplier (OpenAI: $0.20 cached on $2.00 base
-# for Terra; Anthropic: $0.50 cached on $5.00 base for Opus). It is
+# for Terra; Anthropic: $0.20 cached on $2.00 base for Sonnet). It is
 # expressed as a multiplier rather than eight more hand-entered numbers so the
 # cached rate cannot drift out of sync with the base rate it is derived from.
 #
