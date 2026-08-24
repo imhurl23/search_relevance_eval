@@ -152,12 +152,18 @@ Report these fields separately and together:
 - `model_cost_usd`;
 - `total_cost_usd`;
 - `latency_s`;
+- harness `provider_http_latency_s`, `rate_limit_wait_s`, and `retry_backoff_s`;
 - mean and P95 search calls;
 - cached-input use and the applicable price multiplier.
 
 Prices come from the pinned table in `agents.py`. Confirm current public prices
 before a publication run and record the check date. Do not substitute search
 spend for total cost.
+
+`latency_s` is deployed end-to-end latency and includes harness scheduling and
+rate-limit waits. Use `provider_http_latency_s` for You.com's HTTP service time;
+do not compare a You.com tool-span queue wait with a native provider's hidden
+server-side scheduling as if both were retrieval latency.
 
 ## Harness versus native
 
@@ -174,7 +180,7 @@ described as exact 5+5 parity. The shared target is recorded as
 `result_count_target_per_search: 10`, alongside
 `result_count_control: "unavailable_observed_only"` on native runs.
 
-Three differences cannot be closed, and they bound what this contrast can claim:
+These differences cannot be closed and bound what this contrast can claim:
 
 - **Freshness has no native equivalent.** No native API exposes a freshness
   control, so that treatment axis is harness-only and freshness effects never
@@ -183,8 +189,15 @@ Three differences cannot be closed, and they bound what this contrast can claim:
   requests up to 5 web and 5 news results; native search content arrives inside
   `prompt_tokens` and can only be isolated by differencing the same model's
   `no_search` arm.
-- **Only the harness arm can ask for an uncached result.** Freshness is the
-  quantity under measurement, and `Cache-Control` has no native counterpart.
+- **Tool capabilities differ.** OpenAI can search, open a page, and find text in
+  a page. The harness exposes search-result highlights and no page-fetch tool.
+  Rows record each native action type and every emitted native query.
+- **Cache behavior is not controlled.** The You.com request sends
+  `Cache-Control: no-cache` to intermediaries, but that header does not establish
+  index or extraction freshness. Native providers control their own caches.
+- **Search-call units differ.** One OpenAI tool action can carry multiple search
+  queries, and `max_tool_calls` also covers page actions. Report native tool
+  calls, search actions, emitted queries, and page actions separately.
 
 Harness-versus-native is therefore a system comparison — You.com as configured
 here against vendor-native search as shipped — not a retrieval-quality
@@ -195,15 +208,19 @@ another. Within-arm contrasts carry no such limit.
 
 - Use one dataset snapshot, prompt version, model ID, and serving path within a
   contrast.
-- Interleave conditions in time.
-- Report gold-domain availability and `exclusion_enforced` by arm.
+- Randomize condition order reproducibly with `run_matrix.py`; record
+  `matrix_order_seed` and `matrix_order_index`.
+- Report gold-domain availability and `exclusion_requested` by arm. Audit
+  returned domains separately because a sent filter does not prove enforcement.
 - Report observed results per search against `result_count_target_per_search`;
   only the harness enforces the 5-web/5-news section maxima.
-- Report `search_budget_enforced`; OpenAI uses `max_tool_calls`, while
-  Anthropic carries the remaining `max_uses` budget across continuations.
-- Treat Anthropic dates as last-modified timestamps. You.com dates are mixed:
-  web results are last-modified, news results are publication timestamps. Split
-  on each result's `source` before treating a date as a publication date.
+- Report `search_budget_enforced`; OpenAI uses `max_tool_calls` across search,
+  page-open, and find actions, while Anthropic carries the remaining search
+  `max_uses` budget across continuations.
+- Treat Anthropic `page_age` as last-updated, not publication time. The current
+  You.com API reference does not define one publication-time construct across
+  both result sections. `temporal_grounding` uses news results explicitly marked
+  with `date_semantics: publication` and excludes other provider date fields.
 - Read both You.com sections and interleave them; news is additive, not capped
   into the arm's result count. The API applies `count` per section, so surface
   size runs 1x to 2x count depending on whether the query has news intent.
@@ -211,9 +228,8 @@ another. Within-arm contrasts carry no such limit.
   The variation is per query rather than per arm, so it does not confound the
   setup contrast, but it does mean `n_results` is not a constant and must not
   be compared against a single requested count.
-- News results are the only surface in the study reporting a true publication
-  timestamp. Prefer them when auditing `temporal_grounding`, and split on each
-  result's `source` before pooling dates.
+- Use only results marked `date_semantics: publication` when auditing
+  `temporal_grounding`.
 - Do not pool runs across the change to POST + highlights + news results. That
   change enlarged and reordered the harness decision surface, and it was
   contributed by the search vendor under measurement; re-baseline instead.
@@ -227,7 +243,7 @@ The design estimates effects for the pinned models, datasets, prompts, and searc
 systems. It covers short factual answers. One external search API cannot establish
 a general result about independent retrieval providers. Native-search evidence
 is less observable than harness evidence. The native-versus-harness contrast also
-changes one tool-specific prompt sentence.
+changes the visible tool contract and the provider's hidden search orchestration.
 
 OpenAI Terra and Anthropic Opus gateway and native-search adapters passed live
 checks on August 14, 2026. Both Baseten model routes passed on the same date.

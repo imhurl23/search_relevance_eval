@@ -35,7 +35,7 @@ unobservable surface is the dangerous failure mode here.
 metadata:
     The complete benchmark source fields plus importer provenance. Evaluation
     metadata merged in at run time: model_class, model_vendor, search_mode,
-    search_provider, freshness_treatment, exclusion_enforced, search_budget,
+    search_provider, freshness_treatment, exclusion_requested, search_budget,
     zero_search_row, as_of.
 
 All scorers return braintrust-style dicts: {"name", "score" (0-1 or None), "metadata"}.
@@ -572,7 +572,7 @@ def leakage_guard(input, output, expected, metadata=None, **kwargs):
             # Every current arm can enforce it (harness excludeDomains, Anthropic
             # blocked_domains, OpenAI filters.blocked_domains) — but a future arm
             # that cannot must not be silently pooled with those that can.
-            "exclusion_enforced": metadata.get("exclusion_enforced"),
+            "exclusion_requested": metadata.get("exclusion_requested"),
             "n_results_inspected": len(results),
         },
     }
@@ -715,6 +715,13 @@ def temporal_grounding(input, output, expected, metadata=None, **kwargs):
     pre_at_top3 = 0
     for r in _all_results(output):
         total += 1
+        # page_age is not a uniform publication timestamp across providers.
+        # New rows declare semantics explicitly; legacy harness news rows can
+        # still be recognized by their preserved section label.
+        semantics = r.get("date_semantics")
+        if semantics != "publication" and not (
+                semantics is None and r.get("source") == "news"):
+            continue
         pd = _parse_date(r.get("published_date"))
         if pd is None or event is None:
             continue

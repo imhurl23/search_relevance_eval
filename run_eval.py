@@ -153,6 +153,14 @@ SNIPPET_TRUNCATION = "none"
 N_RESULTS = 5                          # per section; `wide` overrides it
 NATIVE_RESULT_COUNT_TARGET = 2 * N_RESULTS
 
+# Pin the overlapping location control so requests do not inherit the machine,
+# gateway, or provider account's geography. You.com also exposes language and
+# SafeSearch controls without native equivalents; pin and declare their values
+# rather than relying on defaults that can change.
+SEARCH_USER_LOCATION = agents.SEARCH_USER_LOCATION
+YDC_LANGUAGE = "en"
+YDC_SAFESEARCH = "moderate"
+
 # Alternate web and news by within-section rank. The sections carry no
 # cross-comparable score, so alternating is the neutral merge; concatenating
 # would pin every news result below every web result and bury the freshest
@@ -187,7 +195,7 @@ YDC_SETUPS: dict[str, dict] = {
     # one-day filter can starve a query whose coverage lags by 48 hours.
     "fresh_week": {"count": N_RESULTS, "freshness": "week"},
     # A bigger decision surface at identical cost: You.com bills per call
-    # independent of `count`, so if 20 results beat 5 that is a free win. Tests
+    # independent of `count`, so if 20-per-section beats 5-per-section that is a free win. Tests
     # whether the 5-per-section baseline was leaving recall on the table.
     "wide": {"count": 20, "freshness": None},
 }
@@ -283,7 +291,8 @@ PROMPT_VERSIONS = {
 # 2026-07-30): $5.00 per 1,000 calls, independent of `count`.
 #
 # That independence is a load-bearing fact, not trivia: it means the `wide` setup
-# returns 20 results for the price of 8, so a recall gain there is free. It also
+# requests 20 results per section for the same per-call price, so a recall gain
+# there is free. It also
 # means search spend across the harness setups is identical, which isolates the
 # cost comparison to the native arms and the model tokens.
 #
@@ -406,7 +415,7 @@ _http = httpx.Client(
 _provider_limiters: dict[str, SharedHostLimiter] = {}
 
 
-def _provider_json(method: str, url: str, **kwargs):
+def _provider_json(method: str, url: str, *, timing: dict | None = None, **kwargs):
     """Conservative serial provider request with bounded retry/backoff."""
     host = (urlparse(url).hostname or "").lower()
     approved_hosts = {"ydc-index.io"}
@@ -415,9 +424,17 @@ def _provider_json(method: str, url: str, **kwargs):
     limiter = _provider_limiters.setdefault(
         host, SharedHostLimiter(f"provider-{host}", 1.0)
     )
+    timing = timing if timing is not None else {}
+    timing.setdefault("rate_limit_wait_s", 0.0)
+    timing.setdefault("provider_http_s", 0.0)
+    timing.setdefault("retry_backoff_s", 0.0)
     for attempt in range(5):
+        wait_started = time.perf_counter()
         limiter.wait()
+        timing["rate_limit_wait_s"] += time.perf_counter() - wait_started
+        request_started = time.perf_counter()
         response = _http.request(method, url, **kwargs)
+        timing["provider_http_s"] += time.perf_counter() - request_started
         if 300 <= response.status_code < 400:
             raise ValueError("provider API redirect refused")
         if (response.url.host or "").lower() not in approved_hosts:
@@ -432,6 +449,7 @@ def _provider_json(method: str, url: str, **kwargs):
             response.raise_for_status()
         delay = max(retry_after_seconds(response.headers.get("Retry-After")),
                     min(60.0, 5.0 * (2 ** attempt)))
+        timing["retry_backoff_s"] += delay
         time.sleep(delay)
     raise AssertionError("unreachable")
 
@@ -450,7 +468,7 @@ def _interleave(web: list, news: list) -> list:
 
 
 def youdotcom_search(query: str, arm: str, exclude_domains: list[str],
-                     setup: dict | None = None):
+                     setup: dict | None = None, timing: dict | None = None):
     # POST https://ydc-index.io/v1/search — POST is the documented path for
     # new features. extraction_mode: "highlights" returns query-aware passages
     # purpose-built for agent grounding, and is only available on POST. GET
@@ -462,6 +480,9 @@ def youdotcom_search(query: str, arm: str, exclude_domains: list[str],
     body: dict = {
         "query": query,
         "count": setup["count"],
+        "country": SEARCH_USER_LOCATION["country"],
+        "language": YDC_LANGUAGE,
+        "safesearch": YDC_SAFESEARCH,
         # Highlights are token-efficient passages from each page most relevant to the
         # query. They are designed to replace snippets and
         # are free — only full_page extraction carries a per-page charge.
@@ -476,11 +497,12 @@ def youdotcom_search(query: str, arm: str, exclude_domains: list[str],
     raw = _provider_json(
         "POST",
         "https://ydc-index.io/v1/search",
+        timing=timing,
         json=body,
         headers={
             "X-API-Key": os.environ["YDC_API_KEY"],
-            # POST responses are not cached at CDN/proxy layers per You.com
-            # docs, but the header documents intent and is harmless.
+            # This is a client cache directive, not a guarantee that You.com
+            # bypasses its index or extraction caches.
             "Cache-Control": "no-cache",
         },
     )
@@ -494,7 +516,9 @@ def youdotcom_search(query: str, arm: str, exclude_domains: list[str],
     web_hits = [("web", h) for h in results_obj.get("web") or []]
     news_hits = [("news", h) for h in results_obj.get("news") or []]
     results = []
+    section_positions = {"web": 0, "news": 0}
     for i, (source, res) in enumerate(_interleave(web_hits, news_hits), start=1):
+        section_positions[source] += 1
         # Highlights replace `snippets` entirely when extraction is requested.
         # News results carry no `contents` at all, so they land on description.
         contents = res.get("contents") or {}
@@ -508,13 +532,18 @@ def youdotcom_search(query: str, arm: str, exclude_domains: list[str],
             snippet = res.get("description", "") or ""
         results.append({
             "rank": i,
+            # rank is the harness's display order after interleaving. Only
+            # section_rank retains the provider's within-section ordering.
+            "section_rank": section_positions[source],
             "url": res.get("url", ""),
             "title": res.get("title") or "",
             "snippet": snippet,
             "published_date": res.get("page_age"),
-            # Which section this came from. web page_age is last-modified,
-            # news page_age is a publication timestamp -- the two are different
-            # constructs, so analysis must be able to separate them.
+            "date_semantics": (
+                "publication" if source == "news"
+                else "provider_page_age_unverified"),
+            # Preserve the section because You.com ranks web and news
+            # independently and does not expose a cross-section score.
             "source": source,
         })
     return results, raw
@@ -535,8 +564,9 @@ def _provider_request_id(raw: dict) -> str | None:
 def run_search(arm: str, query: str, exclude_domains: list[str],
                setup: dict | None = None):
     setup = setup or ydc_setup(arm)
+    timing: dict[str, float] = {}
     t0 = time.perf_counter()
-    results, raw = youdotcom_search(query, arm, exclude_domains, setup)
+    results, raw = youdotcom_search(query, arm, exclude_domains, setup, timing)
     latency = time.perf_counter() - t0
     rendered = "\n".join(
         f"[{r['rank']}] {r['title']}\n    {r['url']}\n    "
@@ -559,10 +589,16 @@ def run_search(arm: str, query: str, exclude_domains: list[str],
                   "ydc_freshness": setup["freshness"],
                   "ydc_extraction_mode": "highlights",
                   "ydc_merge_policy": YDC_MERGE_POLICY,
+                  "search_user_location": SEARCH_USER_LOCATION,
+                  "ydc_language": YDC_LANGUAGE,
+                  "ydc_safesearch": YDC_SAFESEARCH,
                   "provider_request_id": _provider_request_id(raw),
                   "raw_payload_retained": False},
         metrics={"tokens": _tok(rendered),
                  "latency_s": latency,
+                 "provider_http_latency_s": timing.get("provider_http_s", 0.0),
+                 "rate_limit_wait_s": timing.get("rate_limit_wait_s", 0.0),
+                 "retry_backoff_s": timing.get("retry_backoff_s", 0.0),
                  "search_cost_usd": search_cost_usd(arm, len(results)),
                  "n_results": len(results),
                  # Per section; both reach the agent, so n_results is their sum.
@@ -745,7 +781,7 @@ def make_task(
                 else "unknown"),
             # --- observability declarations the scorers gate on ---
             "decision_surface": outcome["decision_surface"],
-            "exclusion_enforced": outcome["exclusion_enforced"],
+            "exclusion_requested": outcome["exclusion_requested"],
             "excluded_source_domains": source_domains,
             "search_budget": MAX_SEARCHES,
             # --- per-row integrity flags ---
@@ -760,6 +796,9 @@ def make_task(
             "model_refused": outcome["refused"],
             "answer_truncated": outcome["truncated"],
             "pause_turns": outcome["pause_turns"],
+            "native_actions": outcome["native_actions"],
+            "native_emitted_queries": outcome["emitted_queries"],
+            "response_model": outcome["response_model"],
             "as_of": datetime.now(timezone.utc).isoformat(),
         })
         # Task-span metrics; Braintrust rolls these into the experiment summary.
@@ -790,6 +829,15 @@ def make_task(
             **cost_metrics,
             "latency_s": wall_clock_s,
             "used_searches": outcome["used_searches"],
+            "native_search_actions": outcome["native_search_actions"],
+            "native_tool_calls": outcome["native_tool_calls"],
+            "native_emitted_query_count": len(outcome["emitted_queries"]),
+            "native_open_page_actions": sum(
+                action.get("type") == "open_page"
+                for action in outcome["native_actions"]),
+            "native_find_actions": sum(
+                action.get("type") == "find_in_page"
+                for action in outcome["native_actions"]),
             "used_clicks": outcome["used_clicks"],
             "refused_tool_calls": (
                 outcome["refused_searches"] + outcome["refused_clicks"]),
@@ -854,9 +902,12 @@ def _blank_outcome(decision_surface: str) -> dict:
         "bad_tool_calls": 0, "search_cost": 0.0, "prompt_tokens": 0,
         "cached_prompt_tokens": 0,
         "completion_tokens": 0, "decision_surface": decision_surface,
-        "exclusion_enforced": False, "citations": [], "search_errors": [],
+        "exclusion_requested": False, "citations": [], "search_errors": [],
         "refused": False, "truncated": False, "pause_turns": 0,
         "operator_violations": [],
+        "native_actions": [], "emitted_queries": [],
+        "native_search_actions": 0, "native_tool_calls": 0,
+        "response_model": None,
     }
 
 
@@ -869,7 +920,8 @@ def _run_harness(client, spec, agent_model, system_prompt, question, excludes,
     """
     out = _blank_outcome(
         SURFACE_FULL if search_mode == SEARCH_MODE_HARNESS else SURFACE_NONE)
-    out["exclusion_enforced"] = search_mode == SEARCH_MODE_HARNESS
+    out["exclusion_requested"] = (
+        search_mode == SEARCH_MODE_HARNESS and bool(excludes))
     tools_allowed = search_mode == SEARCH_MODE_HARNESS
 
     session = make_harness_session(client, spec, agent_model, system_prompt)
@@ -883,6 +935,8 @@ def _run_harness(client, spec, agent_model, system_prompt, question, excludes,
         out_of_budget = (out["used_searches"] >= MAX_SEARCHES
                          and out["used_clicks"] >= MAX_CLICKS)
         turn = session.step(tools_enabled=tools_allowed and not out_of_budget)
+        if turn.response_model:
+            out["response_model"] = turn.response_model
         out["prompt_tokens"] += turn.prompt_tokens
         out["cached_prompt_tokens"] += turn.cached_prompt_tokens
         out["completion_tokens"] += turn.completion_tokens
@@ -998,24 +1052,32 @@ def _run_native(client, spec, agent_model, system_prompt, question,
     out.update({
         "final_answer": run.final_answer or "I could not find this.",
         "trajectory": run.trajectory,
-        "used_searches": run.n_searches,
-        # Native search enforces the budget server-side (`max_tool_calls` on
-        # OpenAI, cumulative remaining `max_uses` on Anthropic), so a per-call
-        # refusal count is not observable. budget_economy reads used_searches.
-        "search_cost": rate * run.n_searches,
+        # For native arms this is the provider-enforced budget unit. OpenAI
+        # counts every built-in tool action; Anthropic counts web searches.
+        # Separate fields retain search-action and subquery counts.
+        "used_searches": run.vendor_search_count or run.n_searches,
+        # Native tools enforce their budget server-side, so a per-call refusal
+        # count is not observable. budget_economy reads used_searches.
+        "search_cost": rate * (
+            run.billable_searches
+            if run.billable_searches is not None else run.n_searches),
         "prompt_tokens": run.prompt_tokens,
         "cached_prompt_tokens": run.cached_prompt_tokens,
         "completion_tokens": run.completion_tokens,
-        "exclusion_enforced": run.exclusion_enforced,
+        "exclusion_requested": run.exclusion_requested,
         "citations": run.citations,
         "search_errors": run.search_errors,
         "refused": run.refused,
         "truncated": run.truncated,
         "pause_turns": run.pause_turns,
+        "native_actions": run.native_actions,
+        "emitted_queries": run.emitted_queries,
+        "native_search_actions": run.n_searches,
+        "native_tool_calls": run.vendor_search_count or run.n_searches,
+        "response_model": run.response_model,
         "operator_violations": [
             {"query": query, "operators": operators}
-            for item in run.trajectory
-            if isinstance((query := item.get("query")), str)
+            for query in run.emitted_queries
             if (operators := _detect_search_operators(query))
         ],
     })
@@ -1352,7 +1414,9 @@ def run(arm: str, dataset_name: str, dataset_version: str | None,
         trials: int, judge_specs: list[str], agent_model: str, study_id: str,
         env_path: Path, search_mode: str = SEARCH_MODE_HARNESS,
         model_vendor: str = DEFAULT_MODEL_VENDOR,
-        split: str | None = None, limit: int | None = None):
+        split: str | None = None, limit: int | None = None,
+        matrix_order_seed: str | None = None,
+        matrix_order_index: int | None = None):
     api_key, project_id = load_runtime_env(env_path)
     _preflight(arm, search_mode, model_vendor, agent_model)
     spec = vendor_of(model_vendor)
@@ -1433,6 +1497,8 @@ def run(arm: str, dataset_name: str, dataset_version: str | None,
                 else None),
             "study_id": study_id,
             "condition_id": condition_id,
+            "matrix_order_seed": matrix_order_seed,
+            "matrix_order_index": matrix_order_index,
             "judge_models": [m for _, m in judges],
             "judge_mode": "single" if len(judges) == 1 else "jury",
             "dataset_name": dataset.name,
@@ -1467,23 +1533,17 @@ def run(arm: str, dataset_name: str, dataset_version: str | None,
             "serving_path": agents.serving_path(),
             "gateway_project": (
                 gateway.project if (gateway := agents.gateway_config()) else None),
-            # Whether the 5-search budget is API-enforced. Anthropic receives
-            # the remaining max_uses on every pause_turn continuation; OpenAI
-            # receives max_tool_calls on its single Responses request.
+            # Whether the five-call budget is API-enforced. Anthropic receives
+            # the remaining search max_uses on each pause_turn continuation;
+            # OpenAI receives max_tool_calls, which also covers page actions.
             "search_budget_enforced": (
                 agents.NATIVE_BUDGET_ENFORCED.get(model_vendor, False)
                 if search_mode == SEARCH_MODE_NATIVE
                 else search_mode == SEARCH_MODE_HARNESS),
-            # Publication date vs last-modified: two different constructs, and
-            # the You.com arm now carries BOTH. Its web results report
-            # last-modified page_age while its news results report a
-            # publication timestamp, so the merged surface is "mixed" and a row
-            # cannot be read as one construct — split on each result's `source`
-            # before treating a date as a publication date. Anthropic native's
-            # page_age is last-modified; OpenAI native has no date field. Prefer
-            # Corvus-QA's recency_rung as the freshness variable regardless; it
-            # is dataset ground truth about when the fact changed rather than
-            # vendor metadata. See docs/study-design.md.
+            # Provider date fields are not one construct. New results carry a
+            # per-result date_semantics label; temporal_grounding uses only
+            # explicit publication timestamps. Prefer Corvus-QA's recency_rung
+            # as dataset ground truth about when a fact changed.
             "date_field_semantics": agents.DATE_FIELD_SEMANTICS.get(
                 SEARCH_PROVIDER if search_mode == SEARCH_MODE_HARNESS
                 else f"{model_vendor}_native" if search_mode == SEARCH_MODE_NATIVE
@@ -1518,6 +1578,12 @@ def run(arm: str, dataset_name: str, dataset_version: str | None,
                 else None),
             "ydc_setup_name": (
                 arm if search_mode == SEARCH_MODE_HARNESS else None),
+            "search_user_location": (
+                SEARCH_USER_LOCATION if search_mode != SEARCH_MODE_NONE else None),
+            "ydc_language": (
+                YDC_LANGUAGE if search_mode == SEARCH_MODE_HARNESS else None),
+            "ydc_safesearch": (
+                YDC_SAFESEARCH if search_mode == SEARCH_MODE_HARNESS else None),
             "ydc_usd_per_call": (
                 YDC_USD_PER_CALL if search_mode == SEARCH_MODE_HARNESS else None),
             # --- native-arm configuration, declared so the arm is reproducible ---
@@ -1629,6 +1695,10 @@ def main():
                         "the full LiveNewsBench matrix is 14 conditions and "
                         "18,606 row executions at one trial.")
     r.add_argument("--env-file", type=Path, default=Path(".env"))
+    r.add_argument("--matrix-order-seed", default=None,
+                   help="Condition-order seed supplied by run_matrix.py.")
+    r.add_argument("--matrix-order-index", type=int, default=None,
+                   help="One-based execution position supplied by run_matrix.py.")
 
     g = sub.add_parser(
         "gateway-check",
@@ -1676,7 +1746,7 @@ def main():
     run(args.arm, args.dataset_name, args.dataset_version,
         args.trials, args.judges or [DEFAULT_JUDGE_MODEL], agent_model,
         args.study_id, args.env_file, search_mode, args.model_vendor,
-        args.split, args.limit)
+        args.split, args.limit, args.matrix_order_seed, args.matrix_order_index)
 
 
 if __name__ == "__main__":

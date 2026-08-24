@@ -182,6 +182,12 @@ class VendorRegistryTest(unittest.TestCase):
         self.assertEqual(counts["gpt-5.6-terra"], 4)
         self.assertEqual(counts["claude-opus-5"], 4)
 
+    def test_matrix_order_is_reproducible_and_seeded(self):
+        first = run_matrix.ordered_matrix("study-a")
+        self.assertEqual(first, run_matrix.ordered_matrix("study-a"))
+        self.assertNotEqual(first, run_matrix.ordered_matrix("study-b"))
+        self.assertCountEqual(first, run_matrix.MATRIX)
+
     def test_model_class_split_matches_the_matrix(self):
         self.assertEqual(agents.VENDORS["baseten"].model_class, "oss")
         self.assertEqual(agents.VENDORS["openai"].model_class, "frontier")
@@ -270,15 +276,11 @@ class VendorRegistryTest(unittest.TestCase):
         self.assertEqual(agents.ANTHROPIC_WEB_SEARCH_TOOL_TYPE,
                          "web_search_20250305")
 
-    def test_youdotcom_date_semantics_are_mixed(self):
-        # You.com now returns both web (last-modified) and news (publication
-        # timestamp) results. The merged result list carries mixed semantics,
-        # which is stronger than the previous uniform last-modified for
-        # news-intent queries. Anthropic native remains last-modified; OpenAI
-        # native has no date field.
-        self.assertEqual(agents.DATE_FIELD_SEMANTICS["youdotcom"], "mixed")
+    def test_provider_date_semantics_are_declared(self):
+        self.assertEqual(agents.DATE_FIELD_SEMANTICS["youdotcom"],
+                         "sectioned_provider_page_age")
         self.assertEqual(agents.DATE_FIELD_SEMANTICS["anthropic_native"],
-                         "last_modified")
+                         "last_updated")
         self.assertIsNone(agents.DATE_FIELD_SEMANTICS["openai_native"])
 
     def test_removed_providers_are_gone_from_every_registry(self):
@@ -416,6 +418,7 @@ class AnthropicNativeSearchTest(unittest.TestCase):
         self.assertEqual(tool["allowed_callers"], ["direct"])
         self.assertEqual(tool["blocked_domains"],
                          ["source.example", "web.archive.org"])
+        self.assertEqual(tool["user_location"], agents.SEARCH_USER_LOCATION)
 
     def test_pause_turn_receives_only_the_remaining_search_budget(self):
         first = dict(
@@ -453,13 +456,14 @@ class AnthropicNativeSearchTest(unittest.TestCase):
         self.assertEqual(client.messages.calls[0]["thinking"]["type"], "adaptive")
 
     def test_prefers_the_vendor_reported_search_count(self):
-        # A search whose results were dropped from the response still spent
-        # budget and still costs money, so trust usage over parsed blocks.
+        # A failed search still spends budget, but Anthropic documents it as
+        # unbilled. Keep attempts and billable searches separate.
         client = FakeAnthropicClient(ANTHROPIC_ERROR_RESPONSE)
         run = agents.anthropic_native_search(
             client, "claude-opus-5", "sys", "who won?", [], 5)
         self.assertEqual(run.trajectory, [])
         self.assertEqual(run.n_searches, 1)
+        self.assertEqual(run.billable_searches, 0)
 
     def test_records_search_errors_instead_of_reading_them_as_empty_results(self):
         client = FakeAnthropicClient(ANTHROPIC_ERROR_RESPONSE)
@@ -516,6 +520,37 @@ class OpenAINativeSearchTest(unittest.TestCase):
         self.assertEqual(tool["filters"]["blocked_domains"], ["source.example"])
         self.assertEqual(tool["search_context_size"],
                          agents.OPENAI_SEARCH_CONTEXT_SIZE)
+        self.assertEqual(tool["user_location"], agents.SEARCH_USER_LOCATION)
+
+    def test_separates_plural_queries_page_opens_and_find_actions(self):
+        search = dict(
+            OPENAI_RESPONSE["output"][0],
+            action={"type": "search", "queries": ["first query", "second query"],
+                    "sources": [{"type": "url", "url": "https://a.example/x"}]},
+        )
+        response = dict(
+            OPENAI_RESPONSE,
+            output=[
+                search,
+                {"type": "web_search_call", "status": "completed",
+                 "action": {"type": "open_page", "url": "https://a.example/x"}},
+                {"type": "web_search_call", "status": "completed",
+                 "action": {"type": "find_in_page", "url": "https://a.example/x",
+                            "pattern": "winner"}},
+                *OPENAI_RESPONSE["output"][1:],
+            ],
+        )
+        run = agents.openai_native_search(
+            FakeOpenAIClient(response), "gpt-5.6", "sys", "who won?", [])
+        self.assertEqual(run.n_searches, 1)
+        self.assertEqual(run.vendor_search_count, 3)
+        self.assertEqual(run.emitted_queries, ["first query", "second query"])
+        self.assertEqual([a["type"] for a in run.native_actions],
+                         ["search", "open_page", "find_in_page"])
+        self.assertEqual(run.trajectory[0]["queries"],
+                         ["first query", "second query"])
+        self.assertIsNone(run.trajectory[0]["results"][0]["rank"])
+        self.assertEqual(run.trajectory[0]["results"][0]["provider_order"], 1)
 
     def test_backfills_titles_from_citations_only(self):
         client = FakeOpenAIClient(OPENAI_RESPONSE)
@@ -622,13 +657,14 @@ class ScorerSurfaceGatingTest(unittest.TestCase):
             "Team Alpha", metadata=LNB_METADATA)
         self.assertIsNone(result["score"])
 
-    def test_temporal_grounding_still_works_on_the_anthropic_native_arm(self):
+    def test_temporal_grounding_excludes_anthropic_last_updated_dates(self):
         result = scorers.temporal_grounding(
             {}, _row_output(scorers.SURFACE_NO_SNIPPET, [
                 {"rank": 1, "url": "https://a.example/x",
-                 "published_date": "2026-07-30"}], used_searches=1),
+                 "published_date": "2026-07-30",
+                 "date_semantics": "last_updated"}], used_searches=1),
             "Team Alpha", metadata=LNB_METADATA)
-        self.assertEqual(result["score"], 1.0)
+        self.assertIsNone(result["score"])
 
     def test_snippet_scorers_return_none_rather_than_a_false_zero(self):
         output = _row_output(scorers.SURFACE_NO_SNIPPET, [
@@ -868,9 +904,9 @@ class TaskWiringTest(unittest.TestCase):
         # And the scorers actually honor it end to end.
         self.assertIsNone(
             scorers.snippet_sufficiency({}, output, "Team Alpha")["score"])
-        self.assertEqual(
+        self.assertIsNone(
             scorers.temporal_grounding({}, output, "Team Alpha",
-                                       metadata=LNB_METADATA)["score"], 1.0)
+                                       metadata=LNB_METADATA)["score"])
 
     def test_native_arm_is_not_free(self):
         # search_cost_usd used to be $0.00 on every native row, making the arm
@@ -908,9 +944,9 @@ class TaskWiringTest(unittest.TestCase):
         _, searched = self._run_task("openai", OPENAI_RESPONSE)
         self.assertFalse(searched.metadata["zero_search_row"])
 
-    def test_exclusion_is_enforced_on_the_native_arms(self):
+    def test_exclusion_request_is_recorded_on_the_native_arms(self):
         _, hooks = self._run_task("anthropic", ANTHROPIC_RESPONSE)
-        self.assertTrue(hooks.metadata["exclusion_enforced"])
+        self.assertTrue(hooks.metadata["exclusion_requested"])
         self.assertIn("source.example",
                       [d for d in hooks.metadata["excluded_source_domains"]])
 

@@ -121,7 +121,7 @@ before publication. Promotional and negotiated rates are excluded.
 |---|---|---|---:|
 | `none` | — | No search tool | $0 |
 | `harness` | `normalized` | You.com, up to 5 web + 5 news results, no freshness filter | $0.005/call |
-| `harness` | `wide` | You.com, 20 results, no freshness filter | $0.005/call |
+| `harness` | `wide` | You.com, up to 20 web + 20 news results, no freshness filter | $0.005/call |
 | `native` | — | Vendor-hosted search; 10-result target, observed-only volume | $0.010/search |
 
 Harness results expose full untruncated passages: You.com is queried with
@@ -134,8 +134,7 @@ The harness reads both result sections You.com returns, `web` and `news`, and
 interleaves them by within-section rank so news is not pinned below every web
 result. News is **additive**: the arm's result count is applied by You.com per
 section, and news results are not capped into it. Two of the three datasets are
-news benchmarks and news is the only section reporting a true publication
-timestamp, so it is on-target retrieval rather than overflow.
+news benchmarks. News is on-target retrieval rather than overflow.
 
 A news-intent query in the normalized arm therefore surfaces up to 5 web and 5
 news results, while an evergreen query surfaces up to 5 web results. That
@@ -163,9 +162,10 @@ four. The total is 14:
 | gpt-5.6-terra | Yes | Yes | Yes | Yes |
 | claude-opus-5 | Yes | Yes | Yes | Yes |
 
-The launcher interleaves models by treatment and runs one condition at a time to
-avoid provider overload. Run the matrix without long pauses because the live web
-changes during a study.
+The launcher runs one condition at a time and reproducibly randomizes condition
+order from the study ID. Pass `--order-seed` to reuse a different registered
+order. Run the matrix without long pauses because the live web changes during a
+study.
 
 Preview the full launch without spending money:
 
@@ -347,7 +347,7 @@ Search modes expose different evidence:
 |---|---|---|---|
 | `full` | Rank, URL, title, snippet, date | Harness | None |
 | `no_snippet` | Rank, URL, title, date | Anthropic native | Snippet-derived scores |
-| `urls_only` | Rank, URL, title | OpenAI native | Snippet-derived scores and temporal grounding |
+| `urls_only` | Consulted-source order, URL, partial title | OpenAI native | Snippet-derived scores, temporal grounding, and cross-provider rank metrics |
 | `none` | No search evidence | No search | All trajectory scores |
 
 An unavailable score is `None` and stays out of averages. Converting it to zero
@@ -360,8 +360,9 @@ Each row also records conditions that can invalidate or qualify an estimate:
 - `search_degraded` and `search_fully_failed`: some or all searches failed.
 - `model_refused` and `answer_truncated`: the model did not produce a usable
   answer.
-- `search_budget_enforced`: the API itself enforces the five-search cap.
-- `exclusion_enforced`: gold-source domains were blocked.
+- `search_budget_enforced`: the API enforces the five-call cap. OpenAI's unit is
+  any built-in search-tool action; Anthropic's unit is a web search.
+- `exclusion_requested`: the request carried the gold-source domain filter.
 - `sampling_pinned` and `reasoning_effort_pinned`: the provider accepted the
   requested controls.
 - `prompt_version`, `serving_path`, and `decision_surface`: the execution path
@@ -382,20 +383,22 @@ and a cost frontier when `total_cost_usd` is present.
 
 ## Limits that affect interpretation
 
-- Native and harness prompts differ by one tool-specific sentence. The runner
-  records the prompt version; no prompt-only control arm exists.
+- Native and harness prompts differ in their tool descriptions and capabilities.
+  Native OpenAI search can emit search, page-open, and find-in-page actions;
+  You.com harness agents receive search-result highlights and cannot fetch pages.
+  The runner records native action types and both prompt versions.
 - Native arms run at each vendor's retrieval ceiling, but the ceilings are not
   equal and no native API exposes a freshness filter. Harness-versus-native is a
   system comparison, not a retrieval-quality one — see
   [docs/study-design.md](docs/study-design.md#harness-versus-native).
-- Both native arms enforce the cumulative five-search budget. OpenAI uses
-  `max_tool_calls`; Anthropic reduces per-request `max_uses` across
+- Both native arms enforce a cumulative five-call budget. OpenAI's
+  `max_tool_calls` also counts page actions; Anthropic reduces search
+  `max_uses` across
   `pause_turn` continuations.
-- You.com dates are mixed: web results expose last-modified, news results
-  expose publication timestamps. Split on each result's `source` before reading
-  a date as a publication date. Anthropic exposes last-modified; OpenAI native
-  exposes no result dates. Freshness claims should use Corvus-QA `recency_rung`
-  regardless of vendor metadata.
+- You.com and Anthropic expose provider date fields with different semantics.
+  `temporal_grounding` uses You.com news dates marked as publication time and
+  excludes web `page_age` and Anthropic last-updated dates. OpenAI native exposes
+  no result dates. Freshness claims should use Corvus-QA `recency_rung`.
 - The You.com retrieval surface changed with the move to POST, highlights, and
   news results. Runs from before and after are not poolable; re-baseline.
 - Native search exposes less evidence than the harness. Compare trajectory
@@ -410,6 +413,7 @@ and a cost frontier when `total_cost_usd` is present.
   context can include an undisclosed number of billable tokens.
 - The design covers short factual QA. It does not support conclusions about
   legal, financial, or other long-form research workflows.
-- The web changes during the matrix. Manual interleaving remains required.
+- The web changes during the matrix. `run_matrix.py` randomizes the registered
+  condition order reproducibly; record the seed and avoid pauses during a run.
 
 Keep documentation edits within the rules in [FORBIDDEN.md](FORBIDDEN.md).

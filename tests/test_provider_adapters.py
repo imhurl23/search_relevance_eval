@@ -95,6 +95,12 @@ class YouComRequestShapeTest(unittest.TestCase):
         self.assertEqual(kwargs["json"]["extraction"],
                          {"extraction_mode": "highlights"})
 
+    def test_pins_location_language_and_safesearch(self):
+        (_, kwargs), _, _ = self._call("normalized")
+        self.assertEqual(kwargs["json"]["country"], "US")
+        self.assertEqual(kwargs["json"]["language"], "en")
+        self.assertEqual(kwargs["json"]["safesearch"], "moderate")
+
     def test_exclude_domains_is_a_json_array(self):
         (_, kwargs), _, _ = self._call(
             "normalized", ["source.example", "web.archive.org"])
@@ -120,27 +126,27 @@ class YouComRequestShapeTest(unittest.TestCase):
         _, results, _ = self._call("normalized")
         self.assertIn("highlight two", results[0]["snippet"])
 
-    def test_page_age_maps_to_published_date(self):
-        # For web results, page_age is last-modified. For news results, it is
-        # a publication timestamp. Both are carried through as published_date.
+    def test_page_age_is_retained_with_explicit_semantics(self):
         _, results, _ = self._call("normalized")
         self.assertEqual(results[0]["published_date"], "2026-07-29T00:00:00Z")
+        self.assertEqual(results[0]["date_semantics"],
+                         "provider_page_age_unverified")
 
     def test_news_results_are_read_alongside_web(self):
-        # results.news[] is automatically returned for news-intent queries and
-        # carries publication timestamps. It must not be discarded.
+        # results.news[] is automatically returned for news-intent queries.
         _, results, _ = self._call("normalized")
         self.assertEqual(len(results), 2)  # 1 web + 1 news
         self.assertEqual(results[1]["url"], "https://news.example/breaking")
         self.assertEqual(results[1]["published_date"], "2026-08-17T10:00:00Z")
+        self.assertEqual(results[1]["date_semantics"], "publication")
         self.assertEqual(results[1]["snippet"], "news highlight passage")
 
     def test_each_result_records_which_section_it_came_from(self):
-        # web page_age is last-modified, news page_age is a publication
-        # timestamp. Analysis cannot pool them, so the section must survive
-        # into the result dict.
+        # Sections have independent ranking and date semantics, so the section
+        # must survive into the result dict.
         _, results, _ = self._call("normalized")
         self.assertEqual([r["source"] for r in results], ["web", "news"])
+        self.assertEqual([r["section_rank"] for r in results], [1, 1])
 
     def test_sections_are_interleaved_not_concatenated(self):
         # Concatenation would pin every news result below every web result. On
@@ -169,9 +175,8 @@ class YouComRequestShapeTest(unittest.TestCase):
                          ["web", "news", "web", "web"])
 
     def test_news_is_additive_and_not_capped_into_count(self):
-        # `count` is per section. Two of the three datasets are news benchmarks
-        # and news is the only section reporting a true publication timestamp,
-        # so it is on-target retrieval; capping it would displace fresh
+        # `count` is per section. Two of the three datasets are news benchmarks,
+        # so news is on-target retrieval; capping it would displace fresh
         # coverage to hold a number. A news-intent query legitimately surfaces
         # up to 2x count.
         response = {"metadata": {}, "results": {
@@ -301,8 +306,7 @@ class YouComSetupTest(unittest.TestCase):
 
 class YouComPricingTest(unittest.TestCase):
     def test_price_is_per_call_and_independent_of_result_count(self):
-        # This is why `wide` is free: 20 results cost the same as 8, so a recall
-        # gain there carries no cost penalty.
+        # The per-section count does not change per-call price.
         self.assertEqual(run_eval.search_cost_usd("normalized", 8),
                          run_eval.search_cost_usd("wide", 20))
         self.assertEqual(run_eval.search_cost_usd("wide", 20),
