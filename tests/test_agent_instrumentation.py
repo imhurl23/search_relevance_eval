@@ -385,6 +385,7 @@ class AnthropicNativeSearchTest(unittest.TestCase):
         tool = client.messages.calls[0]["tools"][0]
         self.assertEqual(tool["type"], agents.ANTHROPIC_WEB_SEARCH_TOOL_TYPE)
         self.assertEqual(tool["max_uses"], 5)
+        self.assertEqual(tool["allowed_callers"], ["direct"])
         self.assertEqual(tool["blocked_domains"],
                          ["source.example", "web.archive.org"])
 
@@ -1337,6 +1338,108 @@ class HarnessSearchErrorTest(unittest.TestCase):
         self.assertEqual(out["search_errors"], [])
         self.assertEqual(len(out["trajectory"]), 1)
         self.assertAlmostEqual(out["search_cost"], run_eval.YDC_USD_PER_CALL)
+
+
+class SearchOperatorDetectionTest(unittest.TestCase):
+    """The harness detects search operators so the per-model violation rate is
+    auditable. The query is never altered — the raw query goes to You.com
+    unchanged. Without detection, one model emitting `site:reuters.com ...`
+    and another emitting a plain phrase is a query-construction difference
+    reading as a retrieval difference, and nothing surfaces it."""
+
+    def test_plain_query_detects_nothing(self):
+        detected = run_eval._detect_search_operators("who won the 2026 final")
+        self.assertEqual(detected, [])
+
+    def test_site_operator_is_detected(self):
+        detected = run_eval._detect_search_operators(
+            "site:reuters.com Apple CEO")
+        self.assertEqual(detected, ["site:reuters.com"])
+
+    def test_intitle_operator_with_quotes_is_detected(self):
+        detected = run_eval._detect_search_operators(
+            'intitle:"Apple CEO" Tim Cook')
+        self.assertEqual(detected, ['intitle:"Apple CEO"'])
+
+    def test_multiple_operators_are_all_detected(self):
+        detected = run_eval._detect_search_operators(
+            "site:reuters.com intitle:Apple filetype:pdf CEO")
+        self.assertEqual(len(detected), 3)
+
+    def test_operator_is_case_insensitive(self):
+        detected = run_eval._detect_search_operators("SITE:reuters.com Apple")
+        self.assertEqual(detected, ["SITE:reuters.com"])
+
+    def test_natural_language_colon_is_not_detected(self):
+        # "note: this is important" is not an operator — "note" is not in the
+        # recognized set, so it must not trigger a false positive.
+        detected = run_eval._detect_search_operators(
+            "note: this is a question about Apple")
+        self.assertEqual(detected, [])
+
+    def test_hyphenated_word_is_not_detected(self):
+        # A leading hyphen is boolean NOT in search syntax, but it is also a
+        # hyphenated word. Only operator: forms are detected, not bare -term.
+        detected = run_eval._detect_search_operators("state-of-the-art AI")
+        self.assertEqual(detected, [])
+
+
+class HarnessOperatorViolationTest(unittest.TestCase):
+    """When the agent emits operators, the harness records the violation and
+    passes the raw query through to You.com unchanged."""
+
+    def _run(self, search_side_effect, turns):
+        session = _ScriptedSession(turns)
+        original_session = run_eval.make_harness_session
+        original_search = run_eval.run_search
+        run_eval.make_harness_session = lambda *a, **k: session
+        run_eval.run_search = search_side_effect
+        self.addCleanup(setattr, run_eval, "make_harness_session",
+                        original_session)
+        self.addCleanup(setattr, run_eval, "run_search", original_search)
+        return run_eval._run_harness(
+            object(), agents.VENDORS["openai"], "gpt-5.6-sol", "sys",
+            "who won?", [], "normalized", agents.SEARCH_MODE_HARNESS)
+
+    def test_raw_query_reaches_search_unchanged(self):
+        captured = {}
+
+        def capture(arm, query, excludes, setup):
+            captured["query"] = query
+            return ([], "No results.", 2)
+
+        self._run(capture, [agents.Turn(tool_calls=[
+            _search_call("site:reuters.com who won")]),
+            agents.Turn(text="Team A.")])
+        # The search layer received the raw query, not a sanitized one.
+        self.assertEqual(captured["query"], "site:reuters.com who won")
+
+    def test_violation_is_recorded_with_query_and_operators(self):
+        out = self._run(
+            lambda *a: ([], "No results.", 2),
+            [agents.Turn(tool_calls=[
+                _search_call("site:reuters.com who won")]),
+             agents.Turn(text="Team A.")])
+        self.assertEqual(len(out["operator_violations"]), 1)
+        v = out["operator_violations"][0]
+        self.assertEqual(v["query"], "site:reuters.com who won")
+        self.assertEqual(v["operators"], ["site:reuters.com"])
+
+    def test_plain_query_produces_no_violation(self):
+        out = self._run(
+            lambda *a: ([], "No results.", 2),
+            [agents.Turn(tool_calls=[_search_call("who won")]),
+             agents.Turn(text="Team A.")])
+        self.assertEqual(out["operator_violations"], [])
+
+    def test_trajectory_records_raw_query(self):
+        out = self._run(
+            lambda *a: ([{"rank": 1, "url": "https://e.com", "title": "t",
+                          "snippet": "s", "published_date": None}], "r", 5),
+            [agents.Turn(tool_calls=[
+                _search_call("intitle:winner who won")]),
+             agents.Turn(text="Team A.")])
+        self.assertEqual(out["trajectory"][0]["query"], "intitle:winner who won")
 
 
 class HarnessProtocolRegistryTest(unittest.TestCase):

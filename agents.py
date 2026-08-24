@@ -893,13 +893,10 @@ def _parse_anthropic_content(response, run: NativeRun, texts: list[str]) -> None
 OPENAI_WEB_SEARCH_TOOL_TYPE = "web_search"
 # low | medium | high. Pinned so the retrieval depth is a declared condition
 # rather than a per-request default that can shift under us.
-# Raised to the ceiling: the harness arm passes every You.com highlight through
-# untruncated, so a mid setting here would compare You.com-at-maximum against
-# OpenAI-at-medium and read a configuration choice as a retrieval difference.
-# This is the only content-volume dial any native arm exposes — Anthropic's
-# web_search has none, max_content_tokens belonging to the barred web_fetch — so
-# that arm is already at its own ceiling and the gap between them is a stated
-# limit rather than a setting anyone forgot to raise.
+# OpenAI exposes context depth, not a result-count or web/news split. `high` is
+# the closest supported treatment to the harness arm's target surface of up to
+# 10 results per search; observed sources remain the auditable quantity because
+# the API does not guarantee a source count for this setting.
 OPENAI_SEARCH_CONTEXT_SIZE = "high"
 
 

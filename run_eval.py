@@ -145,7 +145,12 @@ MAX_SEARCHES, MAX_CLICKS = 5, 0
 # stay distinct from native rows, where the field does not apply; rows written
 # before the switch to highlights carry the integer 400 under `snippet_chars`.
 SNIPPET_TRUNCATION = "none"
-N_RESULTS = 8                          # default result count; `wide` overrides it
+# You.com applies `count` independently to its web and news sections. Five per
+# section therefore gives the registered harness/native contrast a target
+# surface of up to 10 results per search: 5 web + 5 news when both sections are
+# available. Native providers do not expose section-specific result counts, so
+# their observed surface size is recorded rather than post-hoc truncated.
+N_RESULTS = 5                          # per section; `wide` overrides it
 
 # Alternate web and news by within-section rank. The sections carry no
 # cross-comparable score, so alternating is the neutral merge; concatenating
@@ -181,8 +186,8 @@ YDC_SETUPS: dict[str, dict] = {
     # one-day filter can starve a query whose coverage lags by 48 hours.
     "fresh_week": {"count": N_RESULTS, "freshness": "week"},
     # A bigger decision surface at identical cost: You.com bills per call
-    # independent of `count`, so if 20 results beat 8 that is a free win. Tests
-    # whether the 8-result default was leaving recall on the table.
+    # independent of `count`, so if 20 results beat 5 that is a free win. Tests
+    # whether the 5-per-section baseline was leaving recall on the table.
     "wide": {"count": 20, "freshness": None},
 }
 DEFAULT_ARM = "normalized"
@@ -235,7 +240,7 @@ FROZEN_SYSTEM_PROMPT = """\
 You are a web research agent answering a time-sensitive factual question. You have one tool:
 search_web(query). You may use at most 5 searches and may not fetch result pages.
 Search results show rank, title, url, snippet, and
-published date when available. When you know the answer, stop calling tools
+published date when available. Do not use search operators (such as site:, intitle:, inurl:, intext:, filetype:, before:, after:, OR, or quoted exact-match). Write the query as a plain natural-language phrase. When you know the answer, stop calling tools
 and reply with ONLY the final answer, as concisely as possible. If you cannot
 determine the answer within budget, reply exactly: I could not find this."""
 
@@ -264,7 +269,7 @@ and reply with ONLY the final answer, as concisely as possible. If you cannot
 determine the answer within budget, reply exactly: I could not find this."""
 
 PROMPT_VERSIONS = {
-    SEARCH_MODE_HARNESS: "frozen-v2-generic-factual",
+    SEARCH_MODE_HARNESS: "frozen-v3-no-operators",
     SEARCH_MODE_NONE: "no-search-v2-parametric",
     SEARCH_MODE_NATIVE: "native-search-v1-generic-factual",
 }
@@ -288,6 +293,46 @@ YDC_USD_PER_CALL = 0.005
 
 SEARCH_PROVIDER = "youdotcom"
 SEARCH_PROVIDER_KEY = "YDC_API_KEY"
+
+
+# ---------------------------------------------------------------------------
+# Search-operator detection.
+#
+# The harness arm's queries should be plain natural language. If one model
+# emits `site:reuters.com Apple CEO` and another emits `Apple CEO`, a score
+# difference is query-construction, not retrieval quality. The prompt forbids
+# operators, but prompts are soft control — a model may still emit them.
+#
+# The harness does NOT alter the query: rewriting what the model decided to
+# send is itself an intervention, and the logged query would no longer be what
+# the model actually chose. Instead the harness detects operators, records them
+# so the per-model violation rate is auditable in the spans, and passes the
+# raw query through to You.com unchanged.
+#
+# Only the unambiguous `operator:term` forms are detected. Boolean `OR`,
+# leading `-` exclusions, and quoted exact-match are ambiguous in natural
+# language (a hyphenated word, a quoted title), so matching them would produce
+# false positives. The `operator:` forms have no natural-language reading.
+# ---------------------------------------------------------------------------
+
+_SEARCH_OPERATOR_RE = re.compile(
+    r"(?<!\w)(?:site|inurl|intitle|intext|inanchor|filetype|ext|"
+    r"allintitle|allinurl|allintext|allinanchor|related|cache|define|"
+    r"author|before|after|source|loc|location|language|num|filter|"
+    r"safe|sort|date|info|link|blogurl)"
+    r":(?:\"[^\"]*\"|\S+)",
+    re.IGNORECASE,
+)
+
+
+def _detect_search_operators(query: str) -> list[str]:
+    """Return the list of search operators (site:, intitle:, etc.) in a query.
+
+    Detection only — the query is never modified. The raw query is passed to
+    the search layer unchanged; the detected operators are logged so the
+    per-model violation rate is auditable.
+    """
+    return [m.group(0) for m in _SEARCH_OPERATOR_RE.finditer(query)]
 
 
 def search_cost_usd(arm: str, n_results: int) -> float:
@@ -694,6 +739,7 @@ def make_task(
             "search_degraded": search_degraded,
             "search_fully_failed": search_fully_failed,
             "bad_tool_calls": outcome["bad_tool_calls"],
+            "operator_violations": outcome["operator_violations"],
             "refused_searches": outcome["refused_searches"],
             "refused_clicks": outcome["refused_clicks"],
             "search_errors": search_errors,
@@ -749,6 +795,7 @@ def make_task(
             "answer_chars": len(final),
             "distinct_surfaced_domains": len(surfaced),
             "zero_search_row": int(zero_search_row),
+            "n_operator_violations": len(outcome["operator_violations"]),
             "n_search_errors": len(search_errors),
             "search_degraded": int(search_degraded),
             "search_fully_failed": int(search_fully_failed),
@@ -795,6 +842,7 @@ def _blank_outcome(decision_surface: str) -> dict:
         "completion_tokens": 0, "decision_surface": decision_surface,
         "exclusion_enforced": False, "citations": [], "search_errors": [],
         "refused": False, "truncated": False, "pause_turns": 0,
+        "operator_violations": [],
     }
 
 
@@ -849,6 +897,12 @@ def _run_harness(client, spec, agent_model, system_prompt, question, excludes,
                     # inside the turn cap.
                     out["used_searches"] += 1
                     query = call["arguments"].get("query", "")
+                    detected_ops = _detect_search_operators(query)
+                    if detected_ops:
+                        out["operator_violations"].append({
+                            "query": query,
+                            "operators": detected_ops,
+                        })
                     try:
                         results, content, tok = run_search(
                             arm, query, excludes, search_setup)
@@ -1408,11 +1462,27 @@ def run(arm: str, dataset_name: str, dataset_version: str | None,
             # What truncation the harness applied. See SNIPPET_TRUNCATION.
             "snippet_truncation": (
                 SNIPPET_TRUNCATION if search_mode == SEARCH_MODE_HARNESS else None),
-            # Requested result count for this setup. Not a global constant any
-            # more: the `wide` setup varies it, which is the point of that arm.
+            # Requested result count PER SECTION for this setup. Not a global
+            # constant: the `wide` setup varies it, which is the point of that
+            # arm. Kept under the legacy field name for older experiment joins.
             "n_results": (
                 ydc_setup(arm)["count"] if search_mode == SEARCH_MODE_HARNESS
                 else None),
+            # Registered native-vs-harness target: the normalized You.com arm
+            # enforces a maximum of 5 results in each of two sections. Native
+            # APIs expose neither that split nor an exact source-count control,
+            # so 10 is a declared target there and observed trajectory volume is
+            # the measurement. Never truncate native results after the model has
+            # already seen them; that would change metrics, not treatment.
+            "result_count_target_per_search": (
+                2 * ydc_setup(arm)["count"]
+                if search_mode == SEARCH_MODE_HARNESS
+                else 2 * N_RESULTS if search_mode == SEARCH_MODE_NATIVE
+                else None),
+            "result_count_control": (
+                "per_section_max" if search_mode == SEARCH_MODE_HARNESS
+                else "unavailable_observed_only"
+                if search_mode == SEARCH_MODE_NATIVE else None),
             "youdotcom_freshness": (
                 experiment_ydc_setup(arm, dataset.name)["freshness"]
                 if search_mode == SEARCH_MODE_HARNESS

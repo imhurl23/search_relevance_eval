@@ -161,19 +161,26 @@ spend for total cost.
 
 ## Harness versus native
 
-Native arms run at the most retrieval each vendor exposes: OpenAI at
-`search_context_size: "high"`, Anthropic at `max_uses` parity with dynamic
-filtering pinned off (`allowed_callers: ["direct"]`). Anthropic's `web_search`
-exposes no content-volume parameter at all, so the arms are each at their own
-ceiling rather than at a common one.
+The registered harness/native contrast targets up to 10 surfaced results per
+search. You.com enforces that target as up to 5 web plus 5 news results by
+applying `count: 5` independently to each section.
+
+Native APIs cannot enforce the same split or an exact source count. OpenAI uses
+`search_context_size: "high"`, its closest supported evidence-volume setting;
+Anthropic runs at `max_uses` parity with dynamic filtering pinned off
+(`allowed_callers: ["direct"]`) and exposes no content-volume parameter. Native
+source volume is therefore observed and reported, not post-hoc truncated or
+described as exact 5+5 parity. The shared target is recorded as
+`result_count_target_per_search: 10`, alongside
+`result_count_control: "unavailable_observed_only"` on native runs.
 
 Three differences cannot be closed, and they bound what this contrast can claim:
 
 - **Freshness has no native equivalent.** No native API exposes a freshness
   control, so that treatment axis is harness-only and freshness effects never
   cross the harness/native boundary.
-- **Evidence volume is not equal and only partly observable.** The harness
-  surface is ours and counted exactly; native search content arrives inside
+- **Evidence volume is targeted, not enforced, on native arms.** The harness
+  requests up to 5 web and 5 news results; native search content arrives inside
   `prompt_tokens` and can only be isolated by differencing the same model's
   `no_search` arm.
 - **Only the harness arm can ask for an uncached result.** Freshness is the
@@ -190,6 +197,8 @@ another. Within-arm contrasts carry no such limit.
   contrast.
 - Interleave conditions in time.
 - Report gold-domain availability and `exclusion_enforced` by arm.
+- Report observed results per search against `result_count_target_per_search`;
+  only the harness enforces the 5-web/5-news section maxima.
 - Report `search_budget_enforced`; OpenAI native search lacks an API-level cap.
 - Treat Anthropic dates as last-modified timestamps. You.com dates are mixed:
   web results are last-modified, news results are publication timestamps. Split
