@@ -1091,7 +1091,12 @@ def _run_native(client, spec, agent_model, system_prompt, question,
 # temporal_grounding. Do not reintroduce it.
 # ---------------------------------------------------------------------------
 
-def select_rows(dataset, split: str | None, limit: int | None):
+def select_rows(
+    dataset,
+    split: str | None,
+    limit: int | None,
+    count_full: bool = False,
+):
     """Deterministically subset a dataset, and fingerprint what was selected.
 
     Pilots and cost-bounded runs need a subset, but a subset is only usable if
@@ -1104,11 +1109,12 @@ def select_rows(dataset, split: str | None, limit: int | None):
     hash of the selected ids: two runs claiming to be comparable must show the
     same value, which makes a pairing mistake checkable instead of assumed.
     """
-    if split is None and limit is None:
+    if split is None and limit is None and not count_full:
         return dataset, {"subset_applied": False, "split": None,
                          "limit": None, "n_rows": None, "n_available": None,
                          "subset_id": None}
 
+    full_dataset = split is None and limit is None
     rows = list(dataset)
     n_available = len(rows)
     if split is not None:
@@ -1122,8 +1128,12 @@ def select_rows(dataset, split: str | None, limit: int | None):
     if limit is not None:
         rows = rows[:limit]
     ids = [str(r.get("id", "")) for r in rows]
-    return rows, {
-        "subset_applied": True,
+    # A Braintrust Dataset is re-iterable. Keep passing the original object on
+    # full runs so Eval retains dataset-origin linkage; the materialized copy is
+    # used only to count and fingerprint the pinned contents.
+    selected_data = dataset if full_dataset else rows
+    return selected_data, {
+        "subset_applied": split is not None or limit is not None,
         "split": split,
         "limit": limit,
         "n_rows": len(rows),
@@ -1422,6 +1432,30 @@ def _eval_error_summary(eval_result) -> tuple[int, int, float]:
     return failed, total, failed / total if total else 1.0
 
 
+def _enforce_eval_result_gate(
+    eval_result,
+    expected_results: int | None,
+    max_row_error_rate: float,
+) -> tuple[int, int, float]:
+    """Reject incomplete conditions and rows with task or scorer failures."""
+    failed, total, error_rate = _eval_error_summary(eval_result)
+    print(
+        f"Error gate: {failed}/{total} rows "
+        f"({error_rate:.2%}); allowed {max_row_error_rate:.2%}"
+    )
+    if expected_results is not None and total != expected_results:
+        raise SystemExit(
+            f"condition returned {total} evaluation results; "
+            f"expected {expected_results}"
+        )
+    if error_rate > max_row_error_rate:
+        raise SystemExit(
+            f"condition failed row-error gate: {error_rate:.2%} > "
+            f"{max_row_error_rate:.2%}"
+        )
+    return failed, total, error_rate
+
+
 def _write_completion_marker(path: Path, experiment_name: str) -> None:
     """Atomically mark a condition complete after its error gate passes."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1459,7 +1493,12 @@ def run(arm: str, dataset_name: str, dataset_version: str | None,
     print(f"Dataset: {project_name}/{dataset.name} @ version {resolved_version}"
           f"{'' if dataset_version else '  (latest; pass --dataset-version to pin)'}")
 
-    data, subset = select_rows(dataset, split, limit)
+    # Matrix launches always provide expected_rows. Materialize an unlimited
+    # pinned dataset in that case so the pre-launch count guard is real rather
+    # than comparing the expected count with the lazy-path sentinel (None).
+    data, subset = select_rows(
+        dataset, split, limit, count_full=expected_rows is not None
+    )
     if expected_rows is not None and subset["n_rows"] != expected_rows:
         raise SystemExit(
             f"row-count guard failed: selected {subset['n_rows']} rows, "
@@ -1680,16 +1719,12 @@ def run(arm: str, dataset_name: str, dataset_version: str | None,
                 if dataset.name == RETRIEVALQA_DATASET_NAME else "identity-v1"),
         },
     )
-    n_failed_rows, n_rows_run, error_rate = _eval_error_summary(eval_result)
-    print(
-        f"Error gate: {n_failed_rows}/{n_rows_run} rows "
-        f"({error_rate:.2%}); allowed {max_row_error_rate:.2%}"
+    expected_results = (
+        subset["n_rows"] * trials if subset["n_rows"] is not None else None
     )
-    if error_rate > max_row_error_rate:
-        raise SystemExit(
-            f"condition failed row-error gate: {error_rate:.2%} > "
-            f"{max_row_error_rate:.2%}"
-        )
+    _enforce_eval_result_gate(
+        eval_result, expected_results, max_row_error_rate
+    )
     if completion_marker is not None:
         _write_completion_marker(completion_marker, experiment_name)
     return eval_result

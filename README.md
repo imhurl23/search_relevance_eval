@@ -209,6 +209,9 @@ timestamps, and exit codes.
 - A repeated study ID refuses to launch unless `--resume` is present.
 - A process lock rejects concurrent launchers for the same checkpoint.
 - `--resume` verifies the complete plan and skips completed conditions.
+- A condition left in `running` state fails closed because its orphaned child
+  may still be active. After confirming that process is dead, resume with
+  `--retry-running`; a late completion marker is reconciled automatically.
 - A failed condition gets one retry by default. Retries use a new Braintrust
   experiment ending in `-retry-02`, so partial and complete denominators do not
   mix.

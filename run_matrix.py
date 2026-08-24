@@ -275,6 +275,13 @@ def _run_conditions(
         if state["status"] == "completed":
             print(f"[{index:02d}/{len(conditions)}] SKIP completed {condition.label}")
             continue
+        if state["status"] == "running" and not args.retry_running:
+            raise SystemExit(
+                f"{condition.label} was still marked running when the launcher "
+                "stopped. Its child process may still be active. Wait and resume "
+                "again so its completion marker can be reconciled, or pass "
+                "--retry-running only after confirming the prior process is dead."
+            )
         attempts_used = len(state["attempts"])
         if attempts_used >= max_attempts:
             print(
@@ -372,6 +379,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--checkpoint", type=Path)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument(
+        "--retry-running", action="store_true",
+        help="Retry a checkpoint attempt left in 'running' state after first confirming its child process is dead.",
+    )
+    parser.add_argument(
         "--condition-retries", type=int, default=1,
         help="Additional attempts for a failed or timed-out condition.",
     )
@@ -415,6 +426,8 @@ def main() -> int:
         raise SystemExit("--limit and --expected-rows must match when both are set")
     if args.condition_retries < 0:
         raise SystemExit("--condition-retries cannot be negative")
+    if args.retry_running and not args.resume:
+        raise SystemExit("--retry-running requires --resume")
     if args.condition_timeout_s <= 60:
         raise SystemExit("--condition-timeout-s must be greater than 60")
     if args.max_concurrency < 1:

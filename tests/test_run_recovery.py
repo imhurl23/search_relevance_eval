@@ -24,6 +24,7 @@ def _args(**overrides):
         "order_seed": "fixed-order",
         "checkpoint": None,
         "resume": False,
+        "retry_running": False,
         "condition_retries": 0,
         "condition_timeout_s": 600,
         "max_concurrency": 8,
@@ -145,6 +146,9 @@ class MatrixCheckpointTest(unittest.TestCase):
                         self.fail("second launcher acquired the same checkpoint")
 
     def test_completion_marker_closes_parent_crash_window(self):
+        class ParentCrash(BaseException):
+            pass
+
         with TemporaryDirectory() as directory:
             checkpoint = Path(directory) / "checkpoint.json"
             one_condition = self.conditions[:1]
@@ -152,9 +156,9 @@ class MatrixCheckpointTest(unittest.TestCase):
             def child_finishes_then_parent_is_interrupted(command, **kwargs):
                 marker = Path(command[command.index("--completion-marker") + 1])
                 run_eval._write_completion_marker(marker, "completed-experiment")
-                raise KeyboardInterrupt
+                raise ParentCrash
 
-            with self.assertRaises(KeyboardInterrupt):
+            with self.assertRaises(ParentCrash):
                 run_matrix._run_conditions(
                     _args(), one_condition, checkpoint,
                     run_command=child_finishes_then_parent_is_interrupted,
@@ -174,6 +178,35 @@ class MatrixCheckpointTest(unittest.TestCase):
             state = saved["conditions"][one_condition[0].label]
             self.assertEqual(state["status"], "completed")
             self.assertTrue(state["reconciled_from_marker"])
+
+    def test_running_attempt_requires_explicit_retry_confirmation(self):
+        class HardCrash(BaseException):
+            pass
+
+        with TemporaryDirectory() as directory:
+            checkpoint = Path(directory) / "checkpoint.json"
+            one_condition = self.conditions[:1]
+            with self.assertRaises(HardCrash):
+                run_matrix._run_conditions(
+                    _args(), one_condition, checkpoint,
+                    run_command=lambda *a, **k: (_ for _ in ()).throw(HardCrash()),
+                )
+
+            with self.assertRaisesRegex(SystemExit, "may still be active"):
+                run_matrix._run_conditions(
+                    _args(resume=True), one_condition, checkpoint,
+                    run_command=lambda *a, **k: types.SimpleNamespace(returncode=0),
+                )
+
+            self.assertEqual(
+                run_matrix._run_conditions(
+                    _args(resume=True, retry_running=True, condition_retries=1),
+                    one_condition,
+                    checkpoint,
+                    run_command=lambda *a, **k: types.SimpleNamespace(returncode=0),
+                ),
+                0,
+            )
 
     def test_search_cost_ceiling_includes_all_attempts(self):
         once = run_matrix._max_search_cost_usd(
@@ -204,6 +237,15 @@ class EvalErrorGateTest(unittest.TestCase):
             types.SimpleNamespace(results=[])
         )
         self.assertEqual((failed, total, rate), (0, 0, 1.0))
+
+    def test_result_gate_rejects_partial_condition(self):
+        results = [types.SimpleNamespace(error=None, metadata={})]
+        with self.assertRaisesRegex(SystemExit, "expected 2"):
+            run_eval._enforce_eval_result_gate(
+                types.SimpleNamespace(results=results),
+                expected_results=2,
+                max_row_error_rate=0.0,
+            )
 
     def test_completion_marker_is_written_after_success(self):
         with TemporaryDirectory() as directory:
