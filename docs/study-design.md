@@ -260,5 +260,11 @@ changes the visible tool contract and the provider's hidden search orchestration
 
 OpenAI Terra and the Anthropic native-search adapter passed live checks on
 August 14, 2026, using Opus. Sonnet 5 replaced Opus in the registered matrix on
-August 24, 2026 and requires a fresh pilot before the full run. Both Baseten
-model routes passed live checks on August 14, 2026.
+August 24, 2026. The five-row-per-condition pilot
+`sonnet-parity-pilot-2026-08-24-v2` then completed all 14 conditions on commit
+`0b35de6`: 70/70 rows, zero task/scorer/search errors, no retries, and observable
+native search actions from both frontier vendors. The audit recorded five
+quoted-query operator violations and two zero-search Sonnet harness rows; retain
+those registered observability fields in the analysis rather than silently
+rewriting or dropping the model decisions. Both Baseten model routes passed live
+checks on August 14, 2026.
