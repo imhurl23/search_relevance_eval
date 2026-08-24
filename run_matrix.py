@@ -13,9 +13,11 @@ import json
 import os
 import random
 import re
+import signal
 import shlex
 import subprocess
 import sys
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -23,13 +25,21 @@ from pathlib import Path
 
 from agents import MATRIX_MODELS, native_search_rate_usd
 from import_livenewsbench import DATASET_NAME
-from run_eval import MAX_SEARCHES, YDC_USD_PER_CALL
+from run_eval import (
+    DEFAULT_YDC_REQUESTS_PER_SECOND,
+    MAX_SEARCHES,
+    MAX_YDC_REQUESTS_PER_SECOND,
+    YDC_USD_PER_CALL,
+)
 
 
 CHECKPOINT_SCHEMA_VERSION = 1
 DEFAULT_MAX_ROW_EXECUTIONS = 40_000
 YDC_MAX_SEARCH_COST_PER_ROW = MAX_SEARCHES * YDC_USD_PER_CALL
 DEFAULT_CONDITION_TIMEOUT_S = 4 * 60 * 60
+DEFAULT_CONDITION_CONCURRENCY = 2
+MAX_SAFE_CONDITION_CONCURRENCY = 2
+CONDITION_SCHEDULE_POLICY = "one-harness-distinct-vendors-v1"
 
 
 @dataclass(frozen=True)
@@ -107,6 +117,9 @@ def condition_command(
         "--eval-timeout-s", str(args.condition_timeout_s - 60),
         "--max-row-error-rate", str(args.max_row_error_rate),
         "--max-concurrency", str(args.max_concurrency),
+        "--matrix-condition-concurrency", str(args.condition_concurrency),
+        "--matrix-schedule-policy", CONDITION_SCHEDULE_POLICY,
+        "--ydc-requests-per-second", str(args.ydc_requests_per_second),
     ]
     if condition.arm:
         command.extend(["--arm", condition.arm])
@@ -162,6 +175,9 @@ def _plan_fingerprint(args, conditions: tuple[MatrixCondition, ...]) -> dict:
         "env_file": str(args.env_file.resolve()),
         "env_file_sha256": hashlib.sha256(args.env_file.read_bytes()).hexdigest(),
         "max_concurrency": args.max_concurrency,
+        "condition_concurrency": args.condition_concurrency,
+        "condition_schedule_policy": CONDITION_SCHEDULE_POLICY,
+        "ydc_requests_per_second": args.ydc_requests_per_second,
         "max_row_error_rate": args.max_row_error_rate,
         "condition_timeout_s": args.condition_timeout_s,
     }
@@ -359,6 +375,278 @@ def _run_conditions(
     return 0
 
 
+@dataclass
+class _ActiveCondition:
+    index: int
+    condition: MatrixCondition
+    process: subprocess.Popen
+    attempt_record: dict
+    deadline: float
+
+
+def _condition_can_start(
+    candidate: MatrixCondition,
+    active: tuple[MatrixCondition, ...],
+) -> bool:
+    """Keep parallel work on independent provider and retrieval surfaces."""
+    if any(candidate.vendor == running.vendor for running in active):
+        return False
+    if candidate.search_mode == "harness" and any(
+        running.search_mode == "harness" for running in active
+    ):
+        return False
+    return True
+
+
+def _next_parallel_condition(
+    conditions: tuple[MatrixCondition, ...],
+    checkpoint: dict,
+    active: dict[str, _ActiveCondition],
+    max_attempts: int,
+) -> tuple[int, MatrixCondition] | None:
+    running = tuple(item.condition for item in active.values())
+    eligible = []
+    for index, condition in enumerate(conditions, start=1):
+        state = checkpoint["conditions"][condition.label]
+        if condition.label in active or state["status"] == "completed":
+            continue
+        if len(state["attempts"]) >= max_attempts:
+            continue
+        if _condition_can_start(condition, running):
+            eligible.append((index, condition))
+    if not eligible:
+        return None
+
+    # Keep the single You.com lane occupied. Once a harness condition is active,
+    # the second slot may only run native/no-search work. Relative order within
+    # each class remains the registered randomized matrix order.
+    if not any(item.search_mode == "harness" for item in running):
+        for item in eligible:
+            if item[1].search_mode == "harness":
+                return item
+    return eligible[0]
+
+
+def _signal_process_group(process: subprocess.Popen, sig: int) -> None:
+    try:
+        os.killpg(process.pid, sig)
+    except (AttributeError, OSError, ProcessLookupError):
+        try:
+            process.send_signal(sig)
+        except (AttributeError, OSError, ProcessLookupError):
+            pass
+
+
+def _stop_process(process: subprocess.Popen, sig: int, grace_s: float = 10.0) -> None:
+    _signal_process_group(process, sig)
+    deadline = time.monotonic() + grace_s
+    while process.poll() is None and time.monotonic() < deadline:
+        time.sleep(0.05)
+    if process.poll() is None:
+        _signal_process_group(process, signal.SIGKILL)
+        try:
+            process.wait(timeout=2)
+        except (AttributeError, subprocess.TimeoutExpired):
+            pass
+
+
+def _reconcile_parallel_checkpoint(
+    args,
+    conditions: tuple[MatrixCondition, ...],
+    checkpoint: dict,
+    checkpoint_path: Path,
+) -> None:
+    changed = False
+    for condition in conditions:
+        state = checkpoint["conditions"][condition.label]
+        for prior_attempt in reversed(state["attempts"]):
+            marker = prior_attempt.get("completion_marker")
+            if marker and Path(marker).is_file():
+                state["status"] = "completed"
+                state["completed_at"] = (
+                    prior_attempt.get("finished_at") or _utc_now()
+                )
+                state["reconciled_from_marker"] = True
+                changed = True
+                break
+        if state["status"] == "running":
+            if not args.retry_running:
+                raise SystemExit(
+                    f"{condition.label} was still marked running when the launcher "
+                    "stopped. Its child process may still be active. Wait and resume "
+                    "again so its completion marker can be reconciled, or pass "
+                    "--retry-running only after confirming the prior process is dead."
+                )
+            prior_attempt = state["attempts"][-1]
+            prior_attempt.setdefault("finished_at", _utc_now())
+            prior_attempt.setdefault("returncode", 130)
+            prior_attempt.setdefault(
+                "failure", "abandoned running attempt confirmed dead on resume"
+            )
+            state["status"] = "interrupted"
+            changed = True
+    if changed:
+        _write_checkpoint(checkpoint_path, checkpoint)
+
+
+def _run_conditions_parallel(
+    args,
+    conditions: tuple[MatrixCondition, ...],
+    checkpoint_path: Path,
+    popen_factory=subprocess.Popen,
+) -> int:
+    """Run a bounded, provider-aware schedule with one checkpoint owner."""
+    checkpoint = _load_or_create_checkpoint(checkpoint_path, args, conditions)
+    _reconcile_parallel_checkpoint(args, conditions, checkpoint, checkpoint_path)
+    max_attempts = 1 + args.condition_retries
+    active: dict[str, _ActiveCondition] = {}
+    exhausted_failure = False
+
+    try:
+        while True:
+            now = time.monotonic()
+            for label, item in list(active.items()):
+                returncode = item.process.poll()
+                failure = None
+                if returncode is None and now >= item.deadline:
+                    _stop_process(item.process, signal.SIGTERM)
+                    returncode = 124
+                    failure = (
+                        f"condition exceeded {args.condition_timeout_s}s timeout"
+                    )
+                if returncode is None:
+                    continue
+
+                item.attempt_record.update({
+                    "finished_at": _utc_now(),
+                    "returncode": returncode,
+                    "failure": failure,
+                })
+                state = checkpoint["conditions"][label]
+                if returncode == 0:
+                    state["status"] = "completed"
+                    state["completed_at"] = _utc_now()
+                    print(
+                        f"[{item.index:02d}/{len(conditions)}] COMPLETE {label}",
+                        flush=True,
+                    )
+                else:
+                    state["status"] = "failed"
+                    print(
+                        f"[{item.index:02d}/{len(conditions)}] {label} "
+                        f"attempt failed with exit code {returncode}",
+                        flush=True,
+                    )
+                    if len(state["attempts"]) >= max_attempts:
+                        exhausted_failure = True
+                del active[label]
+                _write_checkpoint(checkpoint_path, checkpoint)
+
+            if exhausted_failure:
+                if not active:
+                    print("Stopped after failed condition. Resume with: --resume")
+                    return 1
+            else:
+                while len(active) < args.condition_concurrency:
+                    selected = _next_parallel_condition(
+                        conditions, checkpoint, active, max_attempts
+                    )
+                    if selected is None:
+                        break
+                    index, condition = selected
+                    state = checkpoint["conditions"][condition.label]
+                    attempt = len(state["attempts"]) + 1
+                    condition_hash = hashlib.sha256(
+                        condition.label.encode("utf-8")
+                    ).hexdigest()[:12]
+                    completion_marker = (
+                        checkpoint_path.parent / ".attempt-markers" /
+                        f"{checkpoint_path.stem}-{condition_hash}-{attempt:02d}.done"
+                    )
+                    command = condition_command(
+                        condition, args, index, attempt, completion_marker
+                    )
+                    attempt_record = {
+                        "attempt": attempt,
+                        "started_at": _utc_now(),
+                        "command": command,
+                        "completion_marker": str(completion_marker),
+                    }
+                    state["status"] = "running"
+                    state["attempts"].append(attempt_record)
+                    _write_checkpoint(checkpoint_path, checkpoint)
+                    print(
+                        f"[{index:02d}/{len(conditions)}] {condition.label} "
+                        f"attempt {attempt}/{max_attempts}",
+                        flush=True,
+                    )
+                    print(f"  {shlex.join(command)}", flush=True)
+                    try:
+                        process = popen_factory(command, start_new_session=True)
+                    except OSError as exc:
+                        attempt_record.update({
+                            "finished_at": _utc_now(),
+                            "returncode": 126,
+                            "failure": f"{type(exc).__name__}: {exc}",
+                        })
+                        state["status"] = "failed"
+                        _write_checkpoint(checkpoint_path, checkpoint)
+                        if len(state["attempts"]) >= max_attempts:
+                            exhausted_failure = True
+                            break
+                        continue
+                    active[condition.label] = _ActiveCondition(
+                        index=index,
+                        condition=condition,
+                        process=process,
+                        attempt_record=attempt_record,
+                        deadline=time.monotonic() + args.condition_timeout_s,
+                    )
+
+            if all(
+                checkpoint["conditions"][condition.label]["status"] == "completed"
+                for condition in conditions
+            ):
+                checkpoint["status"] = "completed"
+                checkpoint["completed_at"] = _utc_now()
+                _write_checkpoint(checkpoint_path, checkpoint)
+                return 0
+            if not active and not exhausted_failure:
+                # Nothing can run only when every incomplete condition has used
+                # all allowed attempts. Fail closed rather than spinning.
+                return 1
+            time.sleep(0.1)
+    except KeyboardInterrupt:
+        for item in active.values():
+            _signal_process_group(item.process, signal.SIGINT)
+        deadline = time.monotonic() + 10.0
+        while (any(item.process.poll() is None for item in active.values())
+               and time.monotonic() < deadline):
+            time.sleep(0.05)
+        for label, item in active.items():
+            if item.process.poll() is None:
+                _stop_process(item.process, signal.SIGTERM, grace_s=2.0)
+            marker = item.attempt_record.get("completion_marker")
+            state = checkpoint["conditions"][label]
+            if marker and Path(marker).is_file():
+                state["status"] = "completed"
+                state["completed_at"] = _utc_now()
+                state["reconciled_from_marker"] = True
+                failure = None
+                returncode = item.process.poll() or 0
+            else:
+                state["status"] = "interrupted"
+                failure = "interrupted"
+                returncode = 130
+            item.attempt_record.update({
+                "finished_at": _utc_now(),
+                "returncode": returncode,
+                "failure": failure,
+            })
+        _write_checkpoint(checkpoint_path, checkpoint)
+        raise
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset-name", default=DATASET_NAME)
@@ -390,6 +678,21 @@ def build_parser() -> argparse.ArgumentParser:
         "--condition-timeout-s", type=int, default=DEFAULT_CONDITION_TIMEOUT_S,
     )
     parser.add_argument("--max-concurrency", type=int, default=8)
+    parser.add_argument(
+        "--ydc-requests-per-second", type=float,
+        default=DEFAULT_YDC_REQUESTS_PER_SECOND,
+        help="Shared You.com request rate across local processes (default: 1; "
+             f"hard cap: {MAX_YDC_REQUESTS_PER_SECOND:g}).",
+    )
+    parser.add_argument(
+        "--condition-concurrency", type=int,
+        default=DEFAULT_CONDITION_CONCURRENCY,
+        choices=range(1, MAX_SAFE_CONDITION_CONCURRENCY + 1),
+        help=(
+            "Concurrent matrix conditions. Two uses the safe scheduler: at most "
+            "one harness arm and one condition per vendor at a time."
+        ),
+    )
     parser.add_argument(
         "--max-row-error-rate", type=float, default=0.0,
         help="A condition exits nonzero when its task/scorer error rate exceeds this.",
@@ -432,6 +735,11 @@ def main() -> int:
         raise SystemExit("--condition-timeout-s must be greater than 60")
     if args.max_concurrency < 1:
         raise SystemExit("--max-concurrency must be at least 1")
+    if not 0 < args.ydc_requests_per_second <= MAX_YDC_REQUESTS_PER_SECOND:
+        raise SystemExit(
+            "--ydc-requests-per-second must be greater than zero and no more "
+            f"than {MAX_YDC_REQUESTS_PER_SECOND:g}"
+        )
     if not 0 <= args.max_row_error_rate <= 1:
         raise SystemExit("--max-row-error-rate must be between 0 and 1")
 
@@ -477,7 +785,9 @@ def main() -> int:
     print(
         f"Matrix: {len(conditions)} conditions | dataset={args.dataset_name} "
         f"| trials={args.trials} | study={args.study_id} "
-        f"| order_seed={order_seed}"
+        f"| order_seed={order_seed} | condition_concurrency="
+        f"{args.condition_concurrency} | ydc_rps={args.ydc_requests_per_second:g} "
+        f"| schedule={CONDITION_SCHEDULE_POLICY}"
     )
     if nominal_row_executions is not None:
         print(
@@ -497,6 +807,8 @@ def main() -> int:
     checkpoint_path = _checkpoint_path(args)
     print(f"Checkpoint: {checkpoint_path}")
     with _checkpoint_lock(checkpoint_path):
+        if args.condition_concurrency > 1:
+            return _run_conditions_parallel(args, conditions, checkpoint_path)
         return _run_conditions(args, conditions, checkpoint_path)
 
 

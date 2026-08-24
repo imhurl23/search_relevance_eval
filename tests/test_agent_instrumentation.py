@@ -1558,7 +1558,7 @@ class HarnessOperatorViolationTest(unittest.TestCase):
     def test_raw_query_reaches_search_unchanged(self):
         captured = {}
 
-        def capture(arm, query, excludes, setup):
+        def capture(arm, query, excludes, setup, requests_per_second=1.0):
             captured["query"] = query
             return ([], "No results.", 2)
 

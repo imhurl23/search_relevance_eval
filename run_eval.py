@@ -64,9 +64,11 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import math
 import os
 import re
 import subprocess
+import sys
 import time
 from datetime import date, datetime, timedelta, timezone
 from itertools import zip_longest
@@ -413,21 +415,40 @@ _http = httpx.Client(
     headers={"user-agent": "CorvusEval/0.1"},
 )
 _provider_limiters: dict[str, SharedHostLimiter] = {}
+DEFAULT_YDC_REQUESTS_PER_SECOND = 1.0
+MAX_YDC_REQUESTS_PER_SECOND = 10.0
 
 
-def _provider_json(method: str, url: str, *, timing: dict | None = None, **kwargs):
-    """Conservative serial provider request with bounded retry/backoff."""
+def _provider_json(method: str, url: str, *, timing: dict | None = None,
+                   requests_per_second: float = DEFAULT_YDC_REQUESTS_PER_SECOND,
+                   **kwargs):
+    """Rate-limited provider request with bounded retry/backoff."""
     host = (urlparse(url).hostname or "").lower()
     approved_hosts = {"ydc-index.io"}
     if host not in approved_hosts:
         raise ValueError(f"unapproved provider API host: {host!r}")
-    limiter = _provider_limiters.setdefault(
-        host, SharedHostLimiter(f"provider-{host}", 1.0)
-    )
+    if not 0 < requests_per_second <= MAX_YDC_REQUESTS_PER_SECOND:
+        raise ValueError(
+            "requests_per_second must be greater than zero and no more than "
+            f"{MAX_YDC_REQUESTS_PER_SECOND:g}"
+        )
+    interval = 1.0 / requests_per_second
+    limiter = _provider_limiters.get(host)
+    if limiter is None:
+        limiter = SharedHostLimiter(f"provider-{host}", interval)
+        _provider_limiters[host] = limiter
+    elif not math.isclose(limiter.interval, interval):
+        raise ValueError(
+            f"conflicting request rates configured for {host}: "
+            f"existing={1.0 / limiter.interval:g}/s, "
+            f"requested={requests_per_second:g}/s"
+        )
     timing = timing if timing is not None else {}
     timing.setdefault("rate_limit_wait_s", 0.0)
     timing.setdefault("provider_http_s", 0.0)
     timing.setdefault("retry_backoff_s", 0.0)
+    timing.setdefault("provider_retry_count", 0)
+    timing.setdefault("provider_429_count", 0)
     for attempt in range(5):
         wait_started = time.perf_counter()
         limiter.wait()
@@ -447,9 +468,17 @@ def _provider_json(method: str, url: str, *, timing: dict | None = None, **kwarg
             return value
         if attempt == 4:
             response.raise_for_status()
+        timing["provider_retry_count"] += 1
+        if response.status_code == 429:
+            timing["provider_429_count"] += 1
         delay = max(retry_after_seconds(response.headers.get("Retry-After")),
                     min(60.0, 5.0 * (2 ** attempt)))
         timing["retry_backoff_s"] += delay
+        print(
+            f"Provider {host} returned HTTP {response.status_code}; "
+            f"retrying in {delay:g}s (attempt {attempt + 1}/5).",
+            file=sys.stderr,
+        )
         time.sleep(delay)
     raise AssertionError("unreachable")
 
@@ -468,7 +497,8 @@ def _interleave(web: list, news: list) -> list:
 
 
 def youdotcom_search(query: str, arm: str, exclude_domains: list[str],
-                     setup: dict | None = None, timing: dict | None = None):
+                     setup: dict | None = None, timing: dict | None = None,
+                     requests_per_second: float = DEFAULT_YDC_REQUESTS_PER_SECOND):
     # POST https://ydc-index.io/v1/search — POST is the documented path for
     # new features. extraction_mode: "highlights" returns query-aware passages
     # purpose-built for agent grounding, and is only available on POST. GET
@@ -498,6 +528,7 @@ def youdotcom_search(query: str, arm: str, exclude_domains: list[str],
         "POST",
         "https://ydc-index.io/v1/search",
         timing=timing,
+        requests_per_second=requests_per_second,
         json=body,
         headers={
             "X-API-Key": os.environ["YDC_API_KEY"],
@@ -562,11 +593,14 @@ def _provider_request_id(raw: dict) -> str | None:
 
 @traced(type="tool", name="search_web", notrace_io=True)
 def run_search(arm: str, query: str, exclude_domains: list[str],
-               setup: dict | None = None):
+               setup: dict | None = None,
+               requests_per_second: float = DEFAULT_YDC_REQUESTS_PER_SECOND):
     setup = setup or ydc_setup(arm)
     timing: dict[str, float] = {}
     t0 = time.perf_counter()
-    results, raw = youdotcom_search(query, arm, exclude_domains, setup, timing)
+    results, raw = youdotcom_search(
+        query, arm, exclude_domains, setup, timing, requests_per_second
+    )
     latency = time.perf_counter() - t0
     rendered = "\n".join(
         f"[{r['rank']}] {r['title']}\n    {r['url']}\n    "
@@ -592,6 +626,7 @@ def run_search(arm: str, query: str, exclude_domains: list[str],
                   "search_user_location": SEARCH_USER_LOCATION,
                   "ydc_language": YDC_LANGUAGE,
                   "ydc_safesearch": YDC_SAFESEARCH,
+                  "ydc_requests_per_second": requests_per_second,
                   "provider_request_id": _provider_request_id(raw),
                   "raw_payload_retained": False},
         metrics={"tokens": _tok(rendered),
@@ -599,6 +634,8 @@ def run_search(arm: str, query: str, exclude_domains: list[str],
                  "provider_http_latency_s": timing.get("provider_http_s", 0.0),
                  "rate_limit_wait_s": timing.get("rate_limit_wait_s", 0.0),
                  "retry_backoff_s": timing.get("retry_backoff_s", 0.0),
+                 "provider_retry_count": timing.get("provider_retry_count", 0),
+                 "provider_429_count": timing.get("provider_429_count", 0),
                  "search_cost_usd": search_cost_usd(arm, len(results)),
                  "n_results": len(results),
                  # Per section; both reach the agent, so n_results is their sum.
@@ -656,6 +693,7 @@ def make_task(
     dataset_version: str | None = None,
     search_mode: str = SEARCH_MODE_HARNESS,
     model_vendor: str = DEFAULT_MODEL_VENDOR,
+    ydc_requests_per_second: float = DEFAULT_YDC_REQUESTS_PER_SECOND,
 ):
     spec = vendor_of(model_vendor)
     system_prompt = _system_prompt_for(search_mode)
@@ -702,7 +740,7 @@ def make_task(
         else:
             outcome = _run_harness(client, spec, agent_model, system_prompt,
                                    question, excludes, arm, search_mode,
-                                   search_setup)
+                                   search_setup, ydc_requests_per_second)
         wall_clock_s = time.perf_counter() - t0
 
         surfaced = agents.surfaced_domains(outcome["trajectory"])
@@ -754,6 +792,9 @@ def make_task(
             "ydc_setup": (
                 search_setup if search_mode == SEARCH_MODE_HARNESS
                 else None),
+            "ydc_requests_per_second": (
+                ydc_requests_per_second
+                if search_mode == SEARCH_MODE_HARNESS else None),
             "answer_as_of": answer_as_of,
             "answer_as_of_basis": answer_as_of_basis,
             "temporal_qualification_applied": answer_as_of is not None,
@@ -912,7 +953,8 @@ def _blank_outcome(decision_surface: str) -> dict:
 
 
 def _run_harness(client, spec, agent_model, system_prompt, question, excludes,
-                 arm, search_mode, search_setup: dict | None = None) -> dict:
+                 arm, search_mode, search_setup: dict | None = None,
+                 ydc_requests_per_second: float = DEFAULT_YDC_REQUESTS_PER_SECOND) -> dict:
     """Tool-calling loop for the harness arm and the no-tool control arm.
 
     Identical driver for both: the control arm is this loop with the tool never
@@ -982,7 +1024,8 @@ def _run_harness(client, spec, agent_model, system_prompt, question, excludes,
                         })
                     try:
                         results, content, tok = run_search(
-                            arm, query, excludes, search_setup)
+                            arm, query, excludes, search_setup,
+                            ydc_requests_per_second)
                     except httpx.HTTPError as exc:
                         # The provider failed after _provider_json's retries.
                         # Recorded and survivable rather than fatal: killing the
@@ -1475,11 +1518,14 @@ def run(arm: str, dataset_name: str, dataset_version: str | None,
         split: str | None = None, limit: int | None = None,
         matrix_order_seed: str | None = None,
         matrix_order_index: int | None = None,
+        matrix_condition_concurrency: int | None = None,
+        matrix_schedule_policy: str | None = None,
         condition_attempt: int = 1,
         expected_rows: int | None = None,
         eval_timeout_s: float | None = None,
         max_row_error_rate: float = 0.0,
         max_concurrency: int = 8,
+        ydc_requests_per_second: float = DEFAULT_YDC_REQUESTS_PER_SECOND,
         completion_marker: Path | None = None):
     api_key, project_id = load_runtime_env(env_path)
     _preflight(arm, search_mode, model_vendor, agent_model)
@@ -1550,6 +1596,7 @@ def run(arm: str, dataset_name: str, dataset_version: str | None,
             str(resolved_version),
             search_mode,
             model_vendor,
+            ydc_requests_per_second,
         ),
         scores=[judge, *DETERMINISTIC_SCORERS],
         trial_count=trials,          # web nondeterminism > model nondeterminism
@@ -1579,10 +1626,15 @@ def run(arm: str, dataset_name: str, dataset_version: str | None,
             "condition_id": condition_id,
             "matrix_order_seed": matrix_order_seed,
             "matrix_order_index": matrix_order_index,
+            "matrix_condition_concurrency": matrix_condition_concurrency,
+            "matrix_schedule_policy": matrix_schedule_policy,
             "condition_attempt": condition_attempt,
             "eval_timeout_s": eval_timeout_s,
             "max_row_error_rate": max_row_error_rate,
             "max_concurrency": max_concurrency,
+            "ydc_requests_per_second": (
+                ydc_requests_per_second
+                if search_mode == SEARCH_MODE_HARNESS else None),
             "judge_models": [m for _, m in judges],
             "judge_mode": "single" if len(judges) == 1 else "jury",
             "dataset_name": dataset.name,
@@ -1793,6 +1845,10 @@ def main():
                    help="Condition-order seed supplied by run_matrix.py.")
     r.add_argument("--matrix-order-index", type=int, default=None,
                    help="One-based execution position supplied by run_matrix.py.")
+    r.add_argument("--matrix-condition-concurrency", type=int, default=None,
+                   help="Concurrent-condition cap supplied by run_matrix.py.")
+    r.add_argument("--matrix-schedule-policy", default=None,
+                   help="Compatibility policy supplied by run_matrix.py.")
     r.add_argument("--condition-attempt", type=int, default=1,
                    help="One-based condition attempt supplied by run_matrix.py.")
     r.add_argument("--expected-rows", type=int, default=None,
@@ -1802,6 +1858,12 @@ def main():
     r.add_argument("--max-row-error-rate", type=float, default=0.0,
                    help="Exit nonzero when task/scorer failures exceed this rate.")
     r.add_argument("--max-concurrency", type=int, default=8)
+    r.add_argument(
+        "--ydc-requests-per-second", type=float,
+        default=DEFAULT_YDC_REQUESTS_PER_SECOND,
+        help="Shared You.com request rate across local processes (default: 1; "
+             f"hard cap: {MAX_YDC_REQUESTS_PER_SECOND:g}).",
+    )
     r.add_argument("--completion-marker", type=Path, default=None,
                    help=argparse.SUPPRESS)
 
@@ -1836,6 +1898,9 @@ def main():
         ap.error("--max-row-error-rate must be between 0 and 1")
     if args.max_concurrency < 1:
         ap.error("--max-concurrency must be at least 1")
+    if not 0 < args.ydc_requests_per_second <= MAX_YDC_REQUESTS_PER_SECOND:
+        ap.error("--ydc-requests-per-second must be greater than zero and no "
+                 f"more than {MAX_YDC_REQUESTS_PER_SECOND:g}")
 
     search_mode = args.search_mode
     # `--arm no_search` predates the search_mode axis. Honor it so existing
@@ -1862,8 +1927,10 @@ def main():
         args.trials, args.judges or [DEFAULT_JUDGE_MODEL], agent_model,
         args.study_id, args.env_file, search_mode, args.model_vendor,
         args.split, args.limit, args.matrix_order_seed, args.matrix_order_index,
+        args.matrix_condition_concurrency, args.matrix_schedule_policy,
         args.condition_attempt, args.expected_rows, args.eval_timeout_s,
-        args.max_row_error_rate, args.max_concurrency, args.completion_marker)
+        args.max_row_error_rate, args.max_concurrency,
+        args.ydc_requests_per_second, args.completion_marker)
 
 
 if __name__ == "__main__":

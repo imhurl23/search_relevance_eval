@@ -329,6 +329,15 @@ class ApprovedHostTest(unittest.TestCase):
             with self.subTest(url=url), self.assertRaises(ValueError):
                 run_eval._provider_json("POST", url, json={})
 
+    def test_provider_rate_has_a_hard_safety_cap(self):
+        with self.assertRaisesRegex(ValueError, "no more than 10"):
+            run_eval._provider_json(
+                "POST",
+                "https://ydc-index.io/v1/search",
+                requests_per_second=10.1,
+                json={},
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

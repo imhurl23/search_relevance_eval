@@ -162,10 +162,21 @@ four. The total is 14:
 | gpt-5.6-terra | Yes | Yes | Yes | Yes |
 | claude-sonnet-5 | Yes | Yes | Yes | Yes |
 
-The launcher runs one condition at a time and reproducibly randomizes condition
-order from the study ID. Pass `--order-seed` to reuse a different registered
+The launcher reproducibly randomizes condition order from the study ID and uses
+two safe condition slots by default. It never overlaps two harness conditions
+(all harness arms share the paced You.com lane) or two conditions from the same
+model vendor. One harness condition can therefore overlap one native/no-search
+condition from another vendor. A single parent owns the checkpoint and records
+the scheduling policy in every experiment. Pass `--condition-concurrency 1` for
+the legacy serial schedule or `--order-seed` to reuse a different registered
 order. Run the matrix without long pauses because the live web changes during a
 study.
+
+You.com traffic is globally paced across local processes. The conservative
+default is one request per second; `--ydc-requests-per-second RATE` makes a
+higher tested rate explicit in the checkpoint and experiment metadata. The
+launcher rejects rates above 10 requests per second, and provider retries,
+HTTP 429s, rate-limit wait time, and retry backoff are recorded on search spans.
 
 Preview the full launch without spending money:
 
@@ -189,6 +200,7 @@ row and search-spend guards:
   --dataset-version 1000197598003916222 \
   --study-id livenewsbench-full-v1 \
   --expected-rows 1329 \
+  --ydc-requests-per-second 10 \
   --max-search-cost-usd 810 \
   --execute
 ```
@@ -208,6 +220,8 @@ timestamps, and exit codes.
 
 - A repeated study ID refuses to launch unless `--resume` is present.
 - A process lock rejects concurrent launchers for the same checkpoint.
+- The parent may own two child conditions, but provider/search compatibility is
+  enforced before launch and all checkpoint writes remain in the parent.
 - `--resume` verifies the complete plan and skips completed conditions.
 - A condition left in `running` state fails closed because its orphaned child
   may still be active. After confirming that process is dead, resume with
