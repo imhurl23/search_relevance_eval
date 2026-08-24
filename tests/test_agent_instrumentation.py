@@ -682,6 +682,18 @@ class ScorerSurfaceGatingTest(unittest.TestCase):
              {"rank": 2, "url": "https://b.example/y"}], used_searches=1), "x")
         self.assertEqual(result["score"], 1.0)
 
+    def test_domain_entropy_clamps_floating_point_upper_boundary(self):
+        results = [
+            {"rank": rank, "url": f"https://host-{rank}.example/story"}
+            for rank in range(1, 6)
+        ]
+        result = scorers.domain_entropy(
+            {}, _row_output(
+                scorers.SURFACE_FULL, results, used_searches=1
+            ), "x"
+        )
+        self.assertEqual(result["score"], 1.0)
+
     def test_dealbreaker_gate_does_not_pass_when_no_rule_was_evaluated(self):
         # The compounding bug: leakage_guard and budget_economy both returning
         # 1.0 on an unobservable arm made the gate report a clean pass with zero

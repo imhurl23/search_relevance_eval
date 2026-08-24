@@ -949,8 +949,13 @@ def domain_entropy(input, output, expected, **kwargs):
     counts = Counter(hosts)
     n = len(hosts)
     H = -sum((c / n) * math.log(c / n) for c in counts.values())
+    # Floating-point division can put the mathematically exact upper bound a
+    # few ulps above 1.0 (observed as 1.0000000000000002 for five unique hosts).
+    # Braintrust correctly rejects out-of-range scores, so clamp the normalized
+    # value to the scorer's declared [0, 1] range.
+    score = max(0.0, min(1.0, H / math.log(n)))
     return {"name": "domain_entropy",
-            "score": H / math.log(n),
+            "score": score,
             "metadata": {"applicable": True, "decision_surface": surface,
                          "unique_hosts": len(counts), "n_results": n,
                          "top_host": counts.most_common(1)[0]}}
