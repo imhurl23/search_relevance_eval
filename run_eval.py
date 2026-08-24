@@ -1410,13 +1410,43 @@ def build_judges(specs: list[str]):
     return judges
 
 
+def _eval_error_summary(eval_result) -> tuple[int, int, float]:
+    """Return failed rows, total rows, and failure rate for the launcher gate."""
+    failed = 0
+    for result in eval_result.results:
+        metadata = result.metadata or {}
+        if (result.error is not None or metadata.get("scorer_errors")
+                or metadata.get("classifier_errors")):
+            failed += 1
+    total = len(eval_result.results)
+    return failed, total, failed / total if total else 1.0
+
+
+def _write_completion_marker(path: Path, experiment_name: str) -> None:
+    """Atomically mark a condition complete after its error gate passes."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+    temporary.write_text(
+        f"experiment={experiment_name}\ncompleted_at="
+        f"{datetime.now(timezone.utc).isoformat()}\n",
+        encoding="utf-8",
+    )
+    os.replace(temporary, path)
+
+
 def run(arm: str, dataset_name: str, dataset_version: str | None,
         trials: int, judge_specs: list[str], agent_model: str, study_id: str,
         env_path: Path, search_mode: str = SEARCH_MODE_HARNESS,
         model_vendor: str = DEFAULT_MODEL_VENDOR,
         split: str | None = None, limit: int | None = None,
         matrix_order_seed: str | None = None,
-        matrix_order_index: int | None = None):
+        matrix_order_index: int | None = None,
+        condition_attempt: int = 1,
+        expected_rows: int | None = None,
+        eval_timeout_s: float | None = None,
+        max_row_error_rate: float = 0.0,
+        max_concurrency: int = 8,
+        completion_marker: Path | None = None):
     api_key, project_id = load_runtime_env(env_path)
     _preflight(arm, search_mode, model_vendor, agent_model)
     spec = vendor_of(model_vendor)
@@ -1430,6 +1460,11 @@ def run(arm: str, dataset_name: str, dataset_version: str | None,
           f"{'' if dataset_version else '  (latest; pass --dataset-version to pin)'}")
 
     data, subset = select_rows(dataset, split, limit)
+    if expected_rows is not None and subset["n_rows"] != expected_rows:
+        raise SystemExit(
+            f"row-count guard failed: selected {subset['n_rows']} rows, "
+            f"expected {expected_rows}. Refusing to launch {agent_model}/{search_mode}."
+        )
     if subset["subset_applied"]:
         print(f"Rows: {subset['n_rows']} of {subset['n_available']} "
               f"(split={subset['split'] or 'all'}, limit={limit}) "
@@ -1453,13 +1488,18 @@ def run(arm: str, dataset_name: str, dataset_version: str | None,
     condition_id = f"{model_vendor}:{agent_model}::{condition}"
     model_slug = re.sub(r"[^a-zA-Z0-9_.-]+", "-", agent_model)
     experiment_name = f"{study_id}-{dataset.name}-{model_slug}-{condition}"
+    if condition_attempt > 1:
+        # A retry is a new experiment, not an append into a partial attempt.
+        # This keeps denominators clean and makes the checkpoint's chosen
+        # successful attempt explicit.
+        experiment_name += f"-retry-{condition_attempt:02d}"
     native_rate, rate_confirmed = native_search_rate_usd(model_vendor, agent_model)
     # Sampling parity is NOT achievable across vendors: both frontier vendors
     # reject sampling parameters outright and no vendor here supports `seed`.
     # Record what each arm received instead of implying a frozen config.
     sampling = dict(spec.sampling)
 
-    Eval(
+    eval_result = Eval(
         project_name,
         experiment_name=experiment_name,
         data=data,
@@ -1474,7 +1514,8 @@ def run(arm: str, dataset_name: str, dataset_version: str | None,
         ),
         scores=[judge, *DETERMINISTIC_SCORERS],
         trial_count=trials,          # web nondeterminism > model nondeterminism
-        max_concurrency=8,
+        timeout=eval_timeout_s,
+        max_concurrency=max_concurrency,
         metadata={
             # --- matrix axes ---
             "model_class": spec.model_class,
@@ -1499,6 +1540,10 @@ def run(arm: str, dataset_name: str, dataset_version: str | None,
             "condition_id": condition_id,
             "matrix_order_seed": matrix_order_seed,
             "matrix_order_index": matrix_order_index,
+            "condition_attempt": condition_attempt,
+            "eval_timeout_s": eval_timeout_s,
+            "max_row_error_rate": max_row_error_rate,
+            "max_concurrency": max_concurrency,
             "judge_models": [m for _, m in judges],
             "judge_mode": "single" if len(judges) == 1 else "jury",
             "dataset_name": dataset.name,
@@ -1635,6 +1680,19 @@ def run(arm: str, dataset_name: str, dataset_version: str | None,
                 if dataset.name == RETRIEVALQA_DATASET_NAME else "identity-v1"),
         },
     )
+    n_failed_rows, n_rows_run, error_rate = _eval_error_summary(eval_result)
+    print(
+        f"Error gate: {n_failed_rows}/{n_rows_run} rows "
+        f"({error_rate:.2%}); allowed {max_row_error_rate:.2%}"
+    )
+    if error_rate > max_row_error_rate:
+        raise SystemExit(
+            f"condition failed row-error gate: {error_rate:.2%} > "
+            f"{max_row_error_rate:.2%}"
+        )
+    if completion_marker is not None:
+        _write_completion_marker(completion_marker, experiment_name)
+    return eval_result
 
 
 def main():
@@ -1699,6 +1757,17 @@ def main():
                    help="Condition-order seed supplied by run_matrix.py.")
     r.add_argument("--matrix-order-index", type=int, default=None,
                    help="One-based execution position supplied by run_matrix.py.")
+    r.add_argument("--condition-attempt", type=int, default=1,
+                   help="One-based condition attempt supplied by run_matrix.py.")
+    r.add_argument("--expected-rows", type=int, default=None,
+                   help="Abort before Eval if the selected row count differs.")
+    r.add_argument("--eval-timeout-s", type=float, default=None,
+                   help="Whole-condition timeout; Braintrust flushes in finally.")
+    r.add_argument("--max-row-error-rate", type=float, default=0.0,
+                   help="Exit nonzero when task/scorer failures exceed this rate.")
+    r.add_argument("--max-concurrency", type=int, default=8)
+    r.add_argument("--completion-marker", type=Path, default=None,
+                   help=argparse.SUPPRESS)
 
     g = sub.add_parser(
         "gateway-check",
@@ -1721,6 +1790,16 @@ def main():
                  "--allow-latest only for exploratory runs")
     if args.trials < 1:
         ap.error("--trials must be at least 1")
+    if args.condition_attempt < 1:
+        ap.error("--condition-attempt must be at least 1")
+    if args.expected_rows is not None and args.expected_rows < 1:
+        ap.error("--expected-rows must be at least 1")
+    if args.eval_timeout_s is not None and args.eval_timeout_s <= 0:
+        ap.error("--eval-timeout-s must be positive")
+    if not 0 <= args.max_row_error_rate <= 1:
+        ap.error("--max-row-error-rate must be between 0 and 1")
+    if args.max_concurrency < 1:
+        ap.error("--max-concurrency must be at least 1")
 
     search_mode = args.search_mode
     # `--arm no_search` predates the search_mode axis. Honor it so existing
@@ -1746,7 +1825,9 @@ def main():
     run(args.arm, args.dataset_name, args.dataset_version,
         args.trials, args.judges or [DEFAULT_JUDGE_MODEL], agent_model,
         args.study_id, args.env_file, search_mode, args.model_vendor,
-        args.split, args.limit, args.matrix_order_seed, args.matrix_order_index)
+        args.split, args.limit, args.matrix_order_seed, args.matrix_order_index,
+        args.condition_attempt, args.expected_rows, args.eval_timeout_s,
+        args.max_row_error_rate, args.max_concurrency, args.completion_marker)
 
 
 if __name__ == "__main__":
