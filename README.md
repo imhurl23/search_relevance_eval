@@ -388,8 +388,9 @@ and a cost frontier when `total_cost_usd` is present.
   equal and no native API exposes a freshness filter. Harness-versus-native is a
   system comparison, not a retrieval-quality one — see
   [docs/study-design.md](docs/study-design.md#harness-versus-native).
-- OpenAI native search exposes no `max_uses`, so its five-search budget is
-  observed but not API-enforced.
+- Both native arms enforce the cumulative five-search budget. OpenAI uses
+  `max_tool_calls`; Anthropic reduces per-request `max_uses` across
+  `pause_turn` continuations.
 - You.com dates are mixed: web results expose last-modified, news results
   expose publication timestamps. Split on each result's `source` before reading
   a date as a publication date. Anthropic exposes last-modified; OpenAI native

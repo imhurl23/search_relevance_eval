@@ -151,6 +151,7 @@ SNIPPET_TRUNCATION = "none"
 # available. Native providers do not expose section-specific result counts, so
 # their observed surface size is recorded rather than post-hoc truncated.
 N_RESULTS = 5                          # per section; `wide` overrides it
+NATIVE_RESULT_COUNT_TARGET = 2 * N_RESULTS
 
 # Alternate web and news by within-section rank. The sections carry no
 # cross-comparable score, so alternating is the neutral merge; concatenating
@@ -264,14 +265,14 @@ as possible. If you do not know, reply exactly: I could not find this."""
 # it is a declared confound rather than an oversight (prompt_version records it).
 NATIVE_SEARCH_SYSTEM_PROMPT = """\
 You are a web research agent answering a time-sensitive factual question. You have built-in web
-search. You may use at most 5 searches. When you know the answer, stop searching
+search. You may use at most 5 searches. Do not use search operators (such as site:, intitle:, inurl:, intext:, filetype:, before:, after:, OR, or quoted exact-match). Write the query as a plain natural-language phrase. When you know the answer, stop searching
 and reply with ONLY the final answer, as concisely as possible. If you cannot
 determine the answer within budget, reply exactly: I could not find this."""
 
 PROMPT_VERSIONS = {
     SEARCH_MODE_HARNESS: "frozen-v3-no-operators",
     SEARCH_MODE_NONE: "no-search-v2-parametric",
-    SEARCH_MODE_NATIVE: "native-search-v1-generic-factual",
+    SEARCH_MODE_NATIVE: "native-search-v2-no-operators",
 }
 
 # The harness tool schema lives in agents.SEARCH_TOOL_* — one definition
@@ -309,10 +310,9 @@ SEARCH_PROVIDER_KEY = "YDC_API_KEY"
 # so the per-model violation rate is auditable in the spans, and passes the
 # raw query through to You.com unchanged.
 #
-# Only the unambiguous `operator:term` forms are detected. Boolean `OR`,
-# leading `-` exclusions, and quoted exact-match are ambiguous in natural
-# language (a hyphenated word, a quoted title), so matching them would produce
-# false positives. The `operator:` forms have no natural-language reading.
+# Detect both `operator:term` forms and the additional syntax forbidden by the
+# prompt: uppercase boolean operators, leading +/- terms, and quoted matches.
+# A normal hyphenated word is not leading syntax and remains unflagged.
 # ---------------------------------------------------------------------------
 
 _SEARCH_OPERATOR_RE = re.compile(
@@ -324,6 +324,10 @@ _SEARCH_OPERATOR_RE = re.compile(
     re.IGNORECASE,
 )
 
+_SEARCH_SYNTAX_RE = re.compile(
+    r'(?<!\S)[+-](?=\S)\S+|\b(?:AND|OR|NOT)\b|"(?:[^"\\]|\\.)+"'
+)
+
 
 def _detect_search_operators(query: str) -> list[str]:
     """Return the list of search operators (site:, intitle:, etc.) in a query.
@@ -332,7 +336,17 @@ def _detect_search_operators(query: str) -> list[str]:
     the search layer unchanged; the detected operators are logged so the
     per-model violation rate is auditable.
     """
-    return [m.group(0) for m in _SEARCH_OPERATOR_RE.finditer(query)]
+    if not isinstance(query, str):
+        return []
+    matches = [
+        (m.start(), m.end(), m.group(0))
+        for m in _SEARCH_OPERATOR_RE.finditer(query)
+    ]
+    for match in _SEARCH_SYNTAX_RE.finditer(query):
+        if not any(start < match.end() and end > match.start()
+                   for start, end, _ in matches):
+            matches.append((match.start(), match.end(), match.group(0)))
+    return [value for _, _, value in sorted(matches)]
 
 
 def search_cost_usd(arm: str, n_results: int) -> float:
@@ -886,7 +900,17 @@ def _run_harness(client, spec, agent_model, system_prompt, question, excludes,
             if call["malformed"]:
                 out["bad_tool_calls"] += 1
             if call["name"] == agents.SEARCH_TOOL_NAME:
-                if out["used_searches"] >= MAX_SEARCHES:
+                arguments = call.get("arguments")
+                query = (arguments.get("query", "")
+                         if isinstance(arguments, dict) else None)
+                if call["malformed"] or not isinstance(query, str):
+                    if not call["malformed"]:
+                        out["bad_tool_calls"] += 1
+                    content = (
+                        "Invalid search query: query must be a string. "
+                        "Call search_web again with a plain natural-language phrase."
+                    )
+                elif out["used_searches"] >= MAX_SEARCHES:
                     out["refused_searches"] += 1
                     content = "Search budget exhausted."
                 else:
@@ -896,7 +920,6 @@ def _run_harness(client, spec, agent_model, system_prompt, question, excludes,
                     # failure would hand a flaky provider unlimited retries
                     # inside the turn cap.
                     out["used_searches"] += 1
-                    query = call["arguments"].get("query", "")
                     detected_ops = _detect_search_operators(query)
                     if detected_ops:
                         out["operator_violations"].append({
@@ -964,7 +987,7 @@ def _run_native(client, spec, agent_model, system_prompt, question,
             client, agent_model, system_prompt, question, excludes,
             # Same effort the harness arm sends, so this vendor's native-vs-
             # harness contrast varies only where the search happens.
-            spec.reasoning_effort)
+            spec.reasoning_effort, max_searches=MAX_SEARCHES)
     else:
         raise SystemExit(
             f"--search-mode native is unavailable for --model-vendor {spec.name}: "
@@ -976,9 +999,9 @@ def _run_native(client, spec, agent_model, system_prompt, question,
         "final_answer": run.final_answer or "I could not find this.",
         "trajectory": run.trajectory,
         "used_searches": run.n_searches,
-        # Native search enforces max_uses server-side where the API supports it,
-        # so a per-call refusal count is not observable. Recorded as 0 rather
-        # than fabricated — budget_economy reads used_searches, not this.
+        # Native search enforces the budget server-side (`max_tool_calls` on
+        # OpenAI, cumulative remaining `max_uses` on Anthropic), so a per-call
+        # refusal count is not observable. budget_economy reads used_searches.
         "search_cost": rate * run.n_searches,
         "prompt_tokens": run.prompt_tokens,
         "cached_prompt_tokens": run.cached_prompt_tokens,
@@ -989,6 +1012,12 @@ def _run_native(client, spec, agent_model, system_prompt, question,
         "refused": run.refused,
         "truncated": run.truncated,
         "pause_turns": run.pause_turns,
+        "operator_violations": [
+            {"query": query, "operators": operators}
+            for item in run.trajectory
+            if isinstance((query := item.get("query")), str)
+            if (operators := _detect_search_operators(query))
+        ],
     })
     return out
 
@@ -1233,6 +1262,7 @@ def _gateway_search_probe(gw, spec, agent_model: str, tools: list):
     else:
         url = f"{gw.openai_base_url}/responses"
         body = {"model": agent_model, "input": question, "tools": tools,
+                "max_tool_calls": 1,
                 "include": ["web_search_call.action.sources"]}
     return httpx.post(url, headers=headers, json=body, timeout=180.0)
 
@@ -1437,10 +1467,9 @@ def run(arm: str, dataset_name: str, dataset_version: str | None,
             "serving_path": agents.serving_path(),
             "gateway_project": (
                 gateway.project if (gateway := agents.gateway_config()) else None),
-            # Whether the 5-search budget is API-enforced or only observed.
-            # OpenAI's hosted web_search exposes no max_uses, so its native arm
-            # can exceed the cap every other arm is held to — a real limit on the
-            # native-vs-harness contrast within that vendor.
+            # Whether the 5-search budget is API-enforced. Anthropic receives
+            # the remaining max_uses on every pause_turn continuation; OpenAI
+            # receives max_tool_calls on its single Responses request.
             "search_budget_enforced": (
                 agents.NATIVE_BUDGET_ENFORCED.get(model_vendor, False)
                 if search_mode == SEARCH_MODE_NATIVE
@@ -1477,7 +1506,7 @@ def run(arm: str, dataset_name: str, dataset_version: str | None,
             "result_count_target_per_search": (
                 2 * ydc_setup(arm)["count"]
                 if search_mode == SEARCH_MODE_HARNESS
-                else 2 * N_RESULTS if search_mode == SEARCH_MODE_NATIVE
+                else NATIVE_RESULT_COUNT_TARGET if search_mode == SEARCH_MODE_NATIVE
                 else None),
             "result_count_control": (
                 "per_section_max" if search_mode == SEARCH_MODE_HARNESS

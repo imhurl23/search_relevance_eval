@@ -199,7 +199,8 @@ another. Within-arm contrasts carry no such limit.
 - Report gold-domain availability and `exclusion_enforced` by arm.
 - Report observed results per search against `result_count_target_per_search`;
   only the harness enforces the 5-web/5-news section maxima.
-- Report `search_budget_enforced`; OpenAI native search lacks an API-level cap.
+- Report `search_budget_enforced`; OpenAI uses `max_tool_calls`, while
+  Anthropic carries the remaining `max_uses` budget across continuations.
 - Treat Anthropic dates as last-modified timestamps. You.com dates are mixed:
   web results are last-modified, news results are publication timestamps. Split
   on each result's `source` before treating a date as a publication date.

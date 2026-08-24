@@ -18,6 +18,7 @@ import dataclasses
 import os
 import unittest
 from collections import Counter
+from unittest import mock
 
 import httpx
 
@@ -107,6 +108,23 @@ class FakeAnthropicMessages:
 class FakeAnthropicClient:
     def __init__(self, response):
         self.messages = FakeAnthropicMessages(response)
+
+
+class FakeAnthropicMessagesSequence:
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.calls = []
+
+    def create(self, **kwargs):
+        self.calls.append(kwargs)
+        if not self.responses:
+            raise AssertionError("messages.create made more requests than scripted")
+        return self.responses.pop(0)
+
+
+class FakeSequencedAnthropicClient:
+    def __init__(self, responses):
+        self.messages = FakeAnthropicMessagesSequence(responses)
 
 
 class FakeResponses:
@@ -220,12 +238,22 @@ class VendorRegistryTest(unittest.TestCase):
         # Open models expose no comparable knob, so there is nothing to declare.
         self.assertIsNone(agents.VENDORS["baseten"].reasoning_effort)
 
-    def test_openai_native_search_budget_is_not_api_enforced(self):
-        # Anthropic takes max_uses; OpenAI's hosted web_search publishes no
-        # equivalent, so its native arm can exceed the 5-search cap every other
-        # arm is held to. Recorded, not assumed away.
+    def test_both_native_search_budgets_are_api_enforced(self):
         self.assertTrue(agents.NATIVE_BUDGET_ENFORCED["anthropic"])
-        self.assertFalse(agents.NATIVE_BUDGET_ENFORCED["openai"])
+        self.assertTrue(agents.NATIVE_BUDGET_ENFORCED["openai"])
+
+    def test_native_result_count_target_is_ten(self):
+        # Neither native API exposes an exact result-count knob. Ten remains the
+        # registered target matching You.com's five web plus five news maxima.
+        self.assertEqual(run_eval.NATIVE_RESULT_COUNT_TARGET, 10)
+
+    def test_operator_policy_is_shared_by_harness_and_native_prompts(self):
+        policy = "Do not use search operators"
+        phrase = "Write the query as a plain natural-language phrase."
+        for prompt in (run_eval.FROZEN_SYSTEM_PROMPT,
+                       run_eval.NATIVE_SEARCH_SYSTEM_PROMPT):
+            self.assertIn(policy, prompt)
+            self.assertIn(phrase, prompt)
 
     def test_native_arms_run_at_their_retrieval_ceiling(self):
         # The harness arm passes every highlight through untruncated. Anything
@@ -389,6 +417,25 @@ class AnthropicNativeSearchTest(unittest.TestCase):
         self.assertEqual(tool["blocked_domains"],
                          ["source.example", "web.archive.org"])
 
+    def test_pause_turn_receives_only_the_remaining_search_budget(self):
+        first = dict(
+            ANTHROPIC_RESPONSE,
+            stop_reason="pause_turn",
+            usage={"input_tokens": 100, "output_tokens": 20,
+                   "server_tool_use": {"web_search_requests": 2}},
+        )
+        second = dict(
+            ANTHROPIC_RESPONSE,
+            usage={"input_tokens": 100, "output_tokens": 20,
+                   "server_tool_use": {"web_search_requests": 3}},
+        )
+        client = FakeSequencedAnthropicClient([first, second])
+        run = agents.anthropic_native_search(
+            client, "claude-opus-5", "sys", "who won?", [], 5)
+        self.assertEqual(client.messages.calls[0]["tools"][0]["max_uses"], 5)
+        self.assertEqual(client.messages.calls[1]["tools"][0]["max_uses"], 3)
+        self.assertEqual(run.n_searches, 5)
+
     def test_uses_the_basic_tool_not_dynamic_filtering(self):
         # Dynamic filtering (_20260209+) drops results before they reach the
         # context window, so the model would answer from a surface we cannot
@@ -454,6 +501,12 @@ class OpenAINativeSearchTest(unittest.TestCase):
         call = client.responses.calls[0]
         self.assertIn("web_search_call.action.sources", call["include"])
 
+    def test_enforces_the_five_search_budget(self):
+        client = FakeOpenAIClient(OPENAI_RESPONSE)
+        agents.openai_native_search(
+            client, "gpt-5.6", "sys", "who won?", [], max_searches=5)
+        self.assertEqual(client.responses.calls[0]["max_tool_calls"], 5)
+
     def test_sends_blocked_domains_through_the_filters_object(self):
         client = FakeOpenAIClient(OPENAI_RESPONSE)
         agents.openai_native_search(
@@ -472,6 +525,24 @@ class OpenAINativeSearchTest(unittest.TestCase):
         self.assertEqual(results[0]["title"], "A")
         # Uncited results stay untitled — the reason this arm is urls_only.
         self.assertEqual(results[1]["title"], "")
+
+    def test_native_queries_receive_the_same_operator_observability(self):
+        search_call = dict(
+            OPENAI_RESPONSE["output"][0],
+            action=dict(OPENAI_RESPONSE["output"][0]["action"],
+                        query="site:reuters.com who won"),
+        )
+        response = dict(
+            OPENAI_RESPONSE,
+            output=[search_call, *OPENAI_RESPONSE["output"][1:]],
+        )
+        out = run_eval._run_native(
+            FakeOpenAIClient(response), agents.VENDORS["openai"], "gpt-5.6",
+            run_eval.NATIVE_SEARCH_SYSTEM_PROMPT, "who won?", [])
+        self.assertEqual(out["operator_violations"], [{
+            "query": "site:reuters.com who won",
+            "operators": ["site:reuters.com"],
+        }])
 
 
 class NativeSearchPricingTest(unittest.TestCase):
@@ -926,9 +997,13 @@ class ClientConstructionTest(unittest.TestCase):
         self.addCleanup(agents.reset_clients)
 
     def test_missing_key_raises_a_named_error_not_an_sdk_traceback(self):
-        os.environ.pop("BASETEN_API_KEY", None)
-        with self.assertRaises(SystemExit) as caught:
-            agents.get_client("baseten", lambda c: c)
+        # A configured gateway intentionally replaces local vendor credentials,
+        # so isolate the direct-vendor path even when .env enables the gateway.
+        with mock.patch.dict(
+                os.environ,
+                {"BASETEN_API_KEY": "", agents.GATEWAY_URL_ENV: ""}):
+            with self.assertRaises(SystemExit) as caught:
+                agents.get_client("baseten", lambda c: c)
         self.assertIn("BASETEN_API_KEY", str(caught.exception))
 
     def test_unknown_vendor_is_rejected(self):
@@ -1054,10 +1129,15 @@ class PreflightTest(unittest.TestCase):
         self.assertIn("native", str(caught.exception))
 
     def test_missing_vendor_key_fails_before_spending_money(self):
-        self._set_env("ANTHROPIC_API_KEY", None)
-        with self.assertRaises(SystemExit) as caught:
-            run_eval._preflight(run_eval.DEFAULT_ARM, agents.SEARCH_MODE_NONE,
-                                "anthropic", "claude-opus-5")
+        # Under gateway routing the credential lives in Braintrust, so this
+        # missing-local-key assertion must explicitly exercise the direct path.
+        with mock.patch.dict(
+                os.environ,
+                {"ANTHROPIC_API_KEY": "", agents.GATEWAY_URL_ENV: ""}):
+            with self.assertRaises(SystemExit) as caught:
+                run_eval._preflight(
+                    run_eval.DEFAULT_ARM, agents.SEARCH_MODE_NONE,
+                    "anthropic", "claude-opus-5")
         self.assertIn("ANTHROPIC_API_KEY", str(caught.exception))
 
     def test_no_search_arm_does_not_require_a_search_provider_key(self):
@@ -1378,10 +1458,17 @@ class SearchOperatorDetectionTest(unittest.TestCase):
         self.assertEqual(detected, [])
 
     def test_hyphenated_word_is_not_detected(self):
-        # A leading hyphen is boolean NOT in search syntax, but it is also a
-        # hyphenated word. Only operator: forms are detected, not bare -term.
+        # A hyphen inside a word is not a leading exclusion operator.
         detected = run_eval._detect_search_operators("state-of-the-art AI")
         self.assertEqual(detected, [])
+
+    def test_prompt_forbidden_syntax_is_detected(self):
+        detected = run_eval._detect_search_operators(
+            'Apple OR Microsoft -rumor "chief executive"')
+        self.assertEqual(detected, ["OR", "-rumor", '"chief executive"'])
+
+    def test_non_string_input_is_safe(self):
+        self.assertEqual(run_eval._detect_search_operators(None), [])
 
 
 class HarnessOperatorViolationTest(unittest.TestCase):
@@ -1390,6 +1477,7 @@ class HarnessOperatorViolationTest(unittest.TestCase):
 
     def _run(self, search_side_effect, turns):
         session = _ScriptedSession(turns)
+        self.session = session
         original_session = run_eval.make_harness_session
         original_search = run_eval.run_search
         run_eval.make_harness_session = lambda *a, **k: session
@@ -1440,6 +1528,18 @@ class HarnessOperatorViolationTest(unittest.TestCase):
                 _search_call("intitle:winner who won")]),
              agents.Turn(text="Team A.")])
         self.assertEqual(out["trajectory"][0]["query"], "intitle:winner who won")
+
+    def test_non_string_query_is_returned_as_a_bad_tool_call(self):
+        def search_must_not_run(*args):
+            raise AssertionError(f"search unexpectedly called with {args!r}")
+
+        out = self._run(
+            search_must_not_run,
+            [agents.Turn(tool_calls=[_search_call(None)]),
+             agents.Turn(text="I could not find this.")])
+        self.assertEqual(out["bad_tool_calls"], 1)
+        self.assertEqual(out["used_searches"], 0)
+        self.assertIn("query must be a string", self.session.tool_results[0][1])
 
 
 class HarnessProtocolRegistryTest(unittest.TestCase):

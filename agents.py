@@ -272,13 +272,10 @@ VENDORS: dict[str, VendorSpec] = {
 }
 
 
-# Whether the 5-search budget is ENFORCED by the API, or merely observed.
-# Anthropic's web_search takes max_uses; OpenAI's hosted web_search publishes no
-# equivalent, so its native arm can exceed the budget every other arm is held to.
-# That is a real threat to the native-vs-harness contrast within OpenAI, so it is
-# recorded per run rather than papered over. budget_economy still scores the
-# observed count, which is what surfaces a violation.
-NATIVE_BUDGET_ENFORCED = {"anthropic": True, "openai": False}
+# Whether the five-search budget is enforced by the provider API. Anthropic's
+# max_uses is per request, so pause_turn continuations receive only the remaining
+# budget. OpenAI's Responses API applies max_tool_calls across its request.
+NATIVE_BUDGET_ENFORCED = {"anthropic": True, "openai": True}
 
 # What each search layer's date field actually MEANS. temporal_grounding treats
 # `published_date` as a publication timestamp. You.com now returns BOTH web and
@@ -757,18 +754,16 @@ def anthropic_native_search(
     max_searches: int,
 ) -> NativeRun:
     """Run one question through Claude's server-side web_search tool."""
-    tool = {
+    tool_base = {
         "type": ANTHROPIC_WEB_SEARCH_TOOL_TYPE,
         "name": "web_search",
-        # A hard cap, matching the harness arms' search budget exactly.
-        "max_uses": max_searches,
         "allowed_callers": ANTHROPIC_WEB_SEARCH_ALLOWED_CALLERS,
     }
     blocked = exclude_domains[:ANTHROPIC_MAX_BLOCKED_DOMAINS]
     if blocked:
         # Gold-source exclusion IS enforceable here, so the leakage rule applies
         # to this arm on the same terms as the harness arms.
-        tool["blocked_domains"] = blocked
+        tool_base["blocked_domains"] = blocked
 
     run = NativeRun(
         final_answer="",
@@ -777,8 +772,16 @@ def anthropic_native_search(
     )
     messages = [{"role": "user", "content": question}]
     texts: list[str] = []
+    searches_used = 0
 
     for _ in range(ANTHROPIC_MAX_PAUSE_TURNS + 1):
+        remaining_searches = max_searches - searches_used
+        if remaining_searches <= 0:
+            break
+        # max_uses is scoped to one Messages request. Supplying the remaining
+        # cumulative budget prevents a pause_turn continuation from resetting
+        # the arm to another five searches.
+        tool = {**tool_base, "max_uses": remaining_searches}
         response = client.messages.create(
             model=model,
             max_tokens=ANTHROPIC_MAX_TOKENS,
@@ -796,9 +799,14 @@ def anthropic_native_search(
         server_use = _attr(usage, "server_tool_use")
         requests = _attr(server_use, "web_search_requests")
         if requests is not None:
-            run.vendor_search_count = (run.vendor_search_count or 0) + int(requests)
+            request_count = int(requests)
+            run.vendor_search_count = (run.vendor_search_count or 0) + request_count
+            searches_used += request_count
 
+        trajectory_before = len(run.trajectory)
         _parse_anthropic_content(response, run, texts)
+        if requests is None:
+            searches_used += len(run.trajectory) - trajectory_before
 
         stop = _attr(response, "stop_reason")
         if stop == "refusal":
@@ -907,6 +915,7 @@ def openai_native_search(
     question: str,
     exclude_domains: list[str],
     effort: str | None = None,
+    max_searches: int = 5,
 ) -> NativeRun:
     """Run one question through OpenAI's hosted Responses web_search tool.
 
@@ -930,6 +939,7 @@ def openai_native_search(
         instructions=system_prompt,
         input=question,
         tools=[tool],
+        max_tool_calls=max_searches,
         max_output_tokens=OPENAI_MAX_OUTPUT_TOKENS,
         **extra,
         # Without this include, the response carries only inline url_citation
