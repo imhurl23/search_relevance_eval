@@ -180,7 +180,7 @@ class VendorRegistryTest(unittest.TestCase):
         self.assertEqual(counts["deepseek-ai/DeepSeek-V4-Flash-0731"], 3)
         self.assertEqual(counts["zai-org/GLM-5.2"], 3)
         self.assertEqual(counts["gpt-5.6-terra"], 4)
-        self.assertEqual(counts["claude-opus-5"], 4)
+        self.assertEqual(counts["claude-sonnet-5"], 4)
 
     def test_matrix_order_is_reproducible_and_seeded(self):
         first = run_matrix.ordered_matrix("study-a")
@@ -202,7 +202,7 @@ class VendorRegistryTest(unittest.TestCase):
         self.assertTrue(agents.VENDORS["anthropic"].supports_native_search)
 
     def test_no_frontier_vendor_sends_sampling_params(self):
-        # Both frontier vendors reject them: Opus 5 400s on
+        # Both frontier vendors reject them: Sonnet 5 400s on
         # temperature/top_p/top_k, and gpt-5-family models 400 on `temperature`
         # ("only the default (1) is supported") and support no `seed`. Sending
         # temperature=0 to either would fail every row of those arms. No vendor
@@ -221,9 +221,9 @@ class VendorRegistryTest(unittest.TestCase):
         self.assertEqual(agents.VENDORS["openai"].default_model, "gpt-5.6-terra")
         self.assertNotEqual(agents.VENDORS["openai"].default_model, "gpt-5.6")
 
-    def test_anthropic_default_is_opus(self):
+    def test_anthropic_default_is_sonnet(self):
         self.assertEqual(agents.VENDORS["anthropic"].default_model,
-                         "claude-opus-5")
+                         "claude-sonnet-5")
 
     def test_default_judge_is_luna(self):
         self.assertEqual(scorers.DEFAULT_JUDGE_MODEL, "gpt-5.6-luna")
@@ -380,7 +380,7 @@ class AnthropicNativeSearchTest(unittest.TestCase):
     def test_normalizes_results_onto_the_harness_trajectory_schema(self):
         client = FakeAnthropicClient(ANTHROPIC_RESPONSE)
         run = agents.anthropic_native_search(
-            client, "claude-opus-5", "sys", "who won?", [], 5)
+            client, "claude-sonnet-5", "sys", "who won?", [], 5)
         self.assertEqual(len(run.trajectory), 1)
         results = run.trajectory[0]["results"]
         self.assertEqual([r["rank"] for r in results], [1, 2])
@@ -391,7 +391,7 @@ class AnthropicNativeSearchTest(unittest.TestCase):
     def test_declares_a_no_snippet_surface_and_leaves_snippets_empty(self):
         client = FakeAnthropicClient(ANTHROPIC_RESPONSE)
         run = agents.anthropic_native_search(
-            client, "claude-opus-5", "sys", "who won?", [], 5)
+            client, "claude-sonnet-5", "sys", "who won?", [], 5)
         self.assertEqual(run.surface, agents.SURFACE_NO_SNIPPET)
         for result in run.trajectory[0]["results"]:
             self.assertEqual(result["snippet"], "")
@@ -402,7 +402,7 @@ class AnthropicNativeSearchTest(unittest.TestCase):
         # snippet_sufficiency score ~1.0 on this arm by construction.
         client = FakeAnthropicClient(ANTHROPIC_RESPONSE)
         run = agents.anthropic_native_search(
-            client, "claude-opus-5", "sys", "who won?", [], 5)
+            client, "claude-sonnet-5", "sys", "who won?", [], 5)
         self.assertEqual(run.citations[0]["cited_text"], "Team Alpha won")
         blob = " ".join(r["snippet"] for r in run.trajectory[0]["results"])
         self.assertNotIn("Team Alpha", blob)
@@ -410,7 +410,7 @@ class AnthropicNativeSearchTest(unittest.TestCase):
     def test_sends_max_uses_and_blocked_domains(self):
         client = FakeAnthropicClient(ANTHROPIC_RESPONSE)
         agents.anthropic_native_search(
-            client, "claude-opus-5", "sys", "who won?",
+            client, "claude-sonnet-5", "sys", "who won?",
             ["source.example", "web.archive.org"], 5)
         tool = client.messages.calls[0]["tools"][0]
         self.assertEqual(tool["type"], agents.ANTHROPIC_WEB_SEARCH_TOOL_TYPE)
@@ -434,7 +434,7 @@ class AnthropicNativeSearchTest(unittest.TestCase):
         )
         client = FakeSequencedAnthropicClient([first, second])
         run = agents.anthropic_native_search(
-            client, "claude-opus-5", "sys", "who won?", [], 5)
+            client, "claude-sonnet-5", "sys", "who won?", [], 5)
         self.assertEqual(client.messages.calls[0]["tools"][0]["max_uses"], 5)
         self.assertEqual(client.messages.calls[1]["tools"][0]["max_uses"], 3)
         self.assertEqual(run.n_searches, 5)
@@ -447,12 +447,11 @@ class AnthropicNativeSearchTest(unittest.TestCase):
                          "web_search_20250305")
 
     def test_thinking_stays_enabled(self):
-        # Disabling thinking on Opus 5 can emit a tool call as visible text: the
-        # search silently never runs and nothing errors, which on this eval
-        # manufactures no-search rows inside a search arm.
+        # Keep the Anthropic arms on the same explicit adaptive-thinking mode;
+        # inheriting different defaults would add another moving treatment.
         client = FakeAnthropicClient(ANTHROPIC_RESPONSE)
         agents.anthropic_native_search(
-            client, "claude-opus-5", "sys", "who won?", [], 5)
+            client, "claude-sonnet-5", "sys", "who won?", [], 5)
         self.assertEqual(client.messages.calls[0]["thinking"]["type"], "adaptive")
 
     def test_prefers_the_vendor_reported_search_count(self):
@@ -460,7 +459,7 @@ class AnthropicNativeSearchTest(unittest.TestCase):
         # unbilled. Keep attempts and billable searches separate.
         client = FakeAnthropicClient(ANTHROPIC_ERROR_RESPONSE)
         run = agents.anthropic_native_search(
-            client, "claude-opus-5", "sys", "who won?", [], 5)
+            client, "claude-sonnet-5", "sys", "who won?", [], 5)
         self.assertEqual(run.trajectory, [])
         self.assertEqual(run.n_searches, 1)
         self.assertEqual(run.billable_searches, 0)
@@ -468,7 +467,7 @@ class AnthropicNativeSearchTest(unittest.TestCase):
     def test_records_search_errors_instead_of_reading_them_as_empty_results(self):
         client = FakeAnthropicClient(ANTHROPIC_ERROR_RESPONSE)
         run = agents.anthropic_native_search(
-            client, "claude-opus-5", "sys", "who won?", [], 5)
+            client, "claude-sonnet-5", "sys", "who won?", [], 5)
         self.assertEqual(run.search_errors,
                          [{"query": "who won", "error_code": "max_uses_exceeded"}])
 
@@ -476,7 +475,7 @@ class AnthropicNativeSearchTest(unittest.TestCase):
         client = FakeAnthropicClient(dict(ANTHROPIC_RESPONSE,
                                           stop_reason="refusal"))
         run = agents.anthropic_native_search(
-            client, "claude-opus-5", "sys", "who won?", [], 5)
+            client, "claude-sonnet-5", "sys", "who won?", [], 5)
         self.assertTrue(run.refused)
 
 
@@ -583,7 +582,7 @@ class OpenAINativeSearchTest(unittest.TestCase):
 class NativeSearchPricingTest(unittest.TestCase):
     def test_both_native_arms_price_at_the_published_ten_dollars_per_thousand(self):
         anthropic_rate, anthropic_ok = agents.native_search_rate_usd(
-            "anthropic", "claude-opus-5")
+            "anthropic", "claude-sonnet-5")
         openai_rate, openai_ok = agents.native_search_rate_usd(
             "openai", "gpt-5.6")
         self.assertEqual(anthropic_rate, 0.010)
@@ -752,6 +751,16 @@ class ScorerSurfaceGatingTest(unittest.TestCase):
 # --- CLI wiring -------------------------------------------------------------
 
 class ModelCostTest(unittest.TestCase):
+    def test_sonnet_uses_current_standard_price(self):
+        input_usd, confirmed = agents.model_cost_usd(
+            "claude-sonnet-5", 1_000_000, 0
+        )
+        output_usd, _ = agents.model_cost_usd(
+            "claude-sonnet-5", 0, 1_000_000
+        )
+        self.assertTrue(confirmed)
+        self.assertEqual((input_usd, output_usd), (2.0, 10.0))
+
     """Search fees are the small half of the bill, so a search-fee-only
     comparison ranks arms on the wrong quantity."""
 
@@ -916,7 +925,7 @@ class TaskWiringTest(unittest.TestCase):
         self.assertEqual(hooks.metadata["search_mode"], "native")
         # 1 search x $10/1k.
         self.assertAlmostEqual(
-            agents.native_search_rate_usd("anthropic", "claude-opus-5")[0], 0.010)
+            agents.native_search_rate_usd("anthropic", "claude-sonnet-5")[0], 0.010)
 
     def test_axes_land_in_row_metadata(self):
         _, hooks = self._run_task("openai", OPENAI_RESPONSE)
@@ -1173,14 +1182,14 @@ class PreflightTest(unittest.TestCase):
             with self.assertRaises(SystemExit) as caught:
                 run_eval._preflight(
                     run_eval.DEFAULT_ARM, agents.SEARCH_MODE_NONE,
-                    "anthropic", "claude-opus-5")
+                    "anthropic", "claude-sonnet-5")
         self.assertIn("ANTHROPIC_API_KEY", str(caught.exception))
 
     def test_no_search_arm_does_not_require_a_search_provider_key(self):
         self._set_env("ANTHROPIC_API_KEY", "test-anthropic-key")
         self._set_env("EXA_API_KEY", None)
         run_eval._preflight("no_search", agents.SEARCH_MODE_NONE,
-                            "anthropic", "claude-opus-5")
+                            "anthropic", "claude-sonnet-5")
 
 
 class SubsetSelectionTest(unittest.TestCase):

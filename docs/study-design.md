@@ -258,5 +258,7 @@ a general result about independent retrieval providers. Native-search evidence
 is less observable than harness evidence. The native-versus-harness contrast also
 changes the visible tool contract and the provider's hidden search orchestration.
 
-OpenAI Terra and Anthropic Opus gateway and native-search adapters passed live
-checks on August 14, 2026. Both Baseten model routes passed on the same date.
+OpenAI Terra and the Anthropic native-search adapter passed live checks on
+August 14, 2026, using Opus. Sonnet 5 replaced Opus in the registered matrix on
+August 24, 2026 and requires a fresh pilot before the full run. Both Baseten
+model routes passed live checks on August 14, 2026.

@@ -110,7 +110,7 @@ Pass `--judge gpt-4.1` for direct parity with LiveNewsBench's published judge.
 | Open | Baseten | `deepseek-ai/DeepSeek-V4-Flash-0731` | 0.13 / 0.26 | No |
 | Open | Baseten | `zai-org/GLM-5.2` | 1.40 / 4.40 | No |
 | Frontier | OpenAI | `gpt-5.6-terra` | 2.00 / 12.00 | Yes |
-| Frontier | Anthropic | `claude-opus-5` | 5.00 / 25.00 | Yes |
+| Frontier | Anthropic | `claude-sonnet-5` | 2.00 / 10.00 | Yes |
 
 Prices are pinned list prices in `agents.MODEL_USD_PER_MTOK`. Recheck them
 before publication. Promotional and negotiated rates are excluded.
@@ -160,7 +160,7 @@ four. The total is 14:
 | DeepSeek-V4-Flash | Yes | Yes | Yes | — |
 | GLM-5.2 | Yes | Yes | Yes | — |
 | gpt-5.6-terra | Yes | Yes | Yes | Yes |
-| claude-opus-5 | Yes | Yes | Yes | Yes |
+| claude-sonnet-5 | Yes | Yes | Yes | Yes |
 
 The launcher runs one condition at a time and reproducibly randomizes condition
 order from the study ID. Pass `--order-seed` to reuse a different registered
