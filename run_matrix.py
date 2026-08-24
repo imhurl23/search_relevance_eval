@@ -7,6 +7,8 @@ the dataset version, study ID, and optional row limit.
 from __future__ import annotations
 
 import argparse
+import hashlib
+import random
 import shlex
 import subprocess
 import sys
@@ -53,7 +55,21 @@ MATRIX: tuple[MatrixCondition, ...] = (
 )
 
 
-def condition_command(condition: MatrixCondition, args) -> list[str]:
+def ordered_matrix(seed: str) -> tuple[MatrixCondition, ...]:
+    """Return a reproducible randomized order for one live-web study.
+
+    A fixed treatment-block order would always run native search after You.com.
+    Hashing the study seed makes the order reproducible without making treatment
+    synonymous with elapsed time across studies.
+    """
+    digest = hashlib.sha256(seed.encode("utf-8")).digest()
+    rng = random.Random(int.from_bytes(digest[:8], "big"))
+    conditions = list(MATRIX)
+    rng.shuffle(conditions)
+    return tuple(conditions)
+
+
+def condition_command(condition: MatrixCondition, args, index: int) -> list[str]:
     command = [
         sys.executable,
         str(Path(__file__).with_name("run_eval.py")),
@@ -66,6 +82,8 @@ def condition_command(condition: MatrixCondition, args) -> list[str]:
         "--agent-model", condition.model,
         "--search-mode", condition.search_mode,
         "--env-file", str(args.env_file),
+        "--matrix-order-seed", args.order_seed or args.study_id,
+        "--matrix-order-index", str(index),
     ]
     if condition.arm:
         command.extend(["--arm", condition.arm])
@@ -83,6 +101,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--limit", type=int)
     parser.add_argument("--env-file", type=Path, default=Path(".env"))
     parser.add_argument(
+        "--order-seed",
+        help="Reproducible condition-order seed (defaults to --study-id).",
+    )
+    parser.add_argument(
         "--execute",
         action="store_true",
         help="Run the commands. Without this flag, print the launch plan only.",
@@ -97,13 +119,16 @@ def main() -> int:
     if args.limit is not None and args.limit < 1:
         raise SystemExit("--limit must be at least 1")
 
+    order_seed = args.order_seed or args.study_id
+    conditions = ordered_matrix(order_seed)
     print(
-        f"Matrix: {len(MATRIX)} conditions | dataset={args.dataset_name} "
-        f"| trials={args.trials} | study={args.study_id}"
+        f"Matrix: {len(conditions)} conditions | dataset={args.dataset_name} "
+        f"| trials={args.trials} | study={args.study_id} "
+        f"| order_seed={order_seed}"
     )
-    for index, condition in enumerate(MATRIX, start=1):
-        command = condition_command(condition, args)
-        print(f"[{index:02d}/{len(MATRIX)}] {condition.label}")
+    for index, condition in enumerate(conditions, start=1):
+        command = condition_command(condition, args, index)
+        print(f"[{index:02d}/{len(conditions)}] {condition.label}")
         print(f"  {shlex.join(command)}")
         if args.execute:
             subprocess.run(command, check=True)

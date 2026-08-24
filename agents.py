@@ -50,7 +50,7 @@ Decision-surface tiers, and why they differ
 -------------------------------------------
     full        rank, url, title, snippet, published_date   harness arms
     no_snippet  rank, url, title, published_date            Anthropic native
-    urls_only   rank, url, (title from citations)           OpenAI native
+    urls_only   consulted-source order, url, partial title  OpenAI native
     none        nothing                                     no_search arms
 
 Anthropic's `web_search_result` carries url/title/page_age but no snippet.
@@ -272,30 +272,24 @@ VENDORS: dict[str, VendorSpec] = {
 }
 
 
-# Whether the 5-search budget is ENFORCED by the API, or merely observed.
-# Anthropic's web_search takes max_uses; OpenAI's hosted web_search publishes no
-# equivalent, so its native arm can exceed the budget every other arm is held to.
-# That is a real threat to the native-vs-harness contrast within OpenAI, so it is
-# recorded per run rather than papered over. budget_economy still scores the
-# observed count, which is what surfaces a violation.
-NATIVE_BUDGET_ENFORCED = {"anthropic": True, "openai": False}
+# Whether the five-call budget is enforced by the provider API. Anthropic's
+# max_uses counts searches per request, so pause_turn continuations receive only
+# the remaining budget. OpenAI's max_tool_calls also covers page actions.
+NATIVE_BUDGET_ENFORCED = {"anthropic": True, "openai": True}
 
-# What each search layer's date field actually MEANS. temporal_grounding treats
-# `published_date` as a publication timestamp. You.com now returns BOTH web and
-# news results: web page_age is last-modified, but news page_age is a
-# publication timestamp. The merged result list carries mixed semantics, so the
-# construct is stronger than before for news-intent queries but not uniform.
-# Anthropic native's page_age is last-modified, and OpenAI native has no date
-# field. A re-rendered web page still looks fresh without carrying new
-# information.
+# What each search layer's date field can support. You.com exposes `page_age`
+# but its current API reference does not define one publication-time construct
+# across both web and news sections. Anthropic defines page_age as the page's
+# last-updated time. Neither value is treated as publication time unless a
+# result is explicitly marked as news below.
 #
 # Freshness conclusions should rest on Corvus-QA's recency_rung — dataset ground
 # truth about when the fact actually changed — rather than on vendor metadata.
 # Rows still record the semantic so this stays visible.
 DATE_FIELD_SEMANTICS = {
-    "youdotcom": "mixed",                # web: last_modified, news: publication
-    "anthropic_native": "last_modified",  # page_age
-    "openai_native": None,                # no date field at all
+    "youdotcom": "sectioned_provider_page_age",
+    "anthropic_native": "last_updated",
+    "openai_native": None,
 }
 
 
@@ -681,7 +675,18 @@ class NativeRun:
     # counting parsed blocks: a search whose results were dropped from the
     # response still consumed budget and still costs money.
     vendor_search_count: int | None = None
-    exclusion_enforced: bool = False
+    # The request carried the configured domain filter. Provider-side policy
+    # and the returned URLs determine whether it was actually honored.
+    exclusion_requested: bool = False
+    # Search requests that the provider documents as billable. This can differ
+    # from attempts when a server-side search returns an error.
+    billable_searches: int | None = None
+    # Native providers can expose actions besides a search query (for example,
+    # opening a page or finding text in it). Keep those out of the normalized
+    # search trajectory while retaining the complete action audit trail.
+    native_actions: list = field(default_factory=list)
+    emitted_queries: list[str] = field(default_factory=list)
+    response_model: str | None = None
     citations: list = field(default_factory=list)
     search_errors: list = field(default_factory=list)
     refused: bool = False
@@ -700,6 +705,14 @@ def _domain_of(url: str) -> str:
 ANTHROPIC_MAX_BLOCKED_DOMAINS = 50
 # OpenAI documents up to 100 entries in filters.blocked_domains.
 OPENAI_MAX_BLOCKED_DOMAINS = 100
+
+# Shared with the You.com harness request in run_eval.py. Pinning an approximate
+# location avoids routing each arm from a different gateway/provider geography.
+SEARCH_USER_LOCATION = {
+    "type": "approximate",
+    "country": "US",
+    "timezone": "America/Los_Angeles",
+}
 
 
 
@@ -757,28 +770,35 @@ def anthropic_native_search(
     max_searches: int,
 ) -> NativeRun:
     """Run one question through Claude's server-side web_search tool."""
-    tool = {
+    tool_base = {
         "type": ANTHROPIC_WEB_SEARCH_TOOL_TYPE,
         "name": "web_search",
-        # A hard cap, matching the harness arms' search budget exactly.
-        "max_uses": max_searches,
         "allowed_callers": ANTHROPIC_WEB_SEARCH_ALLOWED_CALLERS,
+        "user_location": SEARCH_USER_LOCATION,
     }
     blocked = exclude_domains[:ANTHROPIC_MAX_BLOCKED_DOMAINS]
     if blocked:
         # Gold-source exclusion IS enforceable here, so the leakage rule applies
         # to this arm on the same terms as the harness arms.
-        tool["blocked_domains"] = blocked
+        tool_base["blocked_domains"] = blocked
 
     run = NativeRun(
         final_answer="",
         surface=SURFACE_NO_SNIPPET,
-        exclusion_enforced=bool(blocked),
+        exclusion_requested=bool(blocked),
     )
     messages = [{"role": "user", "content": question}]
     texts: list[str] = []
+    searches_used = 0
 
     for _ in range(ANTHROPIC_MAX_PAUSE_TURNS + 1):
+        remaining_searches = max_searches - searches_used
+        if remaining_searches <= 0:
+            break
+        # max_uses is scoped to one Messages request. Supplying the remaining
+        # cumulative budget prevents a pause_turn continuation from resetting
+        # the arm to another five searches.
+        tool = {**tool_base, "max_uses": remaining_searches}
         response = client.messages.create(
             model=model,
             max_tokens=ANTHROPIC_MAX_TOKENS,
@@ -788,6 +808,8 @@ def anthropic_native_search(
             thinking=ANTHROPIC_THINKING,
             output_config={"effort": ANTHROPIC_EFFORT},
         )
+        if run.response_model is None:
+            run.response_model = _attr(response, "model")
         usage = _attr(response, "usage")
         billable_input, cached_input = _anthropic_token_split(usage)
         run.prompt_tokens += billable_input
@@ -796,9 +818,14 @@ def anthropic_native_search(
         server_use = _attr(usage, "server_tool_use")
         requests = _attr(server_use, "web_search_requests")
         if requests is not None:
-            run.vendor_search_count = (run.vendor_search_count or 0) + int(requests)
+            request_count = int(requests)
+            run.vendor_search_count = (run.vendor_search_count or 0) + request_count
+            searches_used += request_count
 
+        trajectory_before = len(run.trajectory)
         _parse_anthropic_content(response, run, texts)
+        if requests is None:
+            searches_used += len(run.trajectory) - trajectory_before
 
         stop = _attr(response, "stop_reason")
         if stop == "refusal":
@@ -824,6 +851,10 @@ def anthropic_native_search(
         if run.vendor_search_count is not None
         else len(run.trajectory)
     )
+    # Anthropic documents failed web searches as unbilled. Preserve attempts in
+    # n_searches for reliability and budget analysis, but exclude parsed error
+    # results from the search-fee estimate.
+    run.billable_searches = max(0, run.n_searches - len(run.search_errors))
     return run
 
 
@@ -845,6 +876,9 @@ def _parse_anthropic_content(response, run: NativeRun, texts: list[str]) -> None
         elif btype == "server_tool_use" and _attr(block, "name") == "web_search":
             args = _attr(block, "input") or {}
             query = args.get("query", "") if isinstance(args, dict) else ""
+            if isinstance(query, str):
+                run.emitted_queries.append(query)
+            run.native_actions.append({"type": "search", "query": query})
             pending[_attr(block, "id") or ""] = query
         elif btype == "web_search_tool_result":
             query = pending.pop(_attr(block, "tool_use_id") or "", "")
@@ -871,6 +905,7 @@ def _parse_anthropic_content(response, run: NativeRun, texts: list[str]) -> None
                     # No snippet field exists on web_search_result.
                     "snippet": "",
                     "published_date": _attr(item, "page_age"),
+                    "date_semantics": "last_updated",
                 })
             run.trajectory.append({
                 "type": "search",
@@ -907,6 +942,7 @@ def openai_native_search(
     question: str,
     exclude_domains: list[str],
     effort: str | None = None,
+    max_searches: int = 5,
 ) -> NativeRun:
     """Run one question through OpenAI's hosted Responses web_search tool.
 
@@ -917,6 +953,7 @@ def openai_native_search(
     tool: dict = {
         "type": OPENAI_WEB_SEARCH_TOOL_TYPE,
         "search_context_size": OPENAI_SEARCH_CONTEXT_SIZE,
+        "user_location": SEARCH_USER_LOCATION,
     }
     blocked = exclude_domains[:OPENAI_MAX_BLOCKED_DOMAINS]
     if blocked:
@@ -930,6 +967,7 @@ def openai_native_search(
         instructions=system_prompt,
         input=question,
         tools=[tool],
+        max_tool_calls=max_searches,
         max_output_tokens=OPENAI_MAX_OUTPUT_TOKENS,
         **extra,
         # Without this include, the response carries only inline url_citation
@@ -944,8 +982,9 @@ def openai_native_search(
         # URLs only: no per-result dates and no snippets, so temporal grounding
         # and every snippet-derived metric are unobservable on this arm.
         surface=SURFACE_URLS_ONLY,
-        exclusion_enforced=bool(blocked),
+        exclusion_requested=bool(blocked),
     )
+    run.response_model = _attr(response, "model")
     usage = _attr(response, "usage")
     run.prompt_tokens = int(_attr(usage, "input_tokens") or 0)
     run.cached_prompt_tokens = _openai_cached_tokens(usage)
@@ -962,12 +1001,31 @@ def openai_native_search(
         itype = _attr(item, "type")
         if itype == "web_search_call":
             action = _attr(item, "action") or {}
-            query = _attr(action, "query") or ""
+            action_type = _attr(action, "type") or "unknown"
+            singular_query = _attr(action, "query")
+            plural_queries = _attr(action, "queries") or []
+            queries = [q for q in plural_queries if isinstance(q, str)]
+            if isinstance(singular_query, str) and singular_query not in queries:
+                queries.insert(0, singular_query)
             sources = _attr(action, "sources") or []
+            action_record = {"type": action_type, "status": _attr(item, "status")}
+            if queries:
+                action_record["queries"] = queries
+                run.emitted_queries.extend(queries)
+            for field_name in ("url", "pattern"):
+                value = _attr(action, field_name)
+                if value is not None:
+                    action_record[field_name] = value
+            run.native_actions.append(action_record)
+
             results = []
             for i, source in enumerate(sources, start=1):
                 results.append({
-                    "rank": i,
+                    # OpenAI exposes a consulted-source list, not a documented
+                    # SERP rank. provider_order retains order without claiming
+                    # cross-provider ranking semantics.
+                    "rank": None,
+                    "provider_order": i,
                     "url": _attr(source, "url") or "",
                     "title": "",
                     "snippet": "",
@@ -975,11 +1033,17 @@ def openai_native_search(
                 })
             if _attr(item, "status") not in (None, "completed"):
                 run.search_errors.append({
-                    "query": query, "error_code": _attr(item, "status")})
-            run.trajectory.append({
-                "type": "search", "query": query, "tokens": 0,
-                "results": results,
-            })
+                    "query": queries[0] if queries else "",
+                    "action_type": action_type,
+                    "error_code": _attr(item, "status")})
+            if action_type == "search":
+                run.trajectory.append({
+                    "type": "search",
+                    "query": queries[0] if queries else "",
+                    "queries": queries,
+                    "tokens": 0,
+                    "results": results,
+                })
         elif itype == "message":
             for part in _attr(item, "content") or []:
                 if _attr(part, "type") == "refusal":
@@ -1004,8 +1068,13 @@ def openai_native_search(
                 result["title"] = titles.get(result["url"], "")
 
     run.final_answer = " ".join(t for t in texts if t).strip()
-    run.vendor_search_count = len(run.trajectory)
+    # max_tool_calls and web-search pricing apply to web_search_call items,
+    # including page-open/find actions. Keep this separate from search actions
+    # and emitted subqueries so the native budget is not presented as query
+    # parity with the harness.
+    run.vendor_search_count = len(run.native_actions)
     run.n_searches = len(run.trajectory)
+    run.billable_searches = run.vendor_search_count
     return run
 
 
@@ -1053,6 +1122,7 @@ class Turn:
     stop: str | None = None
     refused: bool = False
     truncated: bool = False
+    response_model: str | None = None
 
 
 class HarnessSession:
@@ -1110,6 +1180,7 @@ class OpenAIHarnessSession(HarnessSession):
             cached_prompt_tokens=_openai_cached_tokens(usage),
             completion_tokens=int(getattr(usage, "completion_tokens", 0) or 0),
             stop=getattr(response.choices[0], "finish_reason", None),
+            response_model=getattr(response, "model", None),
         )
         turn.truncated = turn.stop == "length"
         calls = getattr(message, "tool_calls", None) or []
@@ -1184,6 +1255,7 @@ class AnthropicHarnessSession(HarnessSession):
             stop=stop,
             refused=stop == "refusal",
             truncated=stop == "max_tokens",
+            response_model=getattr(response, "model", None),
         )
         texts = []
         content = getattr(response, "content", None) or []
@@ -1280,6 +1352,7 @@ class OpenAIResponsesHarnessSession(HarnessSession):
             cached_prompt_tokens=_openai_cached_tokens(usage),
             completion_tokens=int(_attr(usage, "output_tokens") or 0),
             stop=_attr(response, "status"),
+            response_model=_attr(response, "model"),
         )
         incomplete = _attr(response, "incomplete_details") or {}
         turn.truncated = _attr(incomplete, "reason") == "max_output_tokens"
