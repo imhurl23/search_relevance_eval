@@ -1136,11 +1136,11 @@ class GatewayRoutingTest(unittest.TestCase):
         """An empty x-bt-project-name is not the same as no header."""
         self._enable()
         self.assertEqual(agents.gateway_config().headers(), {})
-        self._set_env(agents.GATEWAY_PROJECT_ENV, "automations-spend-control")
+        self._set_env(agents.GATEWAY_PROJECT_ENV, "search-evals")
         self._set_env(agents.GATEWAY_ORG_ENV, "BT Staging")
         self.assertEqual(
             agents.gateway_config().headers(),
-            {"x-bt-project-name": "automations-spend-control",
+            {"x-bt-project-name": "search-evals",
              "x-bt-org-name": "BT Staging"})
 
     def test_gateway_key_overrides_the_logging_key(self):

@@ -25,6 +25,7 @@ def _args(**overrides):
         "checkpoint": None,
         "resume": False,
         "retry_running": False,
+        "retry_failed": False,
         "condition_retries": 0,
         "condition_timeout_s": 600,
         "max_concurrency": 8,
@@ -104,7 +105,29 @@ class MatrixCheckpointTest(unittest.TestCase):
             self.assertEqual(
                 commands[0][commands[0].index("--condition-attempt") + 1], "2"
             )
+            self.assertEqual(
+                commands[0][
+                    commands[0].index("--resume-experiment-attempt") + 1
+                ],
+                "1",
+            )
             self.assertIn("--condition-attempt", commands[1])
+
+    def test_legacy_checkpoint_pins_latest_partial_experiment(self):
+        state = {
+            "status": "interrupted",
+            "attempts": [
+                {"attempt": 1},
+                {"attempt": 2},
+                {"attempt": 4},
+            ],
+        }
+        self.assertEqual(
+            run_matrix._row_resume_experiment_attempt(state, 5), 4
+        )
+        self.assertEqual(
+            run_matrix._row_resume_experiment_attempt(state, 6), 4
+        )
 
     def test_timeout_is_checkpointed_as_a_failed_attempt(self):
         with TemporaryDirectory() as directory:
@@ -445,6 +468,118 @@ class EvalErrorGateTest(unittest.TestCase):
             marker = Path(directory) / "condition.done"
             run_eval._write_completion_marker(marker, "experiment-name")
             self.assertIn("experiment=experiment-name", marker.read_text())
+
+
+class RowLevelResumeTest(unittest.TestCase):
+    REQUIRED = {"judge", "deterministic"}
+
+    @staticmethod
+    def _root(row_id, root_id, **overrides):
+        value = {
+            "root_span_id": root_id,
+            "origin": {
+                "object_type": "dataset",
+                "object_id": "dataset-1",
+                "id": row_id,
+            },
+            "output": {"answer": "ok"},
+            "error": None,
+            "metadata": {},
+        }
+        value.update(overrides)
+        return value
+
+    @staticmethod
+    def _score(root_id, *names):
+        return {
+            "root_span_id": root_id,
+            "scores": {name: 1.0 for name in names},
+        }
+
+    def test_only_fully_scored_roots_count_as_complete(self):
+        roots = [
+            self._root("row-a", "root-a"),
+            self._root("row-b", "root-b"),
+            self._root("row-c", "root-c", output=None),
+            self._root(
+                "row-d",
+                "root-d",
+                metadata={"scorer_errors": {"judge": "failed"}},
+            ),
+        ]
+        scorers = [
+            self._score("root-a", "judge", "deterministic"),
+            self._score("root-b", "judge"),
+            self._score("root-c", "judge", "deterministic"),
+            self._score("root-d", "judge", "deterministic"),
+        ]
+        self.assertEqual(
+            run_eval._completed_trials_by_row(
+                roots, scorers, self.REQUIRED, "dataset-1"
+            ),
+            {"row-a": 1},
+        )
+
+    def test_remaining_rows_carry_only_missing_trial_counts(self):
+        rows = [{"id": "row-a"}, {"id": "row-b"}, {"id": "row-c"}]
+        remaining, executions = run_eval._rows_remaining_for_resume(
+            rows, {"row-a": 2, "row-b": 1}, trials=2
+        )
+        self.assertEqual(executions, 3)
+        self.assertEqual(
+            [(row["id"], row["trial_count"]) for row in remaining],
+            [("row-b", 1), ("row-c", 2)],
+        )
+
+    def test_remote_gate_rejects_missing_and_duplicate_valid_trials(self):
+        rows = [{"id": "row-a"}, {"id": "row-b"}]
+        with self.assertRaisesRegex(SystemExit, "still missing"):
+            run_eval._enforce_remote_resume_gate(
+                {"row-a": 1}, rows, trials=1
+            )
+        with self.assertRaisesRegex(SystemExit, "duplicate"):
+            run_eval._enforce_remote_resume_gate(
+                {"row-a": 2, "row-b": 1}, rows, trials=1
+            )
+        run_eval._enforce_remote_resume_gate(
+            {"row-a": 1, "row-b": 1}, rows, trials=1
+        )
+
+    def test_incomplete_trace_events_are_deleted_before_replacement(self):
+        events = [
+            {"id": "root", "root_span_id": "trace", "span_id": "trace"},
+            {"id": "score", "root_span_id": "trace", "span_id": "child"},
+        ]
+
+        class Writable:
+            def __init__(self):
+                self.updates = []
+                self.flushed = False
+
+            def update_span(self, event_id, **event):
+                self.updates.append((event_id, event))
+
+            def flush(self):
+                self.flushed = True
+
+        writable = Writable()
+        with (
+            patch.object(
+                run_eval, "_fetch_experiment_events", return_value=events
+            ),
+            patch.object(
+                run_eval, "init_experiment", return_value=writable
+            ),
+        ):
+            deleted = run_eval._delete_incomplete_experiment_traces(
+                object(), "project", "experiment", "key", {"trace"}
+            )
+        self.assertEqual(deleted, 2)
+        self.assertTrue(writable.flushed)
+        self.assertEqual(
+            [event["_object_delete"] for _, event in writable.updates],
+            [True, True],
+        )
 
 
 if __name__ == "__main__":

@@ -71,10 +71,47 @@ from __future__ import annotations
 
 import json
 import os
+import sys
+import time
 from dataclasses import dataclass, field
 from urllib.parse import urlparse
 
 from openai import OpenAI
+
+
+def _model_call_with_backoff(call, **kwargs):
+    """Retry transient gateway/provider throttles with exponential backoff."""
+    for attempt in range(6):
+        try:
+            return call(**kwargs)
+        except Exception as exc:
+            status = getattr(exc, "status_code", None)
+            if status is None:
+                response = getattr(exc, "response", None)
+                status = getattr(response, "status_code", None)
+            if status in (402, 403, 429) and attempt == 5:
+                try:
+                    from pathlib import Path
+                    Path(".eval-checkpoints/gateway-cap-stop").write_text(
+                        f"status={status}\n", encoding="utf-8")
+                except OSError:
+                    pass
+            if status != 429 or attempt == 5:
+                raise
+            response = getattr(exc, "response", None)
+            headers = getattr(response, "headers", {}) or {}
+            try:
+                retry_after = float(headers.get("retry-after", 0) or 0)
+            except (TypeError, ValueError):
+                retry_after = 0.0
+            delay = max(retry_after, float(2 ** attempt))
+            print(
+                f"Model request throttled (429); retrying in {delay:g}s "
+                f"(attempt {attempt + 2}/6).",
+                file=sys.stderr,
+                flush=True,
+            )
+            time.sleep(delay)
 
 # ---------------------------------------------------------------------------
 # Axes
@@ -960,7 +997,8 @@ def openai_native_search(
     if effort:
         extra["reasoning"] = {"effort": effort}
 
-    response = client.responses.create(
+    response = _model_call_with_backoff(
+        client.responses.create,
         model=model,
         instructions=system_prompt,
         input=question,
@@ -1168,7 +1206,8 @@ class OpenAIHarnessSession(HarnessSession):
         kwargs = dict(self.spec.sampling)
         if tools_enabled:
             kwargs["tools"] = self.tools
-        response = self.client.chat.completions.create(
+        response = _model_call_with_backoff(
+            self.client.chat.completions.create,
             model=self.model, messages=self.messages, **kwargs)
         usage = getattr(response, "usage", None)
         message = response.choices[0].message
@@ -1337,7 +1376,8 @@ class OpenAIResponsesHarnessSession(HarnessSession):
             kwargs["tool_choice"] = "none"
         if self.spec.reasoning_effort:
             kwargs["reasoning"] = {"effort": self.spec.reasoning_effort}
-        response = self.client.responses.create(
+        response = _model_call_with_backoff(
+            self.client.responses.create,
             model=self.model,
             instructions=self.system_prompt,
             input=self.input,

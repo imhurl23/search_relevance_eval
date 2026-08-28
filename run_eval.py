@@ -76,7 +76,8 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import httpx
-from braintrust import Eval, current_span, init_dataset, traced, wrap_openai
+from braintrust import (Eval, current_span, init as init_experiment,
+                        init_dataset, traced, wrap_openai)
 from openai import OpenAI
 
 import agents
@@ -685,6 +686,21 @@ def condition_label(search_mode: str, arm: str, model_vendor: str) -> str:
     return f"harness-{SEARCH_PROVIDER}-{arm}"
 
 
+def condition_experiment_name(
+    study_id: str,
+    dataset_name: str,
+    agent_model: str,
+    condition: str,
+    experiment_attempt: int = 1,
+) -> str:
+    """Return the stable Braintrust experiment used across row-level retries."""
+    model_slug = re.sub(r"[^a-zA-Z0-9_.-]+", "-", agent_model)
+    name = f"{study_id}-{dataset_name}-{model_slug}-{condition}"
+    if experiment_attempt > 1:
+        name += f"-retry-{experiment_attempt:02d}"
+    return name
+
+
 def make_task(
     arm: str,
     agent_model: str = AGENT_MODEL,
@@ -1185,6 +1201,264 @@ def select_rows(
     }
 
 
+def _dataset_with_rows(dataset, rows: list[dict]):
+    """Return a locally filtered Dataset while retaining dataset-origin links.
+
+    Braintrust only records ``origin.id`` when Eval receives a Dataset object.
+    Replace the already-fetched local cache while retaining the Dataset
+    instance. Braintrust's Dataset implements dynamic attribute lookup, so a
+    generic shallow copy recursively trips that lookup; this local cache
+    mutation is confined to the child process.
+    """
+    if not hasattr(dataset, "_fetched_data"):
+        return rows
+    dataset._fetched_data = rows
+    return dataset
+
+
+def _btql_filter_eq(path: list[str], value) -> dict:
+    return {
+        "op": "eq",
+        "left": {"op": "ident", "name": path},
+        "right": {"op": "literal", "value": value},
+    }
+
+
+def _fetch_experiment_events(experiment, filter_expr: dict) -> list[dict]:
+    """Fetch filtered experiment events from Braintrust with pagination."""
+    events: list[dict] = []
+    cursor = None
+    while True:
+        query = {
+            "select": [{"op": "star"}],
+            "from": {
+                "op": "function",
+                "name": {"op": "ident", "name": ["experiment"]},
+                "args": [{"op": "literal", "value": experiment.id}],
+            },
+            "filter": filter_expr,
+            "cursor": cursor,
+            "limit": 1000,
+        }
+        response = experiment.state.api_conn().post(
+            "btql",
+            json={
+                "query": query,
+                "use_columnstore": False,
+                "brainstore_realtime": True,
+                "query_source": "search_relevance_eval_row_resume",
+            },
+            headers={"Accept-Encoding": "gzip"},
+        )
+        response.raise_for_status()
+        payload = response.json()
+        events.extend(payload.get("data") or [])
+        cursor = payload.get("cursor")
+        if not cursor:
+            return events
+
+
+def _open_existing_experiment(
+    project_name: str,
+    experiment_name: str,
+    api_key: str,
+):
+    try:
+        experiment = init_experiment(
+            project=project_name,
+            experiment=experiment_name,
+            open=True,
+            api_key=api_key,
+            set_current=False,
+        )
+        # Braintrust resolves ``open=True`` lazily; force the lookup here so a
+        # genuinely new experiment can fall through to creation instead of
+        # failing later during row-audit.
+        _ = experiment.id
+        return experiment
+    except ValueError as exc:
+        if "not found" in str(exc).lower():
+            return None
+        raise
+
+
+def _required_score_names(judge_count: int) -> set[str]:
+    judge_score = "simpleqa_grade" if judge_count == 1 else "jury_grade"
+    return {judge_score, *(scorer.__name__ for scorer in DETERMINISTIC_SCORERS)}
+
+
+def _completed_trials_by_row(
+    roots: list[dict],
+    scorer_events: list[dict],
+    required_scores: set[str],
+    dataset_id: str,
+) -> dict[str, int]:
+    """Count fully task-and-score-complete trials by stable dataset row ID."""
+    scores_by_root: dict[str, set[str]] = {}
+    for event in scorer_events:
+        root_id = event.get("root_span_id")
+        if root_id:
+            scores_by_root.setdefault(root_id, set()).update(
+                (event.get("scores") or {}).keys()
+            )
+
+    completed: dict[str, int] = {}
+    for root in roots:
+        origin = root.get("origin") or {}
+        row_id = origin.get("id")
+        if not row_id or not _root_trial_is_complete(
+            root, scores_by_root, required_scores, dataset_id
+        ):
+            continue
+        key = str(row_id)
+        completed[key] = completed.get(key, 0) + 1
+    return completed
+
+
+def _root_trial_is_complete(
+    root: dict,
+    scores_by_root: dict[str, set[str]],
+    required_scores: set[str],
+    dataset_id: str,
+) -> bool:
+    origin = root.get("origin") or {}
+    metadata = root.get("metadata") or {}
+    return bool(
+        origin.get("id")
+        and origin.get("object_type") == "dataset"
+        and origin.get("object_id") == dataset_id
+        and root.get("output") is not None
+        and root.get("error") is None
+        and not metadata.get("scorer_errors")
+        and not metadata.get("classifier_errors")
+        and required_scores.issubset(
+            scores_by_root.get(root.get("root_span_id"), set())
+        )
+    )
+
+
+def _experiment_row_progress(
+    project_name: str,
+    experiment_name: str,
+    api_key: str,
+    dataset_id: str,
+    required_scores: set[str],
+) -> tuple[object | None, dict[str, int], set[str]]:
+    experiment = _open_existing_experiment(
+        project_name, experiment_name, api_key
+    )
+    if experiment is None:
+        return None, {}, set()
+    roots = _fetch_experiment_events(
+        experiment, _btql_filter_eq(["is_root"], True)
+    )
+    scorer_events = _fetch_experiment_events(
+        experiment,
+        _btql_filter_eq(["span_attributes", "purpose"], "scorer"),
+    )
+    scores_by_root: dict[str, set[str]] = {}
+    for event in scorer_events:
+        root_id = event.get("root_span_id")
+        if root_id:
+            scores_by_root.setdefault(root_id, set()).update(
+                (event.get("scores") or {}).keys()
+            )
+    invalid_root_ids = {
+        root["root_span_id"]
+        for root in roots
+        if (root.get("origin") or {}).get("object_id") == dataset_id
+        and not _root_trial_is_complete(
+            root, scores_by_root, required_scores, dataset_id
+        )
+    }
+    return experiment, _completed_trials_by_row(
+        roots, scorer_events, required_scores, dataset_id
+    ), invalid_root_ids
+
+
+def _delete_incomplete_experiment_traces(
+    readonly_experiment,
+    project_name: str,
+    experiment_name: str,
+    api_key: str,
+    root_ids: set[str],
+) -> int:
+    """Remove incomplete traces before rerunning their dataset rows.
+
+    This prevents already-finished scorers from an interrupted trace from
+    contributing a second time when that row is rerun. Braintrust retains the
+    delete in its audit history, while normal experiment queries and summaries
+    see only the replacement trace.
+    """
+    if not root_ids:
+        return 0
+    events = _fetch_experiment_events(
+        readonly_experiment,
+        {
+            "op": "in",
+            "left": {"op": "ident", "name": ["root_span_id"]},
+            "right": {"op": "literal", "value": sorted(root_ids)},
+        },
+    )
+    writable = init_experiment(
+        project=project_name,
+        experiment=experiment_name,
+        update=True,
+        api_key=api_key,
+        set_current=False,
+    )
+    for event in events:
+        writable.update_span(
+            event["id"],
+            root_span_id=event.get("root_span_id"),
+            span_id=event.get("span_id"),
+            _object_delete=True,
+        )
+    writable.flush()
+    return len(events)
+
+
+def _rows_remaining_for_resume(
+    rows: list[dict], completed_trials: dict[str, int], trials: int
+) -> tuple[list[dict], int]:
+    """Build rows with per-row trial counts equal to the unfinished work."""
+    remaining_rows = []
+    remaining_trials = 0
+    for row in rows:
+        row_id = str(row.get("id", ""))
+        finished = min(completed_trials.get(row_id, 0), trials)
+        missing = trials - finished
+        if missing:
+            selected = dict(row)
+            selected["trial_count"] = missing
+            remaining_rows.append(selected)
+            remaining_trials += missing
+    return remaining_rows, remaining_trials
+
+
+def _enforce_remote_resume_gate(
+    completed_trials: dict[str, int], rows: list[dict], trials: int
+) -> None:
+    expected_ids = {str(row.get("id", "")) for row in rows}
+    missing = {
+        row_id: trials - completed_trials.get(row_id, 0)
+        for row_id in expected_ids
+        if completed_trials.get(row_id, 0) < trials
+    }
+    duplicates = {
+        row_id: count - trials
+        for row_id, count in completed_trials.items()
+        if row_id in expected_ids and count > trials
+    }
+    if missing or duplicates:
+        raise SystemExit(
+            "row-resume verification failed: "
+            f"{sum(missing.values())} trial(s) still missing across "
+            f"{len(missing)} row(s); {sum(duplicates.values())} duplicate "
+            f"valid trial(s) across {len(duplicates)} row(s)"
+        )
+
+
 def _git_commit() -> str:
     try:
         return subprocess.check_output(
@@ -1273,11 +1547,26 @@ def _gateway_failure(resp, agent_model: str) -> str:
 
 def _gateway_preflight(gw, spec, agent_model: str, search_mode: str) -> None:
     """Confirm the gateway will actually serve this arm's model."""
-    try:
-        resp = _gateway_probe(gw, spec, agent_model)
-    except httpx.HTTPError as exc:
-        raise SystemExit(
-            f"Could not reach the gateway at {gw.root}: {exc}") from None
+    for attempt in range(6):
+        try:
+            resp = _gateway_probe(gw, spec, agent_model)
+        except httpx.HTTPError as exc:
+            raise SystemExit(
+                f"Could not reach the gateway at {gw.root}: {exc}") from None
+        if resp.status_code != 429 or attempt == 5:
+            break
+        retry_after = resp.headers.get("Retry-After", "")
+        try:
+            delay = max(float(retry_after), float(2 ** attempt))
+        except (TypeError, ValueError):
+            delay = float(2 ** attempt)
+        print(
+            f"Gateway preflight throttled (429); retrying in {delay:g}s "
+            f"(attempt {attempt + 2}/6).",
+            file=sys.stderr,
+            flush=True,
+        )
+        time.sleep(delay)
     if resp.status_code >= 400:
         raise SystemExit(_gateway_failure(resp, agent_model))
     if search_mode == SEARCH_MODE_NATIVE:
@@ -1526,7 +1815,8 @@ def run(arm: str, dataset_name: str, dataset_version: str | None,
         max_row_error_rate: float = 0.0,
         max_concurrency: int = 8,
         ydc_requests_per_second: float = DEFAULT_YDC_REQUESTS_PER_SECOND,
-        completion_marker: Path | None = None):
+        completion_marker: Path | None = None,
+        resume_experiment_attempt: int | None = None):
     api_key, project_id = load_runtime_env(env_path)
     _preflight(arm, search_mode, model_vendor, agent_model)
     spec = vendor_of(model_vendor)
@@ -1555,6 +1845,11 @@ def run(arm: str, dataset_name: str, dataset_version: str | None,
               f"(split={subset['split'] or 'all'}, limit={limit}) "
               f"subset_id={subset['subset_id']}")
 
+    # Eval must receive a Dataset (not a list) to preserve origin.id. That
+    # stable dataset row ID is the key used by row-level resume.
+    selected_rows = list(data)
+    data = _dataset_with_rows(dataset, selected_rows)
+
     judges = build_judges(judge_specs)
     # One judge keeps SimpleQA parity with LiveNewsBench's published numbers;
     # several convene a jury. Both emit exactly one score per row.
@@ -1571,38 +1866,80 @@ def run(arm: str, dataset_name: str, dataset_version: str | None,
 
     condition = condition_label(search_mode, arm, model_vendor)
     condition_id = f"{model_vendor}:{agent_model}::{condition}"
-    model_slug = re.sub(r"[^a-zA-Z0-9_.-]+", "-", agent_model)
-    experiment_name = f"{study_id}-{dataset.name}-{model_slug}-{condition}"
-    if condition_attempt > 1:
-        # A retry is a new experiment, not an append into a partial attempt.
-        # This keeps denominators clean and makes the checkpoint's chosen
-        # successful attempt explicit.
-        experiment_name += f"-retry-{condition_attempt:02d}"
+    experiment_attempt = resume_experiment_attempt or condition_attempt
+    experiment_name = condition_experiment_name(
+        study_id, dataset.name, agent_model, condition, experiment_attempt
+    )
+    required_scores = _required_score_names(len(judges))
+    existing_experiment, completed_trials, incomplete_root_ids = (
+        _experiment_row_progress(
+            project_name,
+            experiment_name,
+            api_key,
+            dataset.id,
+            required_scores,
+        )
+    )
+    remaining_rows, remaining_trials = _rows_remaining_for_resume(
+        selected_rows, completed_trials, trials
+    )
+    already_complete = len(selected_rows) * trials - remaining_trials
+    print(
+        f"Row resume: {already_complete}/{len(selected_rows) * trials} "
+        f"trial(s) already complete in {experiment_name}; "
+        f"{remaining_trials} remaining"
+    )
+    # Catch a contaminated experiment before adding more rows. Incomplete or
+    # failed roots are ignored, but multiple fully valid trials are not.
+    duplicate_valid_trials = sum(
+        max(0, count - trials) for count in completed_trials.values()
+    )
+    if duplicate_valid_trials:
+        raise SystemExit(
+            f"row-resume experiment already contains {duplicate_valid_trials} "
+            "duplicate valid trial(s); refusing to append"
+        )
+    if existing_experiment is not None and incomplete_root_ids:
+        deleted_events = _delete_incomplete_experiment_traces(
+            existing_experiment,
+            project_name,
+            experiment_name,
+            api_key,
+            incomplete_root_ids,
+        )
+        print(
+            f"Row resume: removed {len(incomplete_root_ids)} incomplete "
+            f"trace(s) ({deleted_events} events) before replacement"
+        )
+    data = _dataset_with_rows(dataset, remaining_rows)
     native_rate, rate_confirmed = native_search_rate_usd(model_vendor, agent_model)
     # Sampling parity is NOT achievable across vendors: both frontier vendors
     # reject sampling parameters outright and no vendor here supports `seed`.
     # Record what each arm received instead of implying a frozen config.
     sampling = dict(spec.sampling)
 
-    eval_result = Eval(
-        project_name,
-        experiment_name=experiment_name,
-        data=data,
-        task=make_task(
-            arm,
-            agent_model,
-            study_id,
-            dataset.name,
-            str(resolved_version),
-            search_mode,
-            model_vendor,
-            ydc_requests_per_second,
-        ),
-        scores=[judge, *DETERMINISTIC_SCORERS],
-        trial_count=trials,          # web nondeterminism > model nondeterminism
-        timeout=eval_timeout_s,
-        max_concurrency=max_concurrency,
-        metadata={
+    eval_result = None
+    if remaining_trials:
+        eval_result = Eval(
+            project_name,
+            experiment_name=experiment_name,
+            update=True,
+            data=data,
+            task=make_task(
+                arm,
+                agent_model,
+                study_id,
+                dataset.name,
+                str(resolved_version),
+                search_mode,
+                model_vendor,
+                ydc_requests_per_second,
+            ),
+            scores=[judge, *DETERMINISTIC_SCORERS],
+            trial_count=trials,      # per-row overrides contain missing trials
+            timeout=eval_timeout_s,
+            max_concurrency=max_concurrency,
+            metadata={
             # --- matrix axes ---
             "model_class": spec.model_class,
             "model_vendor": model_vendor,
@@ -1629,6 +1966,10 @@ def run(arm: str, dataset_name: str, dataset_version: str | None,
             "matrix_condition_concurrency": matrix_condition_concurrency,
             "matrix_schedule_policy": matrix_schedule_policy,
             "condition_attempt": condition_attempt,
+            "row_resume_experiment_attempt": experiment_attempt,
+            "row_resume_enabled": True,
+            "row_resume_trials_already_complete": already_complete,
+            "row_resume_trials_launched": remaining_trials,
             "eval_timeout_s": eval_timeout_s,
             "max_row_error_rate": max_row_error_rate,
             "max_concurrency": max_concurrency,
@@ -1770,13 +2111,36 @@ def run(arm: str, dataset_name: str, dataset_version: str | None,
             "question_transform_version": (
                 "retrievalqa-answer-as-of-v1"
                 if dataset.name == RETRIEVALQA_DATASET_NAME else "identity-v1"),
-        },
-    )
-    expected_results = (
-        subset["n_rows"] * trials if subset["n_rows"] is not None else None
-    )
-    _enforce_eval_result_gate(
-        eval_result, expected_results, max_row_error_rate
+            },
+        )
+        _enforce_eval_result_gate(
+            eval_result, remaining_trials, max_row_error_rate
+        )
+
+    # Brainstore is normally current immediately after Eval.flush(), but retry
+    # the read briefly before failing a completed child on ingestion latency.
+    verification_error = None
+    for verification_attempt in range(5):
+        _, combined_trials, _ = _experiment_row_progress(
+            project_name,
+            experiment_name,
+            api_key,
+            dataset.id,
+            required_scores,
+        )
+        try:
+            _enforce_remote_resume_gate(combined_trials, selected_rows, trials)
+            verification_error = None
+            break
+        except SystemExit as exc:
+            verification_error = exc
+            if verification_attempt < 4:
+                time.sleep(1)
+    if verification_error is not None:
+        raise verification_error
+    print(
+        f"Row-resume gate: {len(selected_rows) * trials}/"
+        f"{len(selected_rows) * trials} complete trial(s)"
     )
     if completion_marker is not None:
         _write_completion_marker(completion_marker, experiment_name)
@@ -1851,6 +2215,12 @@ def main():
                    help="Compatibility policy supplied by run_matrix.py.")
     r.add_argument("--condition-attempt", type=int, default=1,
                    help="One-based condition attempt supplied by run_matrix.py.")
+    r.add_argument(
+        "--resume-experiment-attempt",
+        type=int,
+        default=None,
+        help=argparse.SUPPRESS,
+    )
     r.add_argument("--expected-rows", type=int, default=None,
                    help="Abort before Eval if the selected row count differs.")
     r.add_argument("--eval-timeout-s", type=float, default=None,
@@ -1890,6 +2260,9 @@ def main():
         ap.error("--trials must be at least 1")
     if args.condition_attempt < 1:
         ap.error("--condition-attempt must be at least 1")
+    if (args.resume_experiment_attempt is not None
+            and args.resume_experiment_attempt < 1):
+        ap.error("--resume-experiment-attempt must be at least 1")
     if args.expected_rows is not None and args.expected_rows < 1:
         ap.error("--expected-rows must be at least 1")
     if args.eval_timeout_s is not None and args.eval_timeout_s <= 0:
@@ -1930,7 +2303,8 @@ def main():
         args.matrix_condition_concurrency, args.matrix_schedule_policy,
         args.condition_attempt, args.expected_rows, args.eval_timeout_s,
         args.max_row_error_rate, args.max_concurrency,
-        args.ydc_requests_per_second, args.completion_marker)
+        args.ydc_requests_per_second, args.completion_marker,
+        args.resume_experiment_attempt)
 
 
 if __name__ == "__main__":

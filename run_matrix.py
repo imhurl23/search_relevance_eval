@@ -98,6 +98,7 @@ def condition_command(
     index: int,
     attempt: int = 1,
     completion_marker: Path | None = None,
+    resume_experiment_attempt: int | None = None,
 ) -> list[str]:
     command = [
         sys.executable,
@@ -114,6 +115,9 @@ def condition_command(
         "--matrix-order-seed", args.order_seed or args.study_id,
         "--matrix-order-index", str(index),
         "--condition-attempt", str(attempt),
+        "--resume-experiment-attempt", str(
+            resume_experiment_attempt or attempt
+        ),
         "--eval-timeout-s", str(args.condition_timeout_s - 60),
         "--max-row-error-rate", str(args.max_row_error_rate),
         "--max-concurrency", str(args.max_concurrency),
@@ -131,6 +135,23 @@ def condition_command(
     if completion_marker is not None:
         command.extend(["--completion-marker", str(completion_marker)])
     return command
+
+
+def _row_resume_experiment_attempt(state: dict, next_attempt: int) -> int:
+    """Pin all future retries to one Braintrust experiment.
+
+    New conditions pin their first attempt. Checkpoints created before row-level
+    resume pin the most recent partial attempt, preserving the work that was in
+    flight when the launcher was stopped.
+    """
+    pinned = state.get("row_resume_experiment_attempt")
+    if pinned is None:
+        pinned = (
+            int(state["attempts"][-1]["attempt"])
+            if state.get("attempts") else next_attempt
+        )
+        state["row_resume_experiment_attempt"] = pinned
+    return int(pinned)
 
 
 def _utc_now() -> str:
@@ -231,10 +252,30 @@ def _load_or_create_checkpoint(
         if checkpoint.get("schema_version") != CHECKPOINT_SCHEMA_VERSION:
             raise SystemExit(f"unsupported checkpoint schema in {path}")
         if checkpoint.get("fingerprint") != fingerprint:
-            raise SystemExit(
-                f"checkpoint plan does not match this launch: {path}. "
-                "Dataset, order, commit, concurrency, and error policy must match."
+            previous = checkpoint.get("fingerprint") or {}
+            # Operational row concurrency is intentionally mutable on resume:
+            # a provider can throttle an otherwise identical study. Preserve
+            # every scientific-plan field while recording the new setting.
+            mutable = {"max_concurrency"}
+            same_plan = (
+                {k: v for k, v in previous.items() if k not in mutable}
+                == {k: v for k, v in fingerprint.items() if k not in mutable}
             )
+            if not same_plan:
+                raise SystemExit(
+                    f"checkpoint plan does not match this launch: {path}. "
+                    "Dataset, order, commit, and error policy must match."
+                )
+            changes = checkpoint.setdefault("configuration_changes", [])
+            changes.append({
+                "at": _utc_now(),
+                "field": "max_concurrency",
+                "from": previous.get("max_concurrency"),
+                "to": fingerprint.get("max_concurrency"),
+                "reason": "provider rate-limit backoff",
+            })
+            checkpoint["fingerprint"] = fingerprint
+            _write_checkpoint(path, checkpoint)
         return checkpoint
     if args.resume:
         raise SystemExit(f"--resume requested but checkpoint does not exist: {path}")
@@ -307,6 +348,9 @@ def _run_conditions(
             return 1
 
         for attempt in range(attempts_used + 1, max_attempts + 1):
+            resume_experiment_attempt = _row_resume_experiment_attempt(
+                state, attempt
+            )
             condition_hash = hashlib.sha256(
                 condition.label.encode("utf-8")
             ).hexdigest()[:12]
@@ -315,7 +359,12 @@ def _run_conditions(
                 f"{checkpoint_path.stem}-{condition_hash}-{attempt:02d}.done"
             )
             command = condition_command(
-                condition, args, index, attempt, completion_marker
+                condition,
+                args,
+                index,
+                attempt,
+                completion_marker,
+                resume_experiment_attempt,
             )
             attempt_record = {
                 "attempt": attempt,
@@ -459,6 +508,11 @@ def _reconcile_parallel_checkpoint(
     changed = False
     for condition in conditions:
         state = checkpoint["conditions"][condition.label]
+        if args.retry_failed and state["status"] == "failed":
+            state.setdefault("prior_attempts", []).extend(state["attempts"])
+            state["attempts"] = []
+            state["status"] = "pending"
+            changed = True
         for prior_attempt in reversed(state["attempts"]):
             marker = prior_attempt.get("completion_marker")
             if marker and Path(marker).is_file():
@@ -501,10 +555,26 @@ def _run_conditions_parallel(
     max_attempts = 1 + args.condition_retries
     active: dict[str, _ActiveCondition] = {}
     exhausted_failure = False
+    gateway_stop_file = checkpoint_path.parent / "gateway-cap-stop"
 
     try:
         while True:
             now = time.monotonic()
+            if gateway_stop_file.exists():
+                print("Gateway budget stop detected; stopping active conditions.")
+                for item in active.values():
+                    _signal_process_group(item.process, signal.SIGINT)
+                for item in active.values():
+                    item.process.wait(timeout=10)
+                    item.attempt_record.update({
+                        "finished_at": _utc_now(),
+                        "returncode": 130,
+                        "failure": "gateway budget stop",
+                    })
+                    checkpoint["conditions"][item.condition.label]["status"] = "failed"
+                checkpoint["status"] = "gateway_budget_exhausted"
+                _write_checkpoint(checkpoint_path, checkpoint)
+                return 2
             for label, item in list(active.items()):
                 returncode = item.process.poll()
                 failure = None
@@ -542,60 +612,66 @@ def _run_conditions_parallel(
                 del active[label]
                 _write_checkpoint(checkpoint_path, checkpoint)
 
-            if exhausted_failure:
-                if not active:
-                    print("Stopped after failed condition. Resume with: --resume")
-                    return 1
-            else:
-                while len(active) < args.condition_concurrency:
-                    selected = _next_parallel_condition(
-                        conditions, checkpoint, active, max_attempts
-                    )
-                    if selected is None:
-                        break
-                    index, condition = selected
-                    state = checkpoint["conditions"][condition.label]
-                    attempt = len(state["attempts"]) + 1
-                    condition_hash = hashlib.sha256(
-                        condition.label.encode("utf-8")
-                    ).hexdigest()[:12]
-                    completion_marker = (
-                        checkpoint_path.parent / ".attempt-markers" /
-                        f"{checkpoint_path.stem}-{condition_hash}-{attempt:02d}.done"
-                    )
-                    command = condition_command(
-                        condition, args, index, attempt, completion_marker
-                    )
-                    attempt_record = {
-                        "attempt": attempt,
-                        "started_at": _utc_now(),
-                        "command": command,
-                        "completion_marker": str(completion_marker),
-                    }
-                    state["status"] = "running"
-                    state["attempts"].append(attempt_record)
+            # An exhausted condition must not block independent conditions;
+            # keep scheduling everything else and report a nonzero result only
+            # after no runnable work remains.
+            while len(active) < args.condition_concurrency:
+                selected = _next_parallel_condition(
+                    conditions, checkpoint, active, max_attempts
+                )
+                if selected is None:
+                    break
+                index, condition = selected
+                state = checkpoint["conditions"][condition.label]
+                attempt = len(state["attempts"]) + 1
+                resume_experiment_attempt = _row_resume_experiment_attempt(
+                    state, attempt
+                )
+                condition_hash = hashlib.sha256(
+                    condition.label.encode("utf-8")
+                ).hexdigest()[:12]
+                completion_marker = (
+                    checkpoint_path.parent / ".attempt-markers" /
+                    f"{checkpoint_path.stem}-{condition_hash}-{attempt:02d}.done"
+                )
+                command = condition_command(
+                    condition,
+                    args,
+                    index,
+                    attempt,
+                    completion_marker,
+                    resume_experiment_attempt,
+                )
+                attempt_record = {
+                    "attempt": attempt,
+                    "started_at": _utc_now(),
+                    "command": command,
+                    "completion_marker": str(completion_marker),
+                }
+                state["status"] = "running"
+                state["attempts"].append(attempt_record)
+                _write_checkpoint(checkpoint_path, checkpoint)
+                print(
+                    f"[{index:02d}/{len(conditions)}] {condition.label} "
+                    f"attempt {attempt}/{max_attempts}",
+                    flush=True,
+                )
+                print(f"  {shlex.join(command)}", flush=True)
+                try:
+                    process = popen_factory(command, start_new_session=True)
+                except OSError as exc:
+                    attempt_record.update({
+                        "finished_at": _utc_now(),
+                        "returncode": 126,
+                        "failure": f"{type(exc).__name__}: {exc}",
+                    })
+                    state["status"] = "failed"
                     _write_checkpoint(checkpoint_path, checkpoint)
-                    print(
-                        f"[{index:02d}/{len(conditions)}] {condition.label} "
-                        f"attempt {attempt}/{max_attempts}",
-                        flush=True,
-                    )
-                    print(f"  {shlex.join(command)}", flush=True)
-                    try:
-                        process = popen_factory(command, start_new_session=True)
-                    except OSError as exc:
-                        attempt_record.update({
-                            "finished_at": _utc_now(),
-                            "returncode": 126,
-                            "failure": f"{type(exc).__name__}: {exc}",
-                        })
-                        state["status"] = "failed"
-                        _write_checkpoint(checkpoint_path, checkpoint)
-                        if len(state["attempts"]) >= max_attempts:
-                            exhausted_failure = True
-                            break
-                        continue
-                    active[condition.label] = _ActiveCondition(
+                    if len(state["attempts"]) >= max_attempts:
+                        exhausted_failure = True
+                        break
+                    continue
+                active[condition.label] = _ActiveCondition(
                         index=index,
                         condition=condition,
                         process=process,
@@ -611,7 +687,7 @@ def _run_conditions_parallel(
                 checkpoint["completed_at"] = _utc_now()
                 _write_checkpoint(checkpoint_path, checkpoint)
                 return 0
-            if not active and not exhausted_failure:
+            if not active:
                 # Nothing can run only when every incomplete condition has used
                 # all allowed attempts. Fail closed rather than spinning.
                 return 1
@@ -669,6 +745,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--retry-running", action="store_true",
         help="Retry a checkpoint attempt left in 'running' state after first confirming its child process is dead.",
+    )
+    parser.add_argument(
+        "--retry-failed", action="store_true",
+        help="Retry failed conditions from row checkpoints, preserving prior attempts.",
     )
     parser.add_argument(
         "--condition-retries", type=int, default=1,
@@ -731,6 +811,8 @@ def main() -> int:
         raise SystemExit("--condition-retries cannot be negative")
     if args.retry_running and not args.resume:
         raise SystemExit("--retry-running requires --resume")
+    if args.retry_failed and not args.resume:
+        raise SystemExit("--retry-failed requires --resume")
     if args.condition_timeout_s <= 60:
         raise SystemExit("--condition-timeout-s must be greater than 60")
     if args.max_concurrency < 1:
