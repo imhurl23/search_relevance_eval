@@ -137,3 +137,18 @@ silently pooled with actual highlights. Primary outcomes should include answer
 accuracy, semantic evidence sufficiency, latency, context tokens, and total
 cost. The current `snippet_sufficiency` string matcher should be supplemented
 with a blinded per-result semantic oracle.
+
+---
+
+## Attribution
+
+Questions and reference answers come from LiveNewsBench, release
+`jan_2026_release_2`, pinned at commit `8a6b96e`, MIT licensed. The benchmark is
+the work of Yunfan Zhang, Kathleen McKeown, and Smaranda Muresan —
+[arXiv:2602.13543](https://arxiv.org/abs/2602.13543). Cite it alongside any
+result taken from this report; the BibTeX entry is in the
+[repository README](../README.md#citation).
+
+The rows carry the upstream canary asking that the benchmark never enter a
+training corpus. These runs use five searches and zero page visits, which
+differs from the benchmark's default allowance of five each.

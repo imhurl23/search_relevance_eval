@@ -190,6 +190,15 @@ the 236–482 day age span in this dataset the judge retrieval gain falls from r
 at the recent end to +24 pp at the old end**. Any published "retrieval is worth X points"
 number from this benchmark is dated the moment it is written.
 
+**Event age is confounded with split membership.** LiveNewsBench builds its
+splits by event age, and the matrix spans all four splits of
+`jan_2026_release_2`: `test` and `human_verified_test` run 236-298 days, `val`
+298-329, and `train` 328-482. Age and split are therefore close to collinear, and
+the decay above is equally describable as a split effect. The no-search judge
+rate is 0.158 on `test` and 0.252 on `train`, with retrieval gains of 0.671 and
+0.547. The parametric-leakage reading survives either description, because the
+splits are defined by the same variable, but no analysis here separates the two.
+
 **Questions differ more than models do.** Adding a random slope for retrieval by task key:
 the SD of the per-question retrieval effect is **0.276** (judge) and **0.327** (gated) —
 *larger* than the SD of the question intercept (0.181 and 0.160). The random-slope model beats
@@ -234,3 +243,18 @@ questions and near-decisive on others, and that spread exceeds the entire betwee
 | `mixed_heterogeneity.csv` | random-slope SDs and LR tests for per-question retrieval effects |
 | `mixed_gee_logistic.csv` | GEE logistic odds ratios, exchangeable, clustered on task key |
 | `mixed_effects_run.log` | full console transcript of the run |
+
+---
+
+## Attribution
+
+Questions and reference answers come from LiveNewsBench, release
+`jan_2026_release_2`, pinned at commit `8a6b96e`, MIT licensed. The benchmark is
+the work of Yunfan Zhang, Kathleen McKeown, and Smaranda Muresan —
+[arXiv:2602.13543](https://arxiv.org/abs/2602.13543). Cite it alongside any
+result taken from this report; the BibTeX entry is in the
+[repository README](../README.md#citation).
+
+The rows carry the upstream canary asking that the benchmark never enter a
+training corpus. These runs use five searches and zero page visits, which
+differs from the benchmark's default allowance of five each.

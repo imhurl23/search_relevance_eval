@@ -132,3 +132,18 @@ Then add a run-time escape hatch: if latency or search count crosses a model-spe
 ## Reproducibility
 
 The timing/context script generates the feature table, paired age effects, task-clustered regressions, model-specific slopes, search-escalation diagnostics, and charts. The core machine-readable outputs are `context_age_rates.csv`, `context_age_retrieval_gains.csv`, `context_adjusted_associations.csv`, `context_age_slopes_by_model.csv`, and `context_search_escalation.csv`.
+
+---
+
+## Attribution
+
+Questions and reference answers come from LiveNewsBench, release
+`jan_2026_release_2`, pinned at commit `8a6b96e`, MIT licensed. The benchmark is
+the work of Yunfan Zhang, Kathleen McKeown, and Smaranda Muresan —
+[arXiv:2602.13543](https://arxiv.org/abs/2602.13543). Cite it alongside any
+result taken from this report; the BibTeX entry is in the
+[repository README](../README.md#citation).
+
+The rows carry the upstream canary asking that the benchmark never enter a
+training corpus. These runs use five searches and zero page visits, which
+differs from the benchmark's default allowance of five each.

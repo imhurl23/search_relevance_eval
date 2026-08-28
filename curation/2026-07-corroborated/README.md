@@ -4,7 +4,11 @@
 with **zero network requests** — every input was already on disk from
 `data/corvus_live/2026-07-dev/`.
 
-This freeze exists to fix a specific measurement failure. On LiveNewsBench,
+This freeze exists to fix a specific measurement failure. On
+[LiveNewsBench](https://github.com/LiveNewsBench/LiveNewsBench)
+([arXiv:2602.13543](https://arxiv.org/abs/2602.13543); cite it alongside any
+comparison drawn here, see the
+[repository README](../../README.md#citation)),
 `gpt-5.6-sol` scored **61.5% on the judge with no retrieval at all**, because the
 benchmark's events run 2025-05-01 → 2025-12-31 and the model has largely
 memorised them. That leaves ≤38 points of headroom for the entire study.

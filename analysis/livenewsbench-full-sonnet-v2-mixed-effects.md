@@ -51,3 +51,11 @@ Odds ratios above 1 favor the first arm named in the comparison.
 ## Interpretation limits
 
 The model accounts for repeated conditions on the same task, but it does not turn post-treatment retrieval metrics into causal mediators. Native conditions remain structurally unavailable for DeepSeek and GLM. Variational-Bayes intervals may be narrower than likelihood-based intervals, so the task-bootstrap analysis remains the registered reproducible baseline.
+
+---
+
+## Attribution
+
+Questions and reference answers come from LiveNewsBench, release `jan_2026_release_2`, pinned at commit `8a6b96e`, MIT licensed. The benchmark is the work of Yunfan Zhang, Kathleen McKeown, and Smaranda Muresan — [arXiv:2602.13543](https://arxiv.org/abs/2602.13543). Cite it alongside any result taken from this report; the BibTeX entry is in the [repository README](../README.md#citation).
+
+The rows carry the upstream canary asking that the benchmark never enter a training corpus. These runs use five searches and zero page visits, which differs from the benchmark's default allowance of five each. The matrix spans all four splits of the release, and LiveNewsBench defines its splits by event age, so `livenewsbench_split` and event age are close to collinear.

@@ -108,3 +108,18 @@ Claude native/harness difference remains indistinguishable from zero.
 4. Normalize category labels and produce category-balanced and category-level
    figures.
 5. Audit deterministic-vs-judge disagreements on a stratified sample.
+
+---
+
+## Attribution
+
+Questions and reference answers come from LiveNewsBench, release
+`jan_2026_release_2`, pinned at commit `8a6b96e`, MIT licensed. The benchmark is
+the work of Yunfan Zhang, Kathleen McKeown, and Smaranda Muresan —
+[arXiv:2602.13543](https://arxiv.org/abs/2602.13543). Cite it alongside any
+result taken from this report; the BibTeX entry is in the
+[repository README](../README.md#citation).
+
+The rows carry the upstream canary asking that the benchmark never enter a
+training corpus. These runs use five searches and zero page visits, which
+differs from the benchmark's default allowance of five each.

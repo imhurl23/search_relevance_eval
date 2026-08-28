@@ -2,11 +2,28 @@
 
 This repository measures how web retrieval changes short-form factual answers.
 It compares four models under no search, a shared You.com tool, and each frontier
-vendor's native search.
+vendor's native search, on questions from
+[LiveNewsBench](https://github.com/LiveNewsBench/LiveNewsBench).
 
-The study has 14 conditions. Each condition uses the same pinned dataset rows,
-answer format, five-search allowance, and scoring code. The preregistered
-contrasts and reporting rules live in [docs/study-design.md](docs/study-design.md).
+The study has 14 conditions: four models crossed with four retrieval arms, minus
+the two native cells that do not exist because those vendors ship no native
+search. Each condition uses the same pinned dataset rows, answer format,
+five-search allowance, and scoring code, so a difference between two conditions
+is attributable to the thing that changed between them.
+
+The headline finding is that retrieval availability dominates model choice, and
+that the two interact: the same four models rank differently depending on the
+search system wrapped around them. [Results](#results) links every report.
+
+New to the repository:
+
+- [Setup](#setup), then [Run an evaluation](#run-an-evaluation).
+- [Experimental matrix](#experimental-matrix) for what the 14 conditions are.
+- [Results](#results) for what was found, and the published dataset.
+- [docs/study-design.md](docs/study-design.md) for the preregistered contrasts
+  and reporting rules.
+- [Limits that affect interpretation](#limits-that-affect-interpretation) before
+  quoting any number.
 
 ## What is included
 
@@ -309,6 +326,63 @@ LiveNewsBench provides rolling news questions and source metadata. RetrievalQA
 contains both static questions and historical time-sensitive questions. Corvus-QA
 contains curated fact transitions with recency and coverage labels.
 
+### LiveNewsBench
+
+Source: <https://github.com/LiveNewsBench/LiveNewsBench> (MIT). Paper:
+[arXiv:2602.13543](https://arxiv.org/abs/2602.13543). See
+[Citation](#citation) for the BibTeX entry, which this repository asks you to
+include in any work built on these results.
+
+Runs in this repository use release `jan_2026_release_2`, pinned by git SHA, and
+draw from all four of its splits. Every result row records `source_repository`,
+`source_commit`, `livenewsbench_release`, and `livenewsbench_split`.
+
+| Split | Rows | Task keys | Event age (days) |
+|---|---:|---:|---|
+| `train` | 8,568 | 612 | 328 – 482 |
+| `test` | 4,844 | 346 | 236 – 298 |
+| `human_verified_test` | 2,800 | 200 | 236 – 298 |
+| `val` | 2,394 | 171 | 298 – 329 |
+
+Two consequences follow, and both matter when reading any aggregate number.
+
+LiveNewsBench defines its splits by event age: `train` holds events older than
+three months, `val` two to three months, `test` within the last two months. Split
+membership and event age are therefore almost collinear here, and an effect
+attributed to one is largely the other.
+
+The `train` split is 46% of the matrix. The benchmark's own leaderboard reports
+`test` and `human_verified_test`. An accuracy averaged over this mixture is not
+comparable to a leaderboard figure, and it is weighted toward the events models
+are most likely to have memorised.
+
+Imported rows carry the upstream canary string, which asks that the benchmark
+never enter a training corpus. Keep the `canary` field intact in anything you
+redistribute.
+
+#### Conformance with the benchmark's defaults
+
+LiveNewsBench allows five searches and five page visits per question by default,
+and asks users who change those limits to state them. This harness runs a
+**snippet-only configuration: five searches and zero page visits.** It exposes no
+fetch tool, so a model cannot read an article body in the `Normalized` or `Wide`
+arms.
+
+Provider-native search is a server-side tool and cannot be constrained the same
+way. In the released matrix:
+
+| Arm | Searches per row | Page visits |
+|---|---|---|
+| `No search` | 0 | 0 |
+| `Normalized`, `Wide` | capped at 5 | none available |
+| `Native` (Claude Sonnet 5) | max 5 | 0 observed |
+| `Native` (GPT-5.6 Terra) | max 6; 22 of 2,658 rows exceeded 5 | 210 opens across 174 rows |
+
+Read the `Native` contrast with that in mind: it bundles a capability difference
+alongside the model and serving-stack difference, so it is not a clean test of
+the search implementation. Numbers here are also not comparable to the
+LiveNewsBench leaderboard, which permits page visits.
+
 ### RetrievalQA reference dates
 
 FreshQA and RealTimeQA labels describe facts at an earlier date. The runner adds
@@ -451,20 +525,60 @@ The analyzer reports paired effects, a 95% task-bootstrap interval,
 category-balanced effects, win/tie/loss counts, search counts, answer length,
 and a cost frontier when `total_cost_usd` is present.
 
+## Results
+
+The completed matrix is `livenewsbench-full-sonnet-v2`: four models over four
+retrieval arms, 1,329 dataset rows across 1,129 task keys, 18,606 rows, one
+generation per cell. Reports live in `analysis/`:
+
+| Report | Question it answers |
+|---|---|
+| [Initial read](analysis/livenewsbench-full-sonnet-v2-initial.md) | First pass over the completed matrix |
+| [Variable analysis](analysis/livenewsbench-full-sonnet-v2-variable-analysis.md) | Which variables are treatments, mediators, or moderators, with paired bootstrap effects |
+| [Context and timing](analysis/livenewsbench-full-sonnet-v2-context-timing-analysis.md) | How event age and question structure change the answer |
+| [Highlights and failures](analysis/livenewsbench-full-sonnet-v2-highlights-and-failures.md) | Where the harness surfaced the answer, and where runs broke |
+| [Registered mixed-effects model](analysis/livenewsbench-full-sonnet-v2-mixed-effects.md) | The preregistered task-random-intercept accuracy model |
+| [Exploratory mixed-effects model](analysis/livenewsbench-full-sonnet-v2-mixed-effects-exploratory.md) | Variance decomposition, mediation, moderation, and heterogeneity |
+
+Regenerate every table and figure from the exported JSONL:
+
+```bash
+.venv/bin/python analysis/analyze_variables.py
+.venv/bin/python analysis/analyze_context_timing.py
+.venv/bin/python analysis/run_mixed_effects.py
+.venv/bin/python analysis/mixed_effects_analysis.py
+```
+
+The raw exports, the row-level CSVs, and the Hugging Face build are gitignored,
+because they carry model answers and canaried benchmark rows. Rebuild them with
+`export_braintrust_results.py` and `analysis/build_hf_dataset.py`.
+
+### Published dataset
+
+The result table is released as a gated dataset at
+[BraintrustDataDev/livenewsbench-search-arms](https://huggingface.co/datasets/BraintrustDataDev/livenewsbench-search-arms).
+It carries the questions, expected answers, every score, and per-row cost and
+token counts. It excludes model answers, search-result text, and the Wikipedia
+context each question was written from. Access is gated because the rows carry
+the LiveNewsBench canary.
+
 ## Limits that affect interpretation
 
 - Native and harness prompts differ in their tool descriptions and capabilities.
   Native OpenAI search can emit search, page-open, and find-in-page actions;
   You.com harness agents receive search-result highlights and cannot fetch pages.
-  The runner records native action types and both prompt versions.
+  The runner records native action types and both prompt versions. The observed
+  gap is in
+  [Conformance with the benchmark's defaults](#conformance-with-the-benchmarks-defaults).
 - Native arms run at each vendor's retrieval ceiling, but the ceilings are not
   equal and no native API exposes a freshness filter. Harness-versus-native is a
   system comparison, not a retrieval-quality one — see
   [docs/study-design.md](docs/study-design.md#harness-versus-native).
-- Both native arms enforce a cumulative five-call budget. OpenAI's
-  `max_tool_calls` also counts page actions; Anthropic reduces search
-  `max_uses` across
-  `pause_turn` continuations.
+- Both native arms request a cumulative five-call budget, and the providers do
+  not always honour it. OpenAI's `max_tool_calls` also counts page actions;
+  Anthropic reduces search `max_uses` across `pause_turn` continuations. In the
+  released matrix, 22 of 2,658 GPT-5.6 Terra native rows issued six searches.
+  Harness arms are capped in-process and never exceed five.
 - You.com and Anthropic expose provider date fields with different semantics.
   `temporal_grounding` uses You.com news dates marked as publication time and
   excludes web `page_age` and Anthropic last-updated dates. OpenAI native exposes
@@ -487,6 +601,39 @@ and a cost frontier when `total_cost_usd` is present.
   condition order reproducibly; record the seed and avoid pauses during a run.
 
 Keep documentation edits within the rules in [FORBIDDEN.md](FORBIDDEN.md).
+
+## Citation
+
+This work builds on LiveNewsBench. Cite the benchmark in anything that uses
+these questions, answers, or results:
+
+```bibtex
+@misc{zhang2026livenewsbench,
+  title         = {LiveNewsBench: Evaluating LLM Web Search Capabilities with Freshly Curated News},
+  author        = {Yunfan Zhang and Kathleen McKeown and Smaranda Muresan},
+  year          = {2026},
+  eprint        = {2602.13543},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.IR},
+  url           = {https://arxiv.org/abs/2602.13543}
+}
+```
+
+To cite the retrieval-arm measurements in this repository:
+
+```bibtex
+@misc{braintrust2026searcharms,
+  title  = {LiveNewsBench Search Arms: paired retrieval measurements for four models},
+  author = {Braintrust},
+  year   = {2026},
+  url    = {https://huggingface.co/datasets/BraintrustDataDev/livenewsbench-search-arms}
+}
+```
+
+State the search and page-visit limits alongside any number taken from here.
+This harness runs five searches and zero page visits, which differs from the
+benchmark's default allowance. See
+[Conformance with the benchmark's defaults](#conformance-with-the-benchmarks-defaults).
 
 ## License
 

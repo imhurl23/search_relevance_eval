@@ -188,6 +188,25 @@ def write_report(
         "narrower than likelihood-based intervals, so the task-bootstrap analysis remains the "
         "registered reproducible baseline.",
     ]
+    lines += [
+        "",
+        "---",
+        "",
+        "## Attribution",
+        "",
+        "Questions and reference answers come from LiveNewsBench, release "
+        "`jan_2026_release_2`, pinned at commit `8a6b96e`, MIT licensed. The benchmark is "
+        "the work of Yunfan Zhang, Kathleen McKeown, and Smaranda Muresan — "
+        "[arXiv:2602.13543](https://arxiv.org/abs/2602.13543). Cite it alongside any "
+        "result taken from this report; the BibTeX entry is in the "
+        "[repository README](../README.md#citation).",
+        "",
+        "The rows carry the upstream canary asking that the benchmark never enter a "
+        "training corpus. These runs use five searches and zero page visits, which differs "
+        "from the benchmark's default allowance of five each. The matrix spans all four "
+        "splits of the release, and LiveNewsBench defines its splits by event age, so "
+        "`livenewsbench_split` and event age are close to collinear.",
+    ]
     (ANALYSIS / "livenewsbench-full-sonnet-v2-mixed-effects.md").write_text(
         "\n".join(lines) + "\n", encoding="utf-8"
     )

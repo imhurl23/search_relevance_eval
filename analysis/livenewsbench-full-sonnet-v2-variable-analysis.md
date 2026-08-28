@@ -171,3 +171,18 @@ There are also **98 task keys where all four normalized models receive judge-fai
 ## Reproducibility
 
 The analysis script builds the joined row-level table, task-paired bootstrap effects, difference-in-differences interactions, mediator regressions, CSV outputs, and all six figures. Generated tables are in the `analysis/variable_*.csv` files and the compact machine-readable summary is `analysis/variable_analysis_summary.json`.
+
+---
+
+## Attribution
+
+Questions and reference answers come from LiveNewsBench, release
+`jan_2026_release_2`, pinned at commit `8a6b96e`, MIT licensed. The benchmark is
+the work of Yunfan Zhang, Kathleen McKeown, and Smaranda Muresan —
+[arXiv:2602.13543](https://arxiv.org/abs/2602.13543). Cite it alongside any
+result taken from this report; the BibTeX entry is in the
+[repository README](../README.md#citation).
+
+The rows carry the upstream canary asking that the benchmark never enter a
+training corpus. These runs use five searches and zero page visits, which
+differs from the benchmark's default allowance of five each.
