@@ -1,0 +1,46 @@
+          model        arm  n_rows  n_tasks    gated    judge  qa_match  searches  latency_mean_s  latency_p95_s  answer_words  zero_search  degraded  refused  truncated
+        GLM-5.2  No search    1329     1129 0.014296 0.027840       NaN  0.000000        2.412939       4.207844      5.035365     0.000000  0.000000 0.000000   0.000000
+        GLM-5.2 Normalized    1329     1129 0.355907 0.791573  0.355907  2.519940       10.880995      21.117521     78.863055     0.000000  0.000000 0.000000   0.000752
+        GLM-5.2       Wide    1329     1129 0.355907 0.813394  0.357412  2.407073       12.785358      24.639773     82.866817     0.000000  0.000000 0.000000   0.000000
+    DeepSeek V4  No search    1329     1129 0.042889 0.080512       NaN  0.000000       20.129154      84.595760     12.281415     0.000000  0.000000 0.000000   0.127163
+    DeepSeek V4 Normalized    1329     1129 0.357412 0.806622  0.357412  2.576373       12.330288      33.435521     38.262603     0.002257  0.003010 0.000000   0.010534
+    DeepSeek V4       Wide    1329     1129 0.361926 0.830700  0.362679  2.393529       11.580935      22.472720     39.608728     0.000752  0.009029 0.000000   0.003762
+  GPT-5.6 Terra  No search    1329     1129 0.261851 0.507148       NaN  0.000000       11.664658      33.450877      4.109105     0.000000  0.000000 0.000000   0.000000
+  GPT-5.6 Terra Normalized    1329     1129 0.419112 0.848758  0.419865  2.044394        9.671824      21.606820      6.879609     0.000000  0.000000 0.000000   0.000000
+  GPT-5.6 Terra       Wide    1329     1129 0.417607 0.860798  0.418360  1.762980        8.873886      20.327803      7.099323     0.001505  0.000000 0.000000   0.000000
+  GPT-5.6 Terra     Native    1329     1129 0.386005 0.812641       NaN  1.685478       13.613010      31.901502     10.471031     0.000752  0.016554 0.000000   0.000000
+Claude Sonnet 5  No search    1329     1129 0.119639 0.246802       NaN  0.000000        5.385585      13.207553      8.415350     0.000000  0.000000 0.003010   0.000752
+Claude Sonnet 5 Normalized    1329     1129 0.353649 0.792325  0.353649  2.170805       12.826259      27.620808     27.007524     0.036117  0.000000 0.001505   0.000752
+Claude Sonnet 5       Wide    1329     1129 0.352144 0.823928  0.352897  2.085026       10.749591      23.477819     27.939052     0.044394  0.000000 0.002257   0.000000
+Claude Sonnet 5     Native    1329     1129 0.344620 0.787810       NaN  2.316027       14.291577      31.596398     85.286682     0.009029  0.000000 0.001505   0.002257
+
+MAIN EFFECTS
+               family           model                                              a                                              b metric    n    effect    ci_low   ci_high  wins  ties  losses
+     Retrieval value         GLM-5.2                    zai-org/GLM-5.2::normalized                          zai-org/GLM-5.2::none  gated 1128  0.346631  0.319592  0.374557   397   729       2
+   Result-count tier         GLM-5.2                          zai-org/GLM-5.2::wide                    zai-org/GLM-5.2::normalized  gated 1128  0.003103 -0.012411  0.018617    46  1039      43
+     Retrieval value     DeepSeek V4 deepseek-ai/DeepSeek-V4-Flash-0731::normalized       deepseek-ai/DeepSeek-V4-Flash-0731::none  gated  982  0.328411  0.298880  0.358961   330   646       6
+   Result-count tier     DeepSeek V4       deepseek-ai/DeepSeek-V4-Flash-0731::wide deepseek-ai/DeepSeek-V4-Flash-0731::normalized  gated 1112  0.004496 -0.010791  0.019784    43  1030      39
+     Retrieval value   GPT-5.6 Terra                      gpt-5.6-terra::normalized                            gpt-5.6-terra::none  gated 1129  0.151461  0.124004  0.178034   233   842      54
+   Result-count tier   GPT-5.6 Terra                            gpt-5.6-terra::wide                      gpt-5.6-terra::normalized  gated 1127 -0.001775 -0.019521  0.015084    59  1007      61
+     Retrieval value Claude Sonnet 5                    claude-sonnet-5::normalized                          claude-sonnet-5::none  gated 1084  0.242620  0.215406  0.270756   292   772      20
+   Result-count tier Claude Sonnet 5                          claude-sonnet-5::wide                    claude-sonnet-5::normalized  gated 1063  0.000470 -0.018344  0.018815    59   946      58
+Native vs normalized   GPT-5.6 Terra                          gpt-5.6-terra::native                      gpt-5.6-terra::normalized  gated 1128 -0.031028 -0.050543 -0.010195    55   978      95
+Native vs normalized Claude Sonnet 5                        claude-sonnet-5::native                    claude-sonnet-5::normalized  gated 1079 -0.009731 -0.028267  0.009268    55   957      67
+
+RETRIEVAL INTERACTIONS
+   first_model    second_model    n  interaction    ci_low   ci_high
+      GLM-5.2   GPT-5.6 Terra 1128     0.195035  0.162677  0.226950
+  DeepSeek V4   GPT-5.6 Terra  982     0.180244  0.146627  0.214868
+      GLM-5.2 Claude Sonnet 5 1083     0.096953  0.071560  0.123730
+  DeepSeek V4 Claude Sonnet 5  943     0.074231  0.044539  0.103924
+      GLM-5.2     DeepSeek V4  981     0.030071  0.009684  0.050968
+GPT-5.6 Terra Claude Sonnet 5 1084    -0.083948 -0.115314 -0.053506
+
+MEDIATOR ASSOCIATIONS
+                 mediator                  field              unit  n_rows  odds_ratio   ci_low  ci_high      p_value       holm_p
+        Domain diversity         domain_entropy          per 1 SD   10497    1.481753 1.345925 1.631289 1.091238e-15 6.547429e-15
+   Token-discounted gain  token_discounted_gain          per 1 SD   10498    1.447656 1.239799 1.690361 2.896128e-06 1.448064e-05
+      Evidence precision     evidence_precision          per 1 SD   10498    1.668176 1.294036 2.150489 7.839279e-05 3.135711e-04
+   Literal-gold coverage    snippet_sufficiency present vs absent   10498    2.092728 1.381159 3.170896 4.957069e-04 1.487121e-03
+Compression distinctness compression_redundancy          per 1 SD   10498    1.127088 1.016124 1.250169 2.366942e-02 4.733883e-02
+      Temporal grounding     temporal_grounding          per 1 SD    9472    0.953413 0.852393 1.066404 4.037929e-01 4.037929e-01

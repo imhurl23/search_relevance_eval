@@ -1,0 +1,37 @@
+comparison,model,a,b,metric,n,effect,ci_low,ci_high,wins,ties,losses
+Normalized - no search,GLM-5.2,zai-org/GLM-5.2::normalized,zai-org/GLM-5.2::none,judge,1128,0.7659574468085106,0.7406914893617021,0.7912234042553191,872,255,1
+Normalized - no search,GLM-5.2,zai-org/GLM-5.2::normalized,zai-org/GLM-5.2::none,latency_s,1128,8.341574996709824,8.063941056209993,8.635772782537742,1126,0,2
+Normalized - no search,GLM-5.2,zai-org/GLM-5.2::normalized,zai-org/GLM-5.2::none,answer_words,1128,72.07358156028369,69.27123226950354,75.16641179078015,1116,6,6
+Wide - normalized,GLM-5.2,zai-org/GLM-5.2::wide,zai-org/GLM-5.2::normalized,judge,1128,0.02171985815602837,0.003989361702127659,0.0398936170212766,76,1002,50
+Wide - normalized,GLM-5.2,zai-org/GLM-5.2::wide,zai-org/GLM-5.2::normalized,used_searches,1128,-0.10904255319148937,-0.15336879432624115,-0.06560283687943262,130,785,213
+Wide - normalized,GLM-5.2,zai-org/GLM-5.2::wide,zai-org/GLM-5.2::normalized,latency_s,1128,1.9137966329535694,1.5688532097727483,2.253019545541693,780,0,348
+Wide - normalized,GLM-5.2,zai-org/GLM-5.2::wide,zai-org/GLM-5.2::normalized,answer_words,1128,5.981826241134752,2.8669547872340426,9.401218971631206,594,42,492
+Normalized - no search,DeepSeek V4,deepseek-ai/DeepSeek-V4-Flash-0731::normalized,deepseek-ai/DeepSeek-V4-Flash-0731::none,judge,982,0.7174134419551935,0.6889002036659878,0.7464358452138493,715,260,7
+Normalized - no search,DeepSeek V4,deepseek-ai/DeepSeek-V4-Flash-0731::normalized,deepseek-ai/DeepSeek-V4-Flash-0731::none,latency_s,982,-1.8954563886230686,-2.959292276406968,-0.8863288610414921,446,0,536
+Normalized - no search,DeepSeek V4,deepseek-ai/DeepSeek-V4-Flash-0731::normalized,deepseek-ai/DeepSeek-V4-Flash-0731::none,answer_words,982,29.334521384928717,28.048828920570266,30.638060081466392,903,41,38
+Wide - normalized,DeepSeek V4,deepseek-ai/DeepSeek-V4-Flash-0731::wide,deepseek-ai/DeepSeek-V4-Flash-0731::normalized,judge,1112,0.02158273381294964,0.002697841726618705,0.04136690647482014,81,977,54
+Wide - normalized,DeepSeek V4,deepseek-ai/DeepSeek-V4-Flash-0731::wide,deepseek-ai/DeepSeek-V4-Flash-0731::normalized,used_searches,1112,-0.18075539568345322,-0.2329136690647482,-0.12993480215827355,112,776,224
+Wide - normalized,DeepSeek V4,deepseek-ai/DeepSeek-V4-Flash-0731::wide,deepseek-ai/DeepSeek-V4-Flash-0731::normalized,latency_s,1112,-0.8378767696001547,-1.6454424558193994,0.13003191947668996,612,0,500
+Wide - normalized,DeepSeek V4,deepseek-ai/DeepSeek-V4-Flash-0731::wide,deepseek-ai/DeepSeek-V4-Flash-0731::normalized,answer_words,1112,1.043615107913669,-0.010364208633093517,2.0769334532374093,531,90,491
+Normalized - no search,GPT-5.6 Terra,gpt-5.6-terra::normalized,gpt-5.6-terra::none,judge,1129,0.3308237378210806,0.29982285208148807,0.3600531443755536,427,667,35
+Normalized - no search,GPT-5.6 Terra,gpt-5.6-terra::normalized,gpt-5.6-terra::none,latency_s,1129,-1.746378880248226,-2.3962878976198714,-1.1219400108837259,644,0,485
+Normalized - no search,GPT-5.6 Terra,gpt-5.6-terra::normalized,gpt-5.6-terra::none,answer_words,1129,2.7940655447298495,2.538950398582817,3.062887511071745,589,445,95
+Wide - normalized,GPT-5.6 Terra,gpt-5.6-terra::wide,gpt-5.6-terra::normalized,judge,1127,0.01020408163265306,-0.006654835847382431,0.027062999112688554,63,1015,49
+Wide - normalized,GPT-5.6 Terra,gpt-5.6-terra::wide,gpt-5.6-terra::normalized,used_searches,1127,-0.2857142857142857,-0.3385093167701863,-0.23070097604259096,144,621,362
+Wide - normalized,GPT-5.6 Terra,gpt-5.6-terra::wide,gpt-5.6-terra::normalized,latency_s,1127,-0.7933224327498658,-1.0597892850187889,-0.5177276164689951,426,0,701
+Wide - normalized,GPT-5.6 Terra,gpt-5.6-terra::wide,gpt-5.6-terra::normalized,answer_words,1127,0.1725820763087844,-0.06522848269742679,0.4072870452528836,293,593,241
+Normalized - no search,Claude Sonnet 5,claude-sonnet-5::normalized,claude-sonnet-5::none,judge,1084,0.5544280442804428,0.5230627306273062,0.5857933579335793,636,428,20
+Normalized - no search,Claude Sonnet 5,claude-sonnet-5::normalized,claude-sonnet-5::none,latency_s,1084,7.63862163851182,6.969328780595997,8.289413309781862,1013,0,71
+Normalized - no search,Claude Sonnet 5,claude-sonnet-5::normalized,claude-sonnet-5::none,answer_words,1084,18.668819188191883,17.535043819188193,19.791974169741696,914,58,112
+Wide - normalized,Claude Sonnet 5,claude-sonnet-5::wide,claude-sonnet-5::normalized,judge,1063,0.03292568203198495,0.012699905926622766,0.05268109125117592,92,919,52
+Wide - normalized,Claude Sonnet 5,claude-sonnet-5::wide,claude-sonnet-5::normalized,used_searches,1063,-0.0761994355597366,-0.11900282220131703,-0.032443555973659624,89,831,143
+Wide - normalized,Claude Sonnet 5,claude-sonnet-5::wide,claude-sonnet-5::normalized,latency_s,1063,-2.166713774260326,-2.7330043631853744,-1.640022711350687,256,0,807
+Wide - normalized,Claude Sonnet 5,claude-sonnet-5::wide,claude-sonnet-5::normalized,answer_words,1063,0.9873000940733773,0.043238476011288815,1.9172271872060205,506,123,434
+Native - normalized,GPT-5.6 Terra,gpt-5.6-terra::native,gpt-5.6-terra::normalized,judge,1128,-0.03546099290780142,-0.05585106382978723,-0.014184397163120567,64,956,108
+Native - normalized,GPT-5.6 Terra,gpt-5.6-terra::native,gpt-5.6-terra::normalized,used_searches,1128,-0.37101063829787234,-0.44148936170212766,-0.30319148936170215,187,471,470
+Native - normalized,GPT-5.6 Terra,gpt-5.6-terra::native,gpt-5.6-terra::normalized,latency_s,1128,4.029213546227056,3.5546910690923106,4.516234619635428,860,0,268
+Native - normalized,GPT-5.6 Terra,gpt-5.6-terra::native,gpt-5.6-terra::normalized,answer_words,1128,3.606382978723404,3.260139627659574,3.948581560283688,677,333,118
+Native - normalized,Claude Sonnet 5,claude-sonnet-5::native,claude-sonnet-5::normalized,judge,1079,-0.006487488415199258,-0.028730305838739572,0.016682113067655237,84,904,91
+Native - normalized,Claude Sonnet 5,claude-sonnet-5::native,claude-sonnet-5::normalized,used_searches,1079,0.1056533827618165,0.04819277108433735,0.16172381835032437,220,664,195
+Native - normalized,Claude Sonnet 5,claude-sonnet-5::native,claude-sonnet-5::normalized,latency_s,1079,1.405831432320433,0.8204469326527942,1.978712034965688,596,0,483
+Native - normalized,Claude Sonnet 5,claude-sonnet-5::native,claude-sonnet-5::normalized,answer_words,1079,58.554680259499534,56.356753938832256,60.744242354031506,1038,17,24

@@ -1,0 +1,11 @@
+family,model,a,b,metric,n,effect,ci_low,ci_high,wins,ties,losses
+Retrieval value,GLM-5.2,zai-org/GLM-5.2::normalized,zai-org/GLM-5.2::none,gated,1128,0.3466312056737589,0.3195921985815603,0.3745567375886525,397,729,2
+Result-count tier,GLM-5.2,zai-org/GLM-5.2::wide,zai-org/GLM-5.2::normalized,gated,1128,0.0031028368794326243,-0.012411347517730497,0.018617021276595744,46,1039,43
+Retrieval value,DeepSeek V4,deepseek-ai/DeepSeek-V4-Flash-0731::normalized,deepseek-ai/DeepSeek-V4-Flash-0731::none,gated,982,0.3284114052953157,0.2988798370672098,0.3589613034623218,330,646,6
+Result-count tier,DeepSeek V4,deepseek-ai/DeepSeek-V4-Flash-0731::wide,deepseek-ai/DeepSeek-V4-Flash-0731::normalized,gated,1112,0.0044964028776978415,-0.01079136690647482,0.019784172661870502,43,1030,39
+Retrieval value,GPT-5.6 Terra,gpt-5.6-terra::normalized,gpt-5.6-terra::none,gated,1129,0.15146147032772364,0.12400354295837024,0.17803365810451727,233,842,54
+Result-count tier,GPT-5.6 Terra,gpt-5.6-terra::wide,gpt-5.6-terra::normalized,gated,1127,-0.001774622892635315,-0.019520851818988466,0.015084294587400177,59,1007,61
+Retrieval value,Claude Sonnet 5,claude-sonnet-5::normalized,claude-sonnet-5::none,gated,1084,0.24261992619926198,0.2154059040590406,0.27075645756457567,292,772,20
+Result-count tier,Claude Sonnet 5,claude-sonnet-5::wide,claude-sonnet-5::normalized,gated,1063,0.00047036688617121356,-0.018344308560677328,0.01881467544684854,59,946,58
+Native vs normalized,GPT-5.6 Terra,gpt-5.6-terra::native,gpt-5.6-terra::normalized,gated,1128,-0.03102836879432624,-0.0505429964539007,-0.010195035460992909,55,978,95
+Native vs normalized,Claude Sonnet 5,claude-sonnet-5::native,claude-sonnet-5::normalized,gated,1079,-0.009731232622798888,-0.028266913809082483,0.009267840593141797,55,957,67

@@ -1,0 +1,25 @@
+model,mediator,n,delta
+GLM-5.2,Literal-gold coverage,1128,0.013297872340425532
+GLM-5.2,Evidence precision,1128,-0.012615822197402678
+GLM-5.2,Token-discounted gain,1128,0.017280357373424884
+GLM-5.2,Temporal grounding,1022,-0.07275226313554752
+GLM-5.2,Domain diversity,1128,-0.06044202729402849
+GLM-5.2,Compression distinctness,1128,-0.06773352308269975
+DeepSeek V4,Literal-gold coverage,1112,0.008992805755395683
+DeepSeek V4,Evidence precision,1112,-0.012993393708658135
+DeepSeek V4,Token-discounted gain,1112,0.011804862130892583
+DeepSeek V4,Temporal grounding,992,-0.09032832957731424
+DeepSeek V4,Domain diversity,1112,-0.05429237737690227
+DeepSeek V4,Compression distinctness,1112,-0.06692159165936391
+GPT-5.6 Terra,Literal-gold coverage,1127,0.0075421472937000885
+GPT-5.6 Terra,Evidence precision,1127,-0.017540110368433243
+GPT-5.6 Terra,Token-discounted gain,1127,0.021126343778447736
+GPT-5.6 Terra,Temporal grounding,914,-0.07031921408865964
+GPT-5.6 Terra,Domain diversity,1126,-0.04917424434876395
+GPT-5.6 Terra,Compression distinctness,1127,-0.06041016416292128
+Claude Sonnet 5,Literal-gold coverage,1063,0.015051740357478834
+Claude Sonnet 5,Evidence precision,1063,-0.013973556984027127
+Claude Sonnet 5,Token-discounted gain,1063,0.014051303521613882
+Claude Sonnet 5,Temporal grounding,899,-0.0825843071261024
+Claude Sonnet 5,Domain diversity,1063,-0.06167386262376256
+Claude Sonnet 5,Compression distinctness,1063,-0.06889216411663562

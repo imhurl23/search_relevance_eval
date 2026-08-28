@@ -1,0 +1,40 @@
+FEATURE PREVALENCE
+      question_words    composed  multi_year  temporal_scope  source_constrained
+mean       64.209932    0.536494    0.093303        0.698269            0.398796
+sum     85335.000000  713.000000  124.000000      928.000000          530.000000
+
+ADJUSTED ASSOCIATIONS
+                     analysis            feature                        label    effect    ci_low   ci_high      p_value  n_rows  n_tasks  r_squared
+ No-search semantic accuracy             age_90      Event is 3 months older  0.056560  0.037504  0.075616 5.979311e-09    5316     1129   0.242921
+ No-search semantic accuracy           composed      Quantitative / composed -0.087487 -0.115701 -0.059273 1.220774e-09    5316     1129   0.242921
+ No-search semantic accuracy         multi_year    References multiple years  0.017408 -0.031356  0.066172 4.841343e-01    5316     1129   0.242921
+ No-search semantic accuracy     temporal_scope      Explicit temporal scope  0.013584 -0.016350  0.043518 3.737774e-01    5316     1129   0.242921
+ No-search semantic accuracy source_constrained   Names a source / authority -0.005927 -0.034199  0.022345 6.811609e-01    5316     1129   0.242921
+ No-search semantic accuracy         q_words_10 10 additional question words -0.001485 -0.010149  0.007179 7.369186e-01    5316     1129   0.242921
+Normalized semantic accuracy             age_90      Event is 3 months older -0.025783 -0.052090  0.000523 5.473402e-02    5316     1129   0.049106
+Normalized semantic accuracy           composed      Quantitative / composed -0.133170 -0.171203 -0.095137 6.758833e-12    5316     1129   0.049106
+Normalized semantic accuracy         multi_year    References multiple years -0.025275 -0.088913  0.038363 4.363148e-01    5316     1129   0.049106
+Normalized semantic accuracy     temporal_scope      Explicit temporal scope  0.010559 -0.030099  0.051217 6.107563e-01    5316     1129   0.049106
+Normalized semantic accuracy source_constrained   Names a source / authority -0.033263 -0.074177  0.007652 1.110648e-01    5316     1129   0.049106
+Normalized semantic accuracy         q_words_10 10 additional question words -0.010000 -0.023600  0.003599 1.495121e-01    5316     1129   0.049106
+              Retrieval gain             age_90      Event is 3 months older -0.082343 -0.109170 -0.055517 1.786872e-09    5316     1129   0.136063
+              Retrieval gain           composed      Quantitative / composed -0.045683 -0.085879 -0.005488 2.591102e-02    5316     1129   0.136063
+              Retrieval gain         multi_year    References multiple years -0.042683 -0.112781  0.027416 2.327070e-01    5316     1129   0.136063
+              Retrieval gain     temporal_scope      Explicit temporal scope -0.003025 -0.045357  0.039307 8.886119e-01    5316     1129   0.136063
+              Retrieval gain source_constrained   Names a source / authority -0.027336 -0.069466  0.014794 2.034745e-01    5316     1129   0.136063
+              Retrieval gain         q_words_10 10 additional question words -0.008515 -0.022482  0.005452 2.321205e-01    5316     1129   0.136063
+
+AGE SLOPES BY MODEL
+           model                     analysis  effect_per_90d    ci_low   ci_high      p_value  n_rows  n_tasks
+        GLM-5.2  No-search semantic accuracy        0.007275 -0.009481  0.024031 3.948039e-01    1329     1129
+        GLM-5.2 Normalized semantic accuracy       -0.025460 -0.057171  0.006251 1.155770e-01    1329     1129
+        GLM-5.2               Retrieval gain       -0.032735 -0.067773  0.002303 6.708123e-02    1329     1129
+    DeepSeek V4  No-search semantic accuracy        0.017580 -0.006272  0.041431 1.485691e-01    1329     1129
+    DeepSeek V4 Normalized semantic accuracy       -0.035621 -0.066647 -0.004595 2.443506e-02    1329     1129
+    DeepSeek V4               Retrieval gain       -0.053201 -0.090321 -0.016080 4.969600e-03    1329     1129
+  GPT-5.6 Terra  No-search semantic accuracy        0.116249  0.078673  0.153825 1.332010e-09    1329     1129
+  GPT-5.6 Terra Normalized semantic accuracy       -0.019494 -0.048238  0.009250 1.837626e-01    1329     1129
+  GPT-5.6 Terra               Retrieval gain       -0.135743 -0.174260 -0.097226 4.937763e-12    1329     1129
+Claude Sonnet 5  No-search semantic accuracy        0.085136  0.051822  0.118451 5.477082e-07    1329     1129
+Claude Sonnet 5 Normalized semantic accuracy       -0.022559 -0.053113  0.007996 1.478828e-01    1329     1129
+Claude Sonnet 5               Retrieval gain       -0.107695 -0.146910 -0.068480 7.340839e-08    1329     1129

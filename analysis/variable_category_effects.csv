@@ -1,0 +1,41 @@
+model,category,n,effect
+GLM-5.2,Armed conflicts and attacks,271,0.30996309963099633
+GLM-5.2,Arts and culture,35,0.4
+GLM-5.2,Business and economy,51,0.24509803921568626
+GLM-5.2,Disasters and accidents,113,0.26548672566371684
+GLM-5.2,Health and environment,22,0.5454545454545454
+GLM-5.2,International relations,133,0.34962406015037595
+GLM-5.2,Law and crime,240,0.35208333333333336
+GLM-5.2,Politics and elections,191,0.3586387434554974
+GLM-5.2,Science and technology,16,0.3125
+GLM-5.2,Sports,56,0.6071428571428571
+DeepSeek V4,Armed conflicts and attacks,239,0.30962343096234307
+DeepSeek V4,Arts and culture,28,0.42857142857142855
+DeepSeek V4,Business and economy,48,0.21875
+DeepSeek V4,Disasters and accidents,103,0.22815533980582525
+DeepSeek V4,Health and environment,19,0.42105263157894735
+DeepSeek V4,International relations,118,0.2966101694915254
+DeepSeek V4,Law and crime,204,0.31862745098039214
+DeepSeek V4,Politics and elections,169,0.3757396449704142
+DeepSeek V4,Science and technology,11,0.36363636363636365
+DeepSeek V4,Sports,43,0.627906976744186
+GPT-5.6 Terra,Armed conflicts and attacks,272,0.08088235294117647
+GPT-5.6 Terra,Arts and culture,35,0.07142857142857142
+GPT-5.6 Terra,Business and economy,51,0.18627450980392157
+GPT-5.6 Terra,Disasters and accidents,113,0.21238938053097345
+GPT-5.6 Terra,Health and environment,22,0.2727272727272727
+GPT-5.6 Terra,International relations,133,0.10526315789473684
+GPT-5.6 Terra,Law and crime,240,0.15
+GPT-5.6 Terra,Politics and elections,191,0.19633507853403143
+GPT-5.6 Terra,Science and technology,16,0.28125
+GPT-5.6 Terra,Sports,56,0.26785714285714285
+Claude Sonnet 5,Armed conflicts and attacks,250,0.184
+Claude Sonnet 5,Arts and culture,34,0.23529411764705882
+Claude Sonnet 5,Business and economy,50,0.27
+Claude Sonnet 5,Disasters and accidents,113,0.22123893805309736
+Claude Sonnet 5,Health and environment,21,0.30952380952380953
+Claude Sonnet 5,International relations,123,0.21951219512195122
+Claude Sonnet 5,Law and crime,235,0.27872340425531916
+Claude Sonnet 5,Politics and elections,186,0.22580645161290322
+Claude Sonnet 5,Science and technology,16,0.03125
+Claude Sonnet 5,Sports,56,0.5178571428571429
