@@ -1,6 +1,19 @@
+# Evaluation runtime. run_eval.py and run_matrix.py need only these.
 braintrust==0.25.0
 pydantic>=2.0,<3.0
 openai>=1.40
 # Required for --model-vendor anthropic (both its harness and native arms).
 anthropic>=0.116
 httpx>=0.27
+
+# Analysis and release tooling: everything under analysis/. Separate from the
+# runtime above so a machine that only runs evaluations can skip these.
+pandas>=2.2
+numpy>=2.0
+scipy>=1.13
+statsmodels>=0.14
+matplotlib>=3.9
+# Parquet writing for analysis/build_hf_dataset.py.
+pyarrow>=17
+# Hub upload for analysis/publish_hf_dataset.py.
+huggingface_hub>=0.34

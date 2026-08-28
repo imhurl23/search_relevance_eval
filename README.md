@@ -32,6 +32,11 @@ claims about You.com, not independent search APIs as a class.
 | `agents.py` | Provider clients, search adapters, prompts, and pricing |
 | `scorers.py` | Deterministic and judge-based row scorers |
 | `analyze_results.py` | Paired summaries for exported JSONL results |
+| `export_braintrust_results.py` | Export completed matrix experiments to JSONL |
+| `analysis/` | Analysis scripts, summary tables, figures, and written reports |
+| `analysis/build_hf_dataset.py` | Build the gated Hugging Face release table |
+| `analysis/publish_hf_dataset.py` | Create the gated Hub repo and upload it |
+| `LICENSE` | MIT license for the code |
 | `import_livenewsbench.py` | Import a pinned LiveNewsBench revision |
 | `import_retrievalqa.py` | Import a pinned RetrievalQA file |
 | `corvus/` | Build, validate, and import Corvus-QA |
@@ -222,13 +227,15 @@ timestamps, and exit codes.
 - A process lock rejects concurrent launchers for the same checkpoint.
 - The parent may own two child conditions, but provider/search compatibility is
   enforced before launch and all checkpoint writes remain in the parent.
-- `--resume` verifies the complete plan and skips completed conditions.
+- `--resume` verifies the complete plan, skips completed conditions, and
+  resumes interrupted conditions at row level using stable dataset row IDs.
 - A condition left in `running` state fails closed because its orphaned child
   may still be active. After confirming that process is dead, resume with
   `--retry-running`; a late completion marker is reconciled automatically.
-- A failed condition gets one retry by default. Retries use a new Braintrust
-  experiment ending in `-retry-02`, so partial and complete denominators do not
-  mix.
+- A failed condition gets one retry by default. Its first attempt pins a
+  Braintrust experiment; later retries reopen it and run only rows without a
+  successful task plus the complete expected scorer set. Legacy checkpoints
+  pin their latest partial `-retry-NN` experiment.
 - Each condition has a four-hour subprocess timeout. Braintrust gets a timeout
   60 seconds shorter so it can flush before the launcher terminates the process.
 - The default row-error tolerance is zero. Task, scorer, or classifier errors
@@ -250,7 +257,7 @@ serving path and effective base URL.
 
 ```dotenv
 BRAINTRUST_GATEWAY_URL=https://gateway.braintrust.dev
-BRAINTRUST_GATEWAY_PROJECT=automations-spend-control
+BRAINTRUST_GATEWAY_PROJECT=search-evals
 BRAINTRUST_GATEWAY_ORG=
 BRAINTRUST_GATEWAY_API_KEY=
 ```
@@ -480,3 +487,27 @@ and a cost frontier when `total_cost_usd` is present.
   condition order reproducibly; record the seed and avoid pauses during a run.
 
 Keep documentation edits within the rules in [FORBIDDEN.md](FORBIDDEN.md).
+
+## License
+
+The code in this repository is MIT licensed. See [LICENSE](LICENSE).
+
+Data carries separate terms, and they do not all match the code license.
+
+- LiveNewsBench questions and answers are MIT licensed. Every row records
+  `source_repository` and `source_commit` so a result can be traced to the
+  release it came from.
+- LiveNewsBench rows carry a canary string asking that the benchmark never enter
+  a training corpus. Keep the `canary` field intact in anything you redistribute.
+  The published result set is gated on the Hugging Face Hub for that reason.
+- You.com search results are not redistributable through this repository. The
+  exporters drop `metadata.articles` and the search trajectory, so no snippet
+  text reaches `analysis/`. `analysis/export_snippet_features.py` describes
+  results rather than reproducing them, and its `--include-text` flag requires
+  written confirmation that both the You.com agreement and publisher copyright
+  permit republication.
+- Model answers stay local. `analysis/build_hf_dataset.py` excludes them from the
+  published table and fails the build if any excluded field reappears.
+
+Collected data and frozen benchmark artifacts are gitignored. See
+[docs/corvus-compliance.md](docs/corvus-compliance.md) for the source policy.

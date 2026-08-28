@@ -48,6 +48,24 @@ curation/**
 !curation/**/
 !curation/*/README.md
 
+# Analysis inputs. The JSONL files are Braintrust experiment dumps carrying model
+# answers and benchmark rows under the upstream LiveNewsBench canary, and the
+# row-level CSVs are the same data reshaped. Summary tables, figures, and the
+# written reports are committed, because those are the analysis. Regenerate the
+# inputs with export_braintrust_results.py.
+analysis/*.jsonl
+analysis/variable_row_level.csv
+analysis/context_timing_rows.csv
+
+# Hugging Face release artifact. Rebuild with analysis/build_hf_dataset.py. The
+# published copy is gated on the Hub, so committing it here would route around
+# the gate.
+hf_dataset/
+
+# Rendered deliverables and local scratch
+output/
+tmp/
+
 # Editor and operating-system files
 .DS_Store
 .idea/
